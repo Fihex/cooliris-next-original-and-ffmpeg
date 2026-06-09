@@ -24,7 +24,9 @@ and it even renders subtitles into the frame for us.
 ## Roadmap
 - [x] **M1 — native binding**: create/initialise mpv, `command()`, `get/setProperty()`.
       Verified: loads libmpv 2.5 / mpv 0.41, controls a player from Node.
-- [ ] **M2 — frames**: render API (SW) → expose latest RGBA frame + size to JS.
+- [x] **M2 — frames**: SW render API → `renderFrame(w,h)` returns the composited RGBA
+      frame, `videoSize()` the dimensions, `hwdec=auto-safe`. Verified: decoded an mkv
+      to a real (non-black) frame with no transcode.
 - [ ] **M3 — renderer integration**: paint frames in the lightbox; wire play/pause/seek/
       volume; replace the `<video>` player.
 - [ ] **M4 — tracks**: audio + subtitle track lists and switching (mpv properties; subs

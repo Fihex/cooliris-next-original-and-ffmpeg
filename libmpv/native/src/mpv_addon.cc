@@ -1,10 +1,12 @@
-// Native libmpv binding (Option C foundation). Milestone 1: create/initialise an mpv
-// instance and drive it (command / get / set property) from Node. Video output via the
-// libmpv render API (frames → texture) is added in the next milestone; for now vo=null
-// so no window appears.
+// Native libmpv binding (Option C).
+//  M1: create/initialise an mpv instance and drive it (command / get / set property).
+//  M2: software render API → decoded RGBA frames (video + subtitles already composited
+//      by mpv) handed to JS for upload into a texture. No on-screen window; no transcode.
 #include <napi.h>
 #include <mpv/client.h>
+#include <mpv/render.h>
 #include <string>
+#include <vector>
 
 class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
  public:
@@ -13,6 +15,8 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
       InstanceMethod("command", &MpvPlayer::Command),
       InstanceMethod("setProperty", &MpvPlayer::SetProperty),
       InstanceMethod("getProperty", &MpvPlayer::GetProperty),
+      InstanceMethod("renderFrame", &MpvPlayer::RenderFrame),
+      InstanceMethod("videoSize", &MpvPlayer::VideoSize),
       InstanceMethod("destroy", &MpvPlayer::Destroy),
     });
     exports.Set("MpvPlayer", func);
@@ -27,14 +31,24 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
       Napi::Error::New(env, "mpv_create failed").ThrowAsJavaScriptException();
       return;
     }
-    // No on-screen window yet (render API comes next); keep audio enabled.
-    mpv_set_option_string(mpv_, "vo", "null");
+    // Route video through the libmpv render API (we pull frames), no window.
+    mpv_set_option_string(mpv_, "vo", "libmpv");
     mpv_set_option_string(mpv_, "terminal", "no");
     mpv_set_option_string(mpv_, "idle", "yes");
+    mpv_set_option_string(mpv_, "hwdec", "auto-safe"); // hardware decode when available
     if (mpv_initialize(mpv_) < 0) {
       mpv_destroy(mpv_);
       mpv_ = nullptr;
       Napi::Error::New(env, "mpv_initialize failed").ThrowAsJavaScriptException();
+      return;
+    }
+    mpv_render_param params[] = {
+      {MPV_RENDER_PARAM_API_TYPE, const_cast<char*>(MPV_RENDER_API_TYPE_SW)},
+      {MPV_RENDER_PARAM_INVALID, nullptr},
+    };
+    if (mpv_render_context_create(&ctx_, mpv_, params) < 0) {
+      ctx_ = nullptr;
+      Napi::Error::New(env, "mpv_render_context_create failed").ThrowAsJavaScriptException();
     }
   }
 
@@ -42,8 +56,14 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
 
  private:
   mpv_handle* mpv_ = nullptr;
+  mpv_render_context* ctx_ = nullptr;
+  std::vector<uint8_t> buf_;
 
   void Cleanup() {
+    if (ctx_) {
+      mpv_render_context_free(ctx_);
+      ctx_ = nullptr;
+    }
     if (mpv_) {
       mpv_terminate_destroy(mpv_);
       mpv_ = nullptr;
@@ -55,7 +75,6 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
     return Napi::String::New(info.Env(), std::to_string(v >> 16) + "." + std::to_string(v & 0xffff));
   }
 
-  // command([...string]) → run an mpv command (e.g. ["loadfile", path]).
   Napi::Value Command(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (!mpv_ || !info[0].IsArray()) return Napi::Boolean::New(env, false);
@@ -65,18 +84,15 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
     for (uint32_t i = 0; i < arr.Length(); i++) hold.push_back(arr.Get(i).ToString().Utf8Value());
     for (auto& s : hold) args.push_back(s.c_str());
     args.push_back(nullptr);
-    int rc = mpv_command(mpv_, args.data());
-    return Napi::Boolean::New(env, rc >= 0);
+    return Napi::Boolean::New(env, mpv_command(mpv_, args.data()) >= 0);
   }
 
-  // setProperty(name, value) — value coerced to string (mpv parses it).
   Napi::Value SetProperty(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (!mpv_ || !info[0].IsString()) return Napi::Boolean::New(env, false);
     std::string name = info[0].As<Napi::String>();
     std::string val = info[1].ToString().Utf8Value();
-    int rc = mpv_set_property_string(mpv_, name.c_str(), val.c_str());
-    return Napi::Boolean::New(env, rc >= 0);
+    return Napi::Boolean::New(env, mpv_set_property_string(mpv_, name.c_str(), val.c_str()) >= 0);
   }
 
   Napi::Value GetProperty(const Napi::CallbackInfo& info) {
@@ -88,6 +104,43 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
     Napi::Value out = Napi::String::New(env, val);
     mpv_free(val);
     return out;
+  }
+
+  // videoSize() → { w, h } of the current video (decoded size), or 0×0 if none yet.
+  Napi::Value VideoSize(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    int64_t w = 0, h = 0;
+    if (mpv_) {
+      mpv_get_property(mpv_, "dwidth", MPV_FORMAT_INT64, &w);
+      mpv_get_property(mpv_, "dheight", MPV_FORMAT_INT64, &h);
+    }
+    Napi::Object o = Napi::Object::New(env);
+    o.Set("w", Napi::Number::New(env, (double)w));
+    o.Set("h", Napi::Number::New(env, (double)h));
+    return o;
+  }
+
+  // renderFrame(w, h) → Buffer (w*h*4, RGBX) of the current composited frame, or null.
+  // The buffer is reused between calls; consume it (upload to a texture) before the next.
+  Napi::Value RenderFrame(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+    if (!ctx_) return env.Null();
+    int w = info[0].As<Napi::Number>().Int32Value();
+    int h = info[1].As<Napi::Number>().Int32Value();
+    if (w <= 0 || h <= 0) return env.Null();
+    size_t stride = (size_t)w * 4;
+    buf_.resize(stride * (size_t)h);
+    int size[2] = {w, h};
+    char fmt[] = "rgb0";
+    mpv_render_param rp[] = {
+      {MPV_RENDER_PARAM_SW_SIZE, size},
+      {MPV_RENDER_PARAM_SW_FORMAT, fmt},
+      {MPV_RENDER_PARAM_SW_STRIDE, &stride},
+      {MPV_RENDER_PARAM_SW_POINTER, buf_.data()},
+      {MPV_RENDER_PARAM_INVALID, nullptr},
+    };
+    if (mpv_render_context_render(ctx_, rp) < 0) return env.Null();
+    return Napi::Buffer<uint8_t>::New(env, buf_.data(), buf_.size());
   }
 
   Napi::Value Destroy(const Napi::CallbackInfo& info) {
