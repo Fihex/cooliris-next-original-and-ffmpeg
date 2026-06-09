@@ -39,7 +39,7 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
     // libmpv proved flaky — "hardware accelerator failed to decode picture" — and could
     // stall playback; mpv's SW decode is fast enough for this use.)
     mpv_set_option_string(mpv_, "hwdec", "no");
-    mpv_request_log_messages(mpv_, "error");
+    mpv_request_log_messages(mpv_, "info"); // surfaces ao/codec selection for diagnosis
     if (mpv_initialize(mpv_) < 0) {
       mpv_destroy(mpv_);
       mpv_ = nullptr;

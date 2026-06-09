@@ -20,7 +20,8 @@ const pending = new Map<number, (v: unknown) => void>();
 
 function ensureChild(): UtilityProcess {
   if (child) return child;
-  child = utilityProcess.fork(hostScript(), [], { stdio: "inherit" });
+  // Pass the full env so mpv's audio output can reach PipeWire/Pulse (XDG_RUNTIME_DIR…).
+  child = utilityProcess.fork(hostScript(), [], { stdio: "inherit", env: process.env });
   child.on("message", (msg: { id: number; result: unknown }) => {
     const cb = pending.get(msg.id);
     if (cb) {

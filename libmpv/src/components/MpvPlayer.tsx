@@ -59,6 +59,7 @@ export function MpvPlayer({
   const [dur, setDur] = useState(0);
   const [vol, setVol] = useState(100);
   const [ready, setReady] = useState(false);
+  const shownRef = useRef(false);
   const seeking = useRef(false);
   const trackRef = useRef<HTMLDivElement>(null);
 
@@ -70,6 +71,7 @@ export function MpvPlayer({
     let cancelled = false;
     let raf = 0;
     let last = 0;
+    shownRef.current = false;
     setReady(false);
     setCur(0);
     setDur(0);
@@ -93,7 +95,10 @@ export function MpvPlayer({
             const buf = await mpv.mpvFrame(rw, rh);
             if (!cancelled && buf && buf.length === rw * rh * 4) {
               ctx.putImageData(new ImageData(new Uint8ClampedArray(buf), rw, rh), 0, 0);
-              if (!ready) setReady(true);
+              if (!shownRef.current) {
+                shownRef.current = true;
+                setReady(true);
+              }
             }
           }
         } catch {
