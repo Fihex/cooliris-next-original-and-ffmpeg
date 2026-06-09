@@ -8,6 +8,7 @@ import { loadConfig, getConfig, updateFfmpeg } from "./config";
 import {
   probe,
   prepareFile,
+  cancelPrepares,
   cleanupPrepared,
   makePoster,
   extractSubtitleVtt,
@@ -282,6 +283,9 @@ ipcMain.handle("ff-subtitle", async (_e, abs: string, index: number): Promise<st
   getConfig().ffmpeg.enabled ? extractSubtitleVtt(abs, index) : null
 );
 
+// Stop any in-flight prepare (the player switched away / closed).
+ipcMain.handle("ff-cancel", () => cancelPrepares());
+
 // Remux/transcode a non-native video to a real, seekable temp .mp4 and return a
 // coolmedia:// URL for it (served with Range, so the player seeks natively) plus the
 // real duration, the audio-track list, and embedded text subtitles as WebVTT.
@@ -469,7 +473,8 @@ app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
 });
 
-// Delete the prepared temp .mp4 files on exit.
+// Stop any running transcode and delete the prepared temp .mp4 files on exit.
 app.on("will-quit", () => {
+  cancelPrepares();
   void cleanupPrepared();
 });

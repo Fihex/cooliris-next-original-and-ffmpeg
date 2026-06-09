@@ -184,6 +184,7 @@ export function VideoPlayer({
       return;
     }
     let cancelled = false;
+    setPlaySrc(""); // drop the previous file so the old video can't keep playing while preparing
     setPreparing(true);
     setPrepPct(0);
     setPrepMode("");
@@ -218,6 +219,9 @@ export function VideoPlayer({
       cancelled = true;
       offProgress?.();
       offMode?.();
+      // Switching away / re-preparing: kill the in-flight transcode so it doesn't keep
+      // running in the background. (ff-cancel is sent before the next ff-prepare.)
+      window.electron?.ffCancel?.();
     };
   }, [src, itemId, isTranscode, transcodeAbs, audioIndex]);
 
@@ -665,14 +669,16 @@ function VideoControls({
         <div className="relative">
           <button
             onClick={() => setAudioMenu((o) => !o)}
-            aria-label="Audio track"
-            title="Audio track"
+            aria-label="Audio language"
+            title="Audio language"
             aria-pressed={audioMenu}
             className={`${btn} ${audioMenu ? "bg-white/20 text-white" : ""}`}
           >
+            {/* Globe = language (audio tracks are usually different languages). */}
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M3 10v4h4l5 4V6l-5 4H3z" strokeLinejoin="round" />
-              <path d="M16 9a3 3 0 0 1 0 6" strokeLinecap="round" />
+              <circle cx="12" cy="12" r="9" />
+              <line x1="3" y1="12" x2="21" y2="12" strokeLinecap="round" />
+              <path d="M12 3c2.6 2.6 2.6 15.4 0 18M12 3c-2.6 2.6-2.6 15.4 0 18" strokeLinecap="round" />
             </svg>
           </button>
           {audioMenu && (

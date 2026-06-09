@@ -24,6 +24,7 @@ contextBridge.exposeInMainWorld("electron", {
   ffPoster: (abs: string) => ipcRenderer.invoke("ff-poster", abs),
   ffSubtitle: (abs: string, index: number) => ipcRenderer.invoke("ff-subtitle", abs, index),
   ffPrepare: (abs: string, audioIndex: number) => ipcRenderer.invoke("ff-prepare", abs, audioIndex),
+  ffCancel: () => ipcRenderer.invoke("ff-cancel"),
   // Subscribe to prepare progress (0–100); returns an unsubscribe fn.
   onFfProgress: (cb: (pct: number) => void) => {
     const h = (_e: unknown, pct: number) => cb(pct);

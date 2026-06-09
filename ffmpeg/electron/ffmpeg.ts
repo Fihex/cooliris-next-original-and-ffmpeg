@@ -262,21 +262,41 @@ export async function prepareFile(
   // -progress pipe:1 streams machine-readable progress to stdout (output is a file).
   args.push("-movflags", "+faststart", "-progress", "pipe:1", "-nostats", out);
 
-  await runWithProgress(ffmpegBin(), args, opts.durationSec ?? 0, onProgress);
+  await runWithProgress(ffmpegBin(), args, out, opts.durationSec ?? 0, onProgress);
   prepared.set(key, out);
   return out;
 }
 
+// In-flight prepare processes → their output path, so a switch can kill them.
+const running = new Map<ReturnType<typeof spawn>, string>();
+
+/** Kill every in-flight prepare (called when the player switches/leaves a video) and
+ *  delete the partial output, so no orphaned ffmpeg keeps transcoding in the background. */
+export function cancelPrepares(): void {
+  for (const [proc, out] of running) {
+    try {
+      proc.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+    running.delete(proc);
+    fs.rm(out, { force: true }).catch(() => {});
+  }
+}
+
 /** Run ffmpeg, parsing its -progress stream (out_time=HH:MM:SS.us on stdout) into a
- *  0..1 fraction against the known total duration. */
+ *  0..1 fraction against the known total duration. Registered in `running` so it can
+ *  be cancelled. */
 function runWithProgress(
   bin: string,
   args: string[],
+  out: string,
   durationSec: number,
   onProgress?: (fraction: number) => void
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const p = spawn(bin, args);
+    running.set(p, out);
     let err = "";
     p.stderr.on("data", (d) => (err = (err + d).slice(-4000)));
     p.stdout.on("data", (d: Buffer) => {
@@ -289,8 +309,14 @@ function runWithProgress(
         onProgress(Math.max(0, Math.min(1, sec / durationSec)));
       }
     });
-    p.on("error", reject);
-    p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(err || `exit ${code}`))));
+    p.on("error", (e) => {
+      running.delete(p);
+      reject(e);
+    });
+    p.on("close", (code) => {
+      running.delete(p);
+      code === 0 ? resolve() : reject(new Error(err || `exit ${code}`));
+    });
   });
 }
 
