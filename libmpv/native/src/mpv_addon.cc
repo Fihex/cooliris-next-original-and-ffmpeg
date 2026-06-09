@@ -35,7 +35,11 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
     mpv_set_option_string(mpv_, "vo", "libmpv");
     mpv_set_option_string(mpv_, "terminal", "no");
     mpv_set_option_string(mpv_, "idle", "yes");
-    mpv_set_option_string(mpv_, "sid", "no"); // subtitles off until chosen (M4 menu)
+    mpv_set_option_string(mpv_, "sid", "no");        // subtitles off until chosen
+    mpv_set_option_string(mpv_, "sub-auto", "no");   // don't auto-load/enable sidecar subs
+    mpv_set_option_string(mpv_, "sub-back-color", "#00000000"); // transparent background box
+    mpv_set_option_string(mpv_, "sub-border-size", "3");        // keep an outline for readability
+    mpv_set_option_string(mpv_, "sub-font-size", "44");
     // Software decode: reliable everywhere. (Hardware decode via the bundled/system
     // libmpv proved flaky — "hardware accelerator failed to decode picture" — and could
     // stall playback; mpv's SW decode is fast enough for this use.)

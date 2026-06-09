@@ -259,6 +259,7 @@ export function MpvPlayer({
           }}
         >
           <canvas
+            data-media
             ref={canvasRef}
             onClick={() => togglePlay()}
             className={`pointer-events-auto h-full w-full object-contain ${
@@ -336,6 +337,29 @@ export function MpvPlayer({
             <div className="absolute inset-y-0 left-0 bg-white" style={{ width: `${pct}%` }} />
           </div>
         </div>
+
+        <button
+          onClick={() => mpv?.mpvCmd(["seek", "-10", "relative"])}
+          className={btn}
+          aria-label="Back 10 seconds"
+          title="Back 10s"
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M11 6L5 12l6 6V6z" />
+            <path d="M19 6l-6 6 6 6V6z" />
+          </svg>
+        </button>
+        <button
+          onClick={() => mpv?.mpvCmd(["seek", "10", "relative"])}
+          className={btn}
+          aria-label="Forward 10 seconds"
+          title="Forward 10s"
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M13 6l6 6-6 6V6z" />
+            <path d="M5 6l6 6-6 6V6z" />
+          </svg>
+        </button>
 
         {audioTracks.length > 1 && (
           <div className="relative">
