@@ -63,6 +63,11 @@ export function MpvPlayer({
   const [activeSid, setActiveSid] = useState("no");
   const [audioMenu, setAudioMenu] = useState(false);
   const [capsMenu, setCapsMenu] = useState(false);
+  // Subtitle style (applied live via mpv properties).
+  const [subSize, setSubSize] = useState(44);
+  const [subColor, setSubColor] = useState("#ffffff");
+  const [subBg, setSubBg] = useState("#000000");
+  const [subBgAlpha, setSubBgAlpha] = useState(0); // 0 = transparent … 100 = opaque
   const shownRef = useRef(false);
   const seeking = useRef(false);
   const trackRef = useRef<HTMLDivElement>(null);
@@ -124,7 +129,23 @@ export function MpvPlayer({
   const selectSub = (id: string) => {
     mpv?.mpvSet("sid", id);
     setActiveSid(id);
-    setCapsMenu(false);
+  };
+  const applySubSize = (n: number) => {
+    setSubSize(n);
+    mpv?.mpvSet("sub-font-size", String(n));
+  };
+  const applySubColor = (c: string) => {
+    setSubColor(c);
+    mpv?.mpvSet("sub-color", c);
+  };
+  // mpv background color is #AARRGGBB; alpha 0..100 → hex.
+  const applySubBg = (c: string, a: number) => {
+    setSubBg(c);
+    setSubBgAlpha(a);
+    const aa = Math.round((a * 255) / 100)
+      .toString(16)
+      .padStart(2, "0");
+    mpv?.mpvSet("sub-back-color", `#${aa}${c.slice(1)}`);
   };
 
   // Load the file and pump frames into the canvas while this item is shown.
@@ -408,7 +429,7 @@ export function MpvPlayer({
               </svg>
             </button>
             {capsMenu && (
-              <div className="absolute bottom-full right-0 mb-2 min-w-32 overflow-hidden rounded-lg bg-black/90 py-1 text-sm ring-1 ring-white/10">
+              <div className="absolute bottom-full right-0 mb-2 w-60 overflow-hidden rounded-lg bg-black/90 py-1 text-sm ring-1 ring-white/10">
                 <button
                   onClick={() => selectSub("no")}
                   className={`block w-full px-3 py-1.5 text-left hover:bg-white/10 ${
@@ -428,6 +449,50 @@ export function MpvPlayer({
                     {tr.label}
                   </button>
                 ))}
+
+                {/* Subtitle style — applied live. */}
+                <div className="mt-1 space-y-2 border-t border-white/10 px-3 pb-2 pt-2 text-white/80">
+                  <label className="flex items-center justify-between gap-2">
+                    <span>Size</span>
+                    <input
+                      type="range"
+                      min={20}
+                      max={90}
+                      value={subSize}
+                      onChange={(e) => applySubSize(Number(e.target.value))}
+                      className="w-28 accent-white"
+                    />
+                  </label>
+                  <label className="flex items-center justify-between gap-2">
+                    <span>Text color</span>
+                    <input
+                      type="color"
+                      value={subColor}
+                      onChange={(e) => applySubColor(e.target.value)}
+                      className="h-6 w-10 cursor-pointer rounded bg-transparent"
+                    />
+                  </label>
+                  <label className="flex items-center justify-between gap-2">
+                    <span>Background</span>
+                    <input
+                      type="color"
+                      value={subBg}
+                      onChange={(e) => applySubBg(e.target.value, subBgAlpha)}
+                      className="h-6 w-10 cursor-pointer rounded bg-transparent"
+                    />
+                  </label>
+                  <label className="flex items-center justify-between gap-2">
+                    <span>BG opacity</span>
+                    <input
+                      type="range"
+                      min={0}
+                      max={100}
+                      value={subBgAlpha}
+                      onChange={(e) => applySubBg(subBg, Number(e.target.value))}
+                      className="w-28 accent-white"
+                    />
+                  </label>
+                </div>
               </div>
             )}
           </div>
