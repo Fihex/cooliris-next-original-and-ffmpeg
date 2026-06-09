@@ -1,0 +1,18 @@
+appId: com.coolirisnext.app
+productName: Cooliris Next
+directories:
+  output: release
+  buildResources: build
+# Vite emits the renderer to dist/ and the main/preload to dist-electron/. Cover-art
+# extraction is dependency-free (electron/coverArt.ts), so no node_modules to package.
+files:
+  - dist/**
+  - dist-electron/**
+linux:
+  target: AppImage
+  category: Graphics
+win:
+  target: nsis
+mac:
+  target: dmg
+  category: public.app-category.graphics-design
