@@ -35,11 +35,17 @@ and it even renders subtitles into the frame for us.
 - [x] **M4 — tracks**: audio-language + subtitle menus from mpv's `track-list`; switching
       sets `aid`/`sid` live (mpv composites subs into the frame). Subs off by default,
       transparent background; ±10s buttons.
-- [~] **M5 — packaging** (first cut): electron-builder bundles the addon + host
-      (asarUnpack); Linux AppImage builds. **Still depends on the target having Node (same
-      ABI) + system mpv/libmpv.** TODO for true portability: bundle a Node runtime + a
-      self-contained libmpv per OS (Win `libmpv-2.dll`, Linux/mac builds with ffmpeg
-      inside), and rebuild the addon for the bundled Node.
+- [x] **M5 — packaging (Linux, self-contained)**: `scripts/bundle-linux.sh` collects a
+      Node binary + libmpv and its shared-lib deps (166 libs) into `vendor/`;
+      electron-builder ships it as extraResources + asarUnpacks the addon/host. At runtime
+      the host runs under `vendor/node` with `LD_LIBRARY_PATH=vendor/lib`, so **no system
+      Node or mpv is required**. Linux AppImage builds (~232 MB). Build order:
+      `bash scripts/bundle-linux.sh && ELECTRON=1 npm run build && npx electron-builder --linux AppImage`.
+      _Needs a runtime test on a clean machine to confirm the bundled lib set is complete._
+- [ ] **M5 — Windows / macOS**: same idea per OS — bundle Node + a self-contained libmpv
+      (Windows `libmpv-2.dll` from shinchiro builds is self-contained → easiest; macOS
+      needs a `libmpv.dylib` + deps via @rpath, built on a Mac). Each must build the addon
+      against the bundled Node's ABI on that platform.
 
 ## Build notes
 - Native build needs: a C/C++ toolchain, `python`, `node-gyp`, and **libmpv + headers**

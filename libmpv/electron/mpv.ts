@@ -15,8 +15,16 @@ function pick(rel: string): string {
 const hostScript = () => pick(path.join("electron", "mpvHost.cjs"));
 const addonFile = () => pick(path.join("native", "build", "Release", "mpv.node"));
 
-// A system Node binary to run the host under (must NOT be the Electron binary).
+// Self-contained runtime bundled by scripts/bundle-linux.sh (vendor/node + vendor/lib),
+// shipped as extraResources. When present, the app needs no system Node or mpv.
+const vendorDir = () =>
+  app.isPackaged ? path.join(process.resourcesPath, "vendor") : path.join(app.getAppPath(), "vendor");
+
+// A Node binary to run the host under (must NOT be the Electron binary): bundled if
+// present, else system Node.
 function nodePath(): string {
+  const bundled = path.join(vendorDir(), process.platform === "win32" ? "node.exe" : "node");
+  if (existsSync(bundled)) return bundled;
   for (const c of ["/usr/bin/node", "/usr/local/bin/node", "/opt/homebrew/bin/node"]) {
     if (existsSync(c)) return c;
   }
@@ -39,11 +47,18 @@ const pending = new Map<number, (v: unknown) => void>();
 
 function ensureChild(): ChildProcess {
   if (child) return child;
+  const env = { ...process.env };
+  // Point the addon at the bundled libmpv + deps (no system mpv needed) when present.
+  const vlib = path.join(vendorDir(), "lib");
+  if (existsSync(vlib)) {
+    env.LD_LIBRARY_PATH = vlib + (env.LD_LIBRARY_PATH ? ":" + env.LD_LIBRARY_PATH : "");
+  }
   console.log("[mpv] starting host under node:", nodePath());
   child = fork(hostScript(), [], {
     execPath: nodePath(),
     serialization: "advanced", // Buffers (frames) cross IPC as binary
     stdio: ["ignore", "pipe", "pipe", "ipc"],
+    env,
   });
   child.stdout?.on("data", (d) => process.stdout.write(`[mpv-host] ${d}`));
   child.stderr?.on("data", (d) => process.stderr.write(`[mpv-host] ${d}`));
