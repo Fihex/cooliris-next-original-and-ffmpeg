@@ -28,7 +28,6 @@ interface MpvPlayerProps {
   fullscreen: boolean;
   chromeHidden: boolean;
   onFullscreen: () => void;
-  onRequestClose: () => void;
   onPlayingChange?: (playing: boolean) => void;
 }
 
@@ -50,7 +49,6 @@ export function MpvPlayer({
   fullscreen,
   chromeHidden,
   onFullscreen,
-  onRequestClose,
   onPlayingChange,
 }: MpvPlayerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -59,11 +57,75 @@ export function MpvPlayer({
   const [dur, setDur] = useState(0);
   const [vol, setVol] = useState(100);
   const [ready, setReady] = useState(false);
+  const [audioTracks, setAudioTracks] = useState<{ id: string; label: string }[]>([]);
+  const [subTracks, setSubTracks] = useState<{ id: string; label: string }[]>([]);
+  const [activeAid, setActiveAid] = useState("");
+  const [activeSid, setActiveSid] = useState("no");
+  const [audioMenu, setAudioMenu] = useState(false);
+  const [capsMenu, setCapsMenu] = useState(false);
   const shownRef = useRef(false);
   const seeking = useRef(false);
   const trackRef = useRef<HTMLDivElement>(null);
 
   const mpv = typeof window !== "undefined" ? window.electron : undefined;
+
+  // Once the file is loaded, read mpv's track list (audio + subtitle) for the choosers.
+  useEffect(() => {
+    if (!mpv) return;
+    let alive = true;
+    setAudioTracks([]);
+    setSubTracks([]);
+    setActiveSid("no");
+    let done = false;
+    const tick = async () => {
+      if (!alive || done) return;
+      const count = parseInt((await mpv.mpvGet("track-list/count")) || "0", 10);
+      if (count > 0) {
+        done = true;
+        const a: { id: string; label: string }[] = [];
+        const s: { id: string; label: string }[] = [];
+        for (let i = 0; i < count; i++) {
+          const type = await mpv.mpvGet(`track-list/${i}/type`);
+          const tid = (await mpv.mpvGet(`track-list/${i}/id`)) || "";
+          const lang = await mpv.mpvGet(`track-list/${i}/lang`);
+          const title = await mpv.mpvGet(`track-list/${i}/title`);
+          const langStr = lang && lang !== "null" ? `${lang} ` : "";
+          const label = `${langStr}${title && title !== "null" ? title : "Track " + tid}`.trim();
+          if (type === "audio") a.push({ id: tid, label });
+          else if (type === "sub") s.push({ id: tid, label });
+        }
+        if (alive) {
+          setAudioTracks(a);
+          setSubTracks(s);
+          setActiveAid((await mpv.mpvGet("aid")) || "");
+        }
+      }
+    };
+    const id = window.setInterval(tick, 300);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [mpv, itemId, abs]);
+
+  // Close the pop-up menus when the chrome auto-hides.
+  useEffect(() => {
+    if (chromeHidden) {
+      setAudioMenu(false);
+      setCapsMenu(false);
+    }
+  }, [chromeHidden]);
+
+  const selectAudio = (id: string) => {
+    mpv?.mpvSet("aid", id);
+    setActiveAid(id);
+    setAudioMenu(false);
+  };
+  const selectSub = (id: string) => {
+    mpv?.mpvSet("sid", id);
+    setActiveSid(id);
+    setCapsMenu(false);
+  };
 
   // Load the file and pump frames into the canvas while this item is shown.
   useEffect(() => {
@@ -275,11 +337,78 @@ export function MpvPlayer({
           </div>
         </div>
 
-        <button onClick={onRequestClose} className={btn} aria-label="Close" title="Close">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-            <path d="M6 6l12 12M18 6L6 18" strokeLinecap="round" />
-          </svg>
-        </button>
+        {audioTracks.length > 1 && (
+          <div className="relative">
+            <button
+              onClick={() => setAudioMenu((o) => !o)}
+              aria-label="Audio language"
+              title="Audio language"
+              className={`${btn} ${audioMenu ? "bg-white/20 text-white" : ""}`}
+            >
+              {/* Globe = language. */}
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <circle cx="12" cy="12" r="9" />
+                <line x1="3" y1="12" x2="21" y2="12" strokeLinecap="round" />
+                <path d="M12 3c2.6 2.6 2.6 15.4 0 18M12 3c-2.6 2.6-2.6 15.4 0 18" strokeLinecap="round" />
+              </svg>
+            </button>
+            {audioMenu && (
+              <div className="absolute bottom-full right-0 mb-2 min-w-32 overflow-hidden rounded-lg bg-black/90 py-1 text-sm ring-1 ring-white/10">
+                {audioTracks.map((tr) => (
+                  <button
+                    key={tr.id}
+                    onClick={() => selectAudio(tr.id)}
+                    className={`block w-full truncate px-3 py-1.5 text-left hover:bg-white/10 ${
+                      activeAid === tr.id ? "text-white" : "text-white/70"
+                    }`}
+                  >
+                    {tr.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {subTracks.length > 0 && (
+          <div className="relative">
+            <button
+              onClick={() => setCapsMenu((o) => !o)}
+              aria-label="Subtitles"
+              title="Subtitles"
+              className={`${btn} ${activeSid !== "no" ? "bg-white/20 text-white" : ""}`}
+            >
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <rect x="3" y="5" width="18" height="14" rx="2" />
+                <path d="M8 11h2M8 14h3M14 11h2M14 14h3" strokeLinecap="round" />
+              </svg>
+            </button>
+            {capsMenu && (
+              <div className="absolute bottom-full right-0 mb-2 min-w-32 overflow-hidden rounded-lg bg-black/90 py-1 text-sm ring-1 ring-white/10">
+                <button
+                  onClick={() => selectSub("no")}
+                  className={`block w-full px-3 py-1.5 text-left hover:bg-white/10 ${
+                    activeSid === "no" ? "text-white" : "text-white/70"
+                  }`}
+                >
+                  Off
+                </button>
+                {subTracks.map((tr) => (
+                  <button
+                    key={tr.id}
+                    onClick={() => selectSub(tr.id)}
+                    className={`block w-full truncate px-3 py-1.5 text-left hover:bg-white/10 ${
+                      activeSid === tr.id ? "text-white" : "text-white/70"
+                    }`}
+                  >
+                    {tr.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
         <button onClick={onFullscreen} className={btn} aria-label="Fullscreen" title="Fullscreen">
           {fullscreen ? (
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">

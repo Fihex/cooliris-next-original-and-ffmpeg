@@ -285,7 +285,6 @@ export function Lightbox({
           fullscreen={isFullscreen}
           chromeHidden={hideChrome}
           onFullscreen={toggleFullscreen}
-          onRequestClose={onClose}
           onPlayingChange={(p) => setVideoPaused(!p)}
         />
       ) : (
