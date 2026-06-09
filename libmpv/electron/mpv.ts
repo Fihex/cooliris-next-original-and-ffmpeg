@@ -4,6 +4,7 @@
 import { app } from "electron";
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 const require = createRequire(import.meta.url);
@@ -19,9 +20,27 @@ function addonPath(): string {
 let addon: any;
 let player: any;
 
+// Load the addon with RTLD_DEEPBIND so libmpv resolves ffmpeg symbols against its OWN
+// libavcodec (full codec set) rather than Electron's bundled, cut-down libffmpeg.so —
+// otherwise ac3/subtitles/most codecs fail ("Failed to initialize a decoder…").
+function loadAddon(): any {
+  const p = addonPath();
+  const d = os.constants?.dlopen as Record<string, number> | undefined;
+  if (d && d.RTLD_NOW != null && d.RTLD_DEEPBIND != null) {
+    try {
+      const m = { exports: {} as any };
+      (process as any).dlopen(m, p, d.RTLD_NOW | d.RTLD_DEEPBIND);
+      return m.exports;
+    } catch (e) {
+      console.error("[mpv] DEEPBIND load failed, falling back to require:", (e as Error).message);
+    }
+  }
+  return require(p);
+}
+
 export function mpvAvailable(): boolean {
   try {
-    if (!addon) addon = require(addonPath());
+    if (!addon) addon = loadAddon();
     return !!addon?.MpvPlayer;
   } catch (e) {
     console.error("[mpv] addon load failed:", (e as Error).message);
@@ -30,7 +49,7 @@ export function mpvAvailable(): boolean {
 }
 
 function ensure(): any {
-  if (!addon) addon = require(addonPath());
+  if (!addon) addon = loadAddon();
   if (!player) player = new addon.MpvPlayer();
   return player;
 }
