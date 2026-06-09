@@ -142,7 +142,9 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
     if (mpv_render_context_render(ctx_, rp) < 0) return env.Null();
     // mpv's "rgb0" leaves the 4th byte as 0 → transparent on a canvas. Force opaque.
     for (size_t i = 3; i < buf_.size(); i += 4) buf_[i] = 255;
-    return Napi::Buffer<uint8_t>::New(env, buf_.data(), buf_.size());
+    // Copy (not an external buffer): Electron's V8 sandbox rejects external buffers
+    // over IPC ("External buffers are not allowed").
+    return Napi::Buffer<uint8_t>::Copy(env, buf_.data(), buf_.size());
   }
 
   Napi::Value Destroy(const Napi::CallbackInfo& info) {
