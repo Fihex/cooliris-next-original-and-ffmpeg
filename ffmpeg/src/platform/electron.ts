@@ -48,6 +48,7 @@ interface ElectronBridge {
   ffPoster(abs: string): Promise<string | null>;
   ffSubtitle(abs: string, index: number): Promise<string | null>;
   ffPrepare(abs: string, audioIndex: number): Promise<FfPrepare | null>;
+  onFfProgress(cb: (pct: number) => void): () => void;
 }
 
 export interface FfProbe {

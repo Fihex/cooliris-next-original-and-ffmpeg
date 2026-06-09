@@ -290,9 +290,14 @@ ipcMain.handle("ff-prepare", async (_e, abs: string, audioIndex: number) => {
   const info = await probe(abs, path.extname(abs).slice(1).toLowerCase());
   const { videoCopy, audioCopy } = planCodecs(info, audioIndex);
   const encoder = !videoCopy && getConfig().ffmpeg.hwAccel ? await detectHwEncoder() : null;
+  const durationSec = info?.durationSec ?? 0;
   let file: string;
   try {
-    file = await prepareFile(abs, { videoCopy, audioCopy, encoder, audioIndex });
+    file = await prepareFile(
+      abs,
+      { videoCopy, audioCopy, encoder, audioIndex, durationSec },
+      (frac) => win?.webContents.send("ff-progress", Math.round(frac * 100))
+    );
   } catch (e) {
     console.error("[ffmpeg] prepare failed:", (e as Error).message);
     return null;

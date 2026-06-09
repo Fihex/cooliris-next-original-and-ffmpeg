@@ -129,6 +129,7 @@ export interface PrepareOpts {
   audioCopy: boolean; // true = -c:a copy, false = transcode to aac
   encoder?: string | null; // hardware H.264 encoder (GPU); null/undefined = software
   audioIndex?: number; // pick a specific audio stream (multi-track mkv); -1 = default
+  durationSec?: number; // total duration, for computing prepare progress
 }
 
 /** Decide per-stream whether we can copy or must re-encode, for the SELECTED audio
@@ -231,7 +232,11 @@ function keyFor(abs: string, opts: PrepareOpts): string {
  * Remux (-c copy) is near-instant; a full transcode takes time proportional to the
  * clip. Results are cached, so it only happens once per (file, audio track).
  */
-export async function prepareFile(abs: string, opts: PrepareOpts): Promise<string> {
+export async function prepareFile(
+  abs: string,
+  opts: PrepareOpts,
+  onProgress?: (fraction: number) => void
+): Promise<string> {
   const key = keyFor(abs, opts);
   const cached = prepared.get(key);
   if (cached && existsSync(cached)) return cached;
@@ -254,11 +259,39 @@ export async function prepareFile(abs: string, opts: PrepareOpts): Promise<strin
   args.push(...(opts.audioCopy ? ["-c:a", "copy"] : ["-c:a", "aac", "-b:a", "192k", "-ac", "2"]));
   // A complete file: faststart puts the moov atom up front so the browser can seek
   // immediately. No fragmentation / timestamp hacks needed — ffmpeg writes correct PTS.
-  args.push("-movflags", "+faststart", out);
+  // -progress pipe:1 streams machine-readable progress to stdout (output is a file).
+  args.push("-movflags", "+faststart", "-progress", "pipe:1", "-nostats", out);
 
-  await run(ffmpegBin(), args);
+  await runWithProgress(ffmpegBin(), args, opts.durationSec ?? 0, onProgress);
   prepared.set(key, out);
   return out;
+}
+
+/** Run ffmpeg, parsing its -progress stream (out_time=HH:MM:SS.us on stdout) into a
+ *  0..1 fraction against the known total duration. */
+function runWithProgress(
+  bin: string,
+  args: string[],
+  durationSec: number,
+  onProgress?: (fraction: number) => void
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const p = spawn(bin, args);
+    let err = "";
+    p.stderr.on("data", (d) => (err = (err + d).slice(-4000)));
+    p.stdout.on("data", (d: Buffer) => {
+      if (!onProgress || durationSec <= 0) return;
+      const matches = d.toString().match(/out_time=(\d+):(\d+):(\d+(?:\.\d+)?)/g);
+      const last = matches?.[matches.length - 1];
+      const m = last && /(\d+):(\d+):(\d+(?:\.\d+)?)/.exec(last);
+      if (m) {
+        const sec = +m[1] * 3600 + +m[2] * 60 + parseFloat(m[3]);
+        onProgress(Math.max(0, Math.min(1, sec / durationSec)));
+      }
+    });
+    p.on("error", reject);
+    p.on("close", (code) => (code === 0 ? resolve() : reject(new Error(err || `exit ${code}`))));
+  });
 }
 
 /** Remove every prepared temp file (call on app quit). */

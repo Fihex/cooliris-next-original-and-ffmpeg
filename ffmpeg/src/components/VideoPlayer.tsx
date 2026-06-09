@@ -161,6 +161,7 @@ export function VideoPlayer({
   const transcodeAbs = isTranscode ? decodeAbs(src) : "";
   const [playSrc, setPlaySrc] = useState(isTranscode ? "" : src);
   const [preparing, setPreparing] = useState(isTranscode);
+  const [prepPct, setPrepPct] = useState(0);
   const [prepError, setPrepError] = useState(false);
   const [audioIndex, setAudioIndex] = useState(-1); // -1 = default track
   const [audioTracks, setAudioTracks] = useState<{ index: number; label: string }[]>([]);
@@ -183,7 +184,11 @@ export function VideoPlayer({
     }
     let cancelled = false;
     setPreparing(true);
+    setPrepPct(0);
     setPrepError(false);
+    const offProgress = window.electron?.onFfProgress?.((p) => {
+      if (!cancelled) setPrepPct(p);
+    });
     window.electron
       ?.ffPrepare?.(transcodeAbs, audioIndex)
       .then((res) => {
@@ -206,6 +211,7 @@ export function VideoPlayer({
       });
     return () => {
       cancelled = true;
+      offProgress?.();
     };
   }, [src, itemId, isTranscode, transcodeAbs, audioIndex]);
 
@@ -359,8 +365,23 @@ export function VideoPlayer({
         {/* Preparing (remux/transcode to a temp file) / failure notices. */}
         {(preparing || prepError) && (
           <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
-            <div className="rounded-lg bg-black/75 px-4 py-3 text-sm text-white shadow-lg">
-              {prepError ? "Couldn't prepare this video." : "Preparing video…"}
+            <div className="min-w-52 rounded-lg bg-black/75 px-4 py-3 text-sm text-white shadow-lg">
+              {prepError ? (
+                "Couldn't prepare this video."
+              ) : (
+                <>
+                  <div className="mb-2 flex items-center justify-between gap-4">
+                    <span>Preparing video…</span>
+                    <span className="tabular-nums text-white/80">{prepPct}%</span>
+                  </div>
+                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/20">
+                    <div
+                      className="h-full bg-white transition-[width] duration-200"
+                      style={{ width: `${prepPct}%` }}
+                    />
+                  </div>
+                </>
+              )}
             </div>
           </div>
         )}

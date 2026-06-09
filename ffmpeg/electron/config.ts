@@ -42,6 +42,9 @@ export function getConfig(): AppConfig {
 
 export async function saveConfig(): Promise<void> {
   try {
+    // The userData dir may not exist yet on first run — create it, or the write (and
+    // thus the default config file) silently fails.
+    await fs.mkdir(app.getPath("userData"), { recursive: true });
     await fs.writeFile(configPath(), JSON.stringify(cached, null, 2));
   } catch {
     /* best effort */
