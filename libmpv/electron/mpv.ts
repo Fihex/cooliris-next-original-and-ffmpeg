@@ -20,8 +20,12 @@ const pending = new Map<number, (v: unknown) => void>();
 
 function ensureChild(): UtilityProcess {
   if (child) return child;
-  // Pass the full env so mpv's audio output can reach PipeWire/Pulse (XDG_RUNTIME_DIR…).
-  child = utilityProcess.fork(hostScript(), [], { stdio: "inherit", env: process.env });
+  // Pipe the host's stdout/stderr through here so mpv's logs actually reach the terminal
+  // (utilityProcess "inherit" often doesn't). Pass full env for PipeWire/Pulse audio.
+  console.log("[mpv] starting host:", hostScript());
+  child = utilityProcess.fork(hostScript(), [], { stdio: "pipe", env: process.env });
+  child.stdout?.on("data", (d) => process.stdout.write(`[mpv-host] ${d}`));
+  child.stderr?.on("data", (d) => process.stderr.write(`[mpv-host] ${d}`));
   child.on("message", (msg: { id: number; result: unknown }) => {
     const cb = pending.get(msg.id);
     if (cb) {
@@ -29,7 +33,8 @@ function ensureChild(): UtilityProcess {
       cb(msg.result);
     }
   });
-  child.on("exit", () => {
+  child.on("exit", (code) => {
+    console.log("[mpv] host exited", code);
     child = null;
     pending.forEach((cb) => cb(null));
     pending.clear();
