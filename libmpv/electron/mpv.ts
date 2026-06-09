@@ -48,10 +48,15 @@ const pending = new Map<number, (v: unknown) => void>();
 function ensureChild(): ChildProcess {
   if (child) return child;
   const env = { ...process.env };
-  // Point the addon at the bundled libmpv + deps (no system mpv needed) when present.
-  const vlib = path.join(vendorDir(), "lib");
-  if (existsSync(vlib)) {
-    env.LD_LIBRARY_PATH = vlib + (env.LD_LIBRARY_PATH ? ":" + env.LD_LIBRARY_PATH : "");
+  // Point the addon at the bundled libmpv (+ deps) so no system mpv is needed. On Windows
+  // libmpv-2.dll sits next to vendor/node.exe and is found via PATH; on Linux the deps
+  // live in vendor/lib via LD_LIBRARY_PATH.
+  const isWin = process.platform === "win32";
+  const libDir = isWin ? vendorDir() : path.join(vendorDir(), "lib");
+  if (vendorDir() && existsSync(libDir)) {
+    const v = isWin ? "PATH" : "LD_LIBRARY_PATH";
+    const sep = isWin ? ";" : ":";
+    env[v] = libDir + sep + (env[v] ?? "");
   }
   console.log("[mpv] starting host under node:", nodePath());
   child = fork(hostScript(), [], {
