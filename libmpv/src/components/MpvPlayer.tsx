@@ -199,10 +199,9 @@ export function MpvPlayer({
           <canvas
             ref={canvasRef}
             onClick={() => togglePlay()}
-            className={`pointer-events-auto max-h-full max-w-full object-contain ${
+            className={`pointer-events-auto h-full w-full object-contain ${
               chromeHidden ? "cursor-none" : "cursor-pointer"
             }`}
-            style={{ width: "auto", height: "auto" }}
           />
         </div>
 
