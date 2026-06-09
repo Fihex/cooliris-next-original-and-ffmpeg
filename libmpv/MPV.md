@@ -27,17 +27,19 @@ and it even renders subtitles into the frame for us.
 - [x] **M2 — frames**: SW render API → `renderFrame(w,h)` returns the composited RGBA
       frame, `videoSize()` the dimensions, `hwdec=auto-safe`. Verified: decoded an mkv
       to a real (non-black) frame with no transcode.
-- [~] **M3 — renderer integration** (implemented; needs on-device run): `electron/mpv.ts`
-      loads the addon in the main process + IPC (`mpv-load/cmd/set/get/size/frame/stop`);
-      `MpvPlayer.tsx` paints frames into a <canvas> (~30fps, capped at 1280w to bound the
-      per-frame IPC) with play/pause/seek/volume + keyboard, wired into the Lightbox.
-      Addon rebuilt against Electron 42 ABI; renderer + main compile. Couldn't launch
-      Electron in the build sandbox, so visual playback is pending a run on a real desktop.
-- [ ] **M4 — tracks**: audio + subtitle track lists and switching (mpv properties; subs
-      are burned into the frame by mpv — no overlay needed).
-- [ ] **M5 — packaging**: bundle `libmpv` per OS (Win `libmpv-2.dll`, Linux `libmpv.so`,
-      mac `libmpv.dylib`); rebuild the addon against Electron's ABI (electron-rebuild);
-      build installers.
+- [x] **M3 — renderer integration**: mpv runs in a forked **system-Node** process
+      (`electron/mpvHost.cjs`) so it never touches Electron's cut-down libffmpeg and uses
+      the full system ffmpeg (all codecs). `electron/mpv.ts` proxies over Node IPC;
+      `MpvPlayer.tsx` paints frames into a <canvas> (~30fps, capped 1280w) with play/pause/
+      seek/volume + keyboard. Verified on desktop: mkv + avi play with video + audio.
+- [x] **M4 — tracks**: audio-language + subtitle menus from mpv's `track-list`; switching
+      sets `aid`/`sid` live (mpv composites subs into the frame). Subs off by default,
+      transparent background; ±10s buttons.
+- [~] **M5 — packaging** (first cut): electron-builder bundles the addon + host
+      (asarUnpack); Linux AppImage builds. **Still depends on the target having Node (same
+      ABI) + system mpv/libmpv.** TODO for true portability: bundle a Node runtime + a
+      self-contained libmpv per OS (Win `libmpv-2.dll`, Linux/mac builds with ffmpeg
+      inside), and rebuild the addon for the bundled Node.
 
 ## Build notes
 - Native build needs: a C/C++ toolchain, `python`, `node-gyp`, and **libmpv + headers**

@@ -3,11 +3,16 @@ productName: Cooliris Next
 directories:
   output: release
   buildResources: build
-# Vite emits the renderer to dist/ and the main/preload to dist-electron/. Cover-art
-# extraction is dependency-free (electron/coverArt.ts), so no node_modules to package.
+# Vite emits the renderer to dist/ and the main/preload to dist-electron/. The libmpv
+# layer needs the native addon + the host script shipped and unpacked (spawned/dlopen'd).
 files:
   - dist/**
   - dist-electron/**
+  - electron/mpvHost.cjs
+  - native/build/Release/mpv.node
+asarUnpack:
+  - electron/mpvHost.cjs
+  - native/build/Release/mpv.node
 linux:
   target: AppImage
   category: Graphics
