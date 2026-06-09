@@ -1,87 +1,66 @@
-// Main-process libmpv bridge (Option C). Loads the native addon, owns one mpv player,
-// and exposes load/control + frame pulling. Frames are RGBA buffers (video + subtitles
-// composited by mpv) handed to the renderer over IPC for upload into a <canvas>.
-import { app } from "electron";
-import { createRequire } from "node:module";
+// Main-process proxy to the mpv host (Option C). mpv runs in a utilityProcess so it
+// doesn't share Chromium's bundled libffmpeg.so — it uses the full system ffmpeg, so
+// every codec/subtitle works (no DEEPBIND hacks). We forward load/control + frame pulls
+// over parentPort and resolve replies by id.
+import { app, utilityProcess, type UtilityProcess } from "electron";
 import { existsSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
-const require = createRequire(import.meta.url);
-
-function addonPath(): string {
-  const rel = path.join("native", "build", "Release", "mpv.node");
+function pick(rel: string): string {
   const dev = path.join(app.getAppPath(), rel);
   const packed = path.join(process.resourcesPath, "app.asar.unpacked", rel);
   return existsSync(dev) ? dev : packed;
 }
+const hostScript = () => pick(path.join("electron", "mpvHost.cjs"));
+const addonFile = () => pick(path.join("native", "build", "Release", "mpv.node"));
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
-let addon: any;
-let player: any;
+let child: UtilityProcess | null = null;
+let nextId = 1;
+const pending = new Map<number, (v: unknown) => void>();
 
-// Load the addon with RTLD_DEEPBIND so libmpv resolves ffmpeg symbols against its OWN
-// libavcodec (full codec set) rather than Electron's bundled, cut-down libffmpeg.so —
-// otherwise ac3/subtitles/most codecs fail ("Failed to initialize a decoder…").
-function loadAddon(): any {
-  const p = addonPath();
-  const d = os.constants?.dlopen as Record<string, number> | undefined;
-  if (d && d.RTLD_NOW != null && d.RTLD_DEEPBIND != null) {
-    try {
-      const m = { exports: {} as any };
-      (process as any).dlopen(m, p, d.RTLD_NOW | d.RTLD_DEEPBIND);
-      return m.exports;
-    } catch (e) {
-      console.error("[mpv] DEEPBIND load failed, falling back to require:", (e as Error).message);
+function ensureChild(): UtilityProcess {
+  if (child) return child;
+  child = utilityProcess.fork(hostScript(), [], { stdio: "inherit" });
+  child.on("message", (msg: { id: number; result: unknown }) => {
+    const cb = pending.get(msg.id);
+    if (cb) {
+      pending.delete(msg.id);
+      cb(msg.result);
     }
-  }
-  return require(p);
+  });
+  child.on("exit", () => {
+    child = null;
+    pending.forEach((cb) => cb(null));
+    pending.clear();
+  });
+  return child;
+}
+
+function call<T = unknown>(fn: string, args: unknown[]): Promise<T> {
+  return new Promise((resolve) => {
+    const id = nextId++;
+    pending.set(id, resolve as (v: unknown) => void);
+    ensureChild().postMessage({ id, fn, args });
+  });
 }
 
 export function mpvAvailable(): boolean {
-  try {
-    if (!addon) addon = loadAddon();
-    return !!addon?.MpvPlayer;
-  } catch (e) {
-    console.error("[mpv] addon load failed:", (e as Error).message);
-    return false;
-  }
+  return existsSync(addonFile()) && existsSync(hostScript());
 }
-
-function ensure(): any {
-  if (!addon) addon = loadAddon();
-  if (!player) player = new addon.MpvPlayer();
-  return player;
-}
-
-export function mpvLoad(abs: string): void {
-  ensure().command(["loadfile", abs]);
-}
-export function mpvCommand(args: string[]): boolean {
-  return ensure().command(args);
-}
-export function mpvSet(name: string, value: string): boolean {
-  return ensure().setProperty(name, String(value));
-}
-export function mpvGet(name: string): string | null {
-  return ensure().getProperty(name);
-}
-export function mpvVideoSize(): { w: number; h: number } {
-  return ensure().videoSize();
-}
-export function mpvFrame(w: number, h: number): Buffer | null {
-  return ensure().renderFrame(w, h);
-}
-export function mpvStop(): void {
-  if (player) player.command(["stop"]);
-}
+export const mpvLoad = (abs: string) => call("load", [abs]);
+export const mpvCommand = (args: string[]) => call<boolean>("cmd", [args]);
+export const mpvSet = (name: string, value: string) => call<boolean>("set", [name, value]);
+export const mpvGet = (name: string) => call<string | null>("get", [name]);
+export const mpvVideoSize = () => call<{ w: number; h: number }>("size", []);
+export const mpvFrame = (w: number, h: number) => call<Uint8Array | null>("frame", [w, h]);
+export const mpvStop = () => call("stop", []);
 export function mpvDestroy(): void {
-  if (player) {
+  if (child) {
     try {
-      player.destroy();
+      child.kill();
     } catch {
-      /* ignore */
+      /* already gone */
     }
-    player = null;
+    child = null;
   }
 }
