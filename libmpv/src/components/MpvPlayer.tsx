@@ -138,14 +138,21 @@ export function MpvPlayer({
     setSubColor(c);
     mpv?.mpvSet("sub-color", c);
   };
-  // mpv background color is #AARRGGBB; alpha 0..100 → hex.
+  // Background box: mpv only draws one with a box border-style. With opacity 0 keep the
+  // plain outline (readable, no box); above 0 switch to a background box of the chosen
+  // color. mpv color is #AARRGGBB (alpha first; FF = opaque).
   const applySubBg = (c: string, a: number) => {
     setSubBg(c);
     setSubBgAlpha(a);
-    const aa = Math.round((a * 255) / 100)
-      .toString(16)
-      .padStart(2, "0");
-    mpv?.mpvSet("sub-back-color", `#${aa}${c.slice(1)}`);
+    if (a > 0) {
+      const aa = Math.round((a * 255) / 100)
+        .toString(16)
+        .padStart(2, "0");
+      mpv?.mpvSet("sub-border-style", "background-box");
+      mpv?.mpvSet("sub-back-color", `#${aa}${c.slice(1)}`);
+    } else {
+      mpv?.mpvSet("sub-border-style", "outline-and-shadow");
+    }
   };
 
   // Load the file and pump frames into the canvas while this item is shown.
