@@ -197,11 +197,21 @@ export function VideoPlayer({
   const resumeAtRef = useRef(0); // play position to restore after an audio-switch re-prepare
   const wasPlayingRef = useRef(true); // whether to resume after a prepare / switch
 
-  // Reset the audio + subtitle selection whenever the item changes.
-  useEffect(() => {
-    setAudioIndex(-1);
+  // Reset the source SYNCHRONOUSLY (during render) the instant the item changes — so the
+  // new <video> never mounts with the previous item's prepared URL and plays the old
+  // video for a beat. (Doing this in an effect runs too late: the element commits first.)
+  const [shownItem, setShownItem] = useState(itemId);
+  if (itemId !== shownItem) {
+    setShownItem(itemId);
+    setPlaySrc(isTranscode ? "" : src);
+    setPreparing(isTranscode);
+    setPrepPct(0);
+    setPrepError(false);
     setActiveSub(-1);
-  }, [src, itemId]);
+    setAudioIndex(-1);
+    resumeAtRef.current = 0;
+    wasPlayingRef.current = true;
+  }
 
   // Prepare (or re-prepare on audio switch) the temp file.
   useEffect(() => {
