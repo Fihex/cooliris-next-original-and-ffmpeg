@@ -1,0 +1,32 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  overflow: hidden;
+  background: radial-gradient(ellipse at top, #0b0f17 0%, #05070c 60%, #000 100%);
+  color: #e6e8ec;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Transient play/pause/skip indicator in the video player. */
+@keyframes ui-flash {
+  0% {
+    opacity: 0.85;
+    transform: scale(0.8);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.35);
+  }
+}
+.ui-flash > div {
+  animation: ui-flash 600ms ease-out forwards;
+}

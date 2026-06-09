@@ -1,0 +1,43 @@
+{
+  "name": "cooliris-next",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Modern, Flash-free reimplementation of the Cooliris 3D media wall (cooliris/embed-wall).",
+  "scripts": {
+    "dev": "vite",
+    "generate": "tsr generate",
+    "build": "tsr generate && tsc -b && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsr generate && tsc -b --noEmit",
+    "electron:dev": "ELECTRON=1 vite",
+    "electron:build": "ELECTRON=1 npm run build && electron-builder",
+    "electron:build:win": "ELECTRON=1 npm run build && electron-builder --win",
+    "electron:build:linux": "ELECTRON=1 npm run build && electron-builder --linux",
+    "electron:preview": "ELECTRON=1 npm run build && electron ."
+  },
+  "main": "dist-electron/main.cjs",
+  "dependencies": {
+    "@tanstack/react-router": "^1.58.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "three": "^0.169.0"
+  },
+  "devDependencies": {
+    "@tanstack/router-cli": "^1.167.17",
+    "@tanstack/router-plugin": "^1.58.4",
+    "@types/node": "^25.9.2",
+    "@types/react": "^18.3.11",
+    "@types/react-dom": "^18.3.0",
+    "@types/three": "^0.169.0",
+    "@vitejs/plugin-react": "^4.3.2",
+    "autoprefixer": "^10.4.20",
+    "electron": "^42.3.3",
+    "electron-builder": "^26.15.0",
+    "postcss": "^8.4.47",
+    "tailwindcss": "^3.4.13",
+    "typescript": "^5.6.2",
+    "vite": "^5.4.8",
+    "vite-plugin-electron": "^1.0.4"
+  }
+}

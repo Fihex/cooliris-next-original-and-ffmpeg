@@ -1,0 +1,28 @@
+appId: com.coolirisnext.app
+productName: Cooliris Next
+directories:
+  output: release
+  buildResources: build
+# Vite emits the renderer to dist/ and the main/preload to dist-electron/. The ffmpeg
+# layer needs its binaries shipped (and unpacked from the asar so they can be spawned).
+files:
+  - dist/**
+  - dist-electron/**
+  # ffmpeg binaries: ffmpeg-static (newest, native-platform build) preferred at runtime,
+  # @ffmpeg-installer covers the other OSes for cross-builds; ffprobe-static already
+  # ships every platform. Unpacked from the asar so they can be spawned.
+  - "node_modules/ffmpeg-static/**"
+  - "node_modules/@ffmpeg-installer/**"
+  - "node_modules/ffprobe-static/**"
+asarUnpack:
+  - "node_modules/ffmpeg-static/**"
+  - "node_modules/@ffmpeg-installer/**"
+  - "node_modules/ffprobe-static/**"
+linux:
+  target: AppImage
+  category: Graphics
+win:
+  target: nsis
+mac:
+  target: dmg
+  category: public.app-category.graphics-design
