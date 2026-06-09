@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { VideoSub } from "@/feed/types";
 
 /**
@@ -56,6 +56,32 @@ interface VideoPlayerProps {
 function srtToVtt(srt: string): string {
   const body = srt.replace(/\r+/g, "").replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2");
   return `WEBVTT\n\n${body}`;
+}
+
+interface Cue {
+  start: number;
+  end: number;
+  text: string;
+}
+
+// Parse WebVTT into cues. We render subtitles ourselves (overlay div) rather than via
+// <track>, because Chromium's out-of-band text tracks duplicate / linger when their src
+// changes — doing it manually is fully deterministic.
+function parseVtt(vtt: string): Cue[] {
+  const cues: Cue[] = [];
+  const ts = /(?:(\d{1,2}):)?(\d{1,2}):(\d{2}(?:\.\d{1,3})?)\s*-->\s*(?:(\d{1,2}):)?(\d{1,2}):(\d{2}(?:\.\d{1,3})?)/;
+  for (const block of vtt.replace(/\r/g, "").split(/\n\n+/)) {
+    const lines = block.split("\n");
+    const i = lines.findIndex((l) => l.includes("-->"));
+    if (i < 0) continue;
+    const m = ts.exec(lines[i]);
+    if (!m) continue;
+    const start = (+m[1] || 0) * 3600 + +m[2] * 60 + parseFloat(m[3]);
+    const end = (+m[4] || 0) * 3600 + +m[5] * 60 + parseFloat(m[6]);
+    const text = lines.slice(i + 1).join("\n").replace(/<[^>]+>/g, "").trim();
+    if (text && end > start) cues.push({ start, end, text });
+  }
+  return cues;
 }
 
 /** Big glyph for the transient play/pause/skip overlay. */
@@ -167,7 +193,7 @@ export function VideoPlayer({
   const [audioIndex, setAudioIndex] = useState(-1); // -1 = default track
   const [audioTracks, setAudioTracks] = useState<{ index: number; label: string }[]>([]);
   const [preparedSubs, setPreparedSubs] = useState<{ vtt: string; label: string }[]>([]);
-  const [activeSub, setActiveSub] = useState(-1); // index into trackUrls; -1 = off
+  const [activeSub, setActiveSub] = useState(-1); // index into subList; -1 = off
   const resumeAtRef = useRef(0); // play position to restore after an audio-switch re-prepare
   const wasPlayingRef = useRef(true); // whether to resume after a prepare / switch
 
@@ -235,48 +261,41 @@ export function VideoPlayer({
     setAudioIndex(idx);
   };
 
-  // Switch subtitle track: a single <track> is (re)mounted for the chosen sub (keyed by
-  // url), so the previous track's cues are destroyed — never lingering. Pause around the
-  // swap so the change applies cleanly, then resume.
-  const selectSub = (i: number) => {
-    const v = videoRef.current;
-    const wasPlaying = v ? !v.paused : true;
-    v?.pause();
-    setActiveSub(i);
-    if (wasPlaying) window.setTimeout(() => videoRef.current?.play().catch(() => {}), 60);
-  };
+  // Switch subtitle track — instant (the overlay just reads from a different cue list).
+  const selectSub = (i: number) => setActiveSub(i);
 
-  // Subtitle <track> blob URLs from sidecar + embedded WebVTT. Absolute cue times — the
-  // prepared file is one real timeline, so nothing needs shifting (and no duplication).
-  const [trackUrls, setTrackUrls] = useState<{ url: string; label: string }[]>([]);
-  useEffect(() => {
-    const all = [...sidecarRaw, ...preparedSubs];
-    const created: string[] = [];
-    const out = all.map((s) => {
-      const url = URL.createObjectURL(new Blob([s.vtt], { type: "text/vtt" }));
-      created.push(url);
-      return { url, label: s.label };
-    });
-    setTrackUrls(out);
-    return () => created.forEach((u) => URL.revokeObjectURL(u));
-  }, [sidecarRaw, preparedSubs]);
+  // All available subtitles (sidecar + embedded), and the parsed cues for the active one.
+  const subList = useMemo(() => [...sidecarRaw, ...preparedSubs], [sidecarRaw, preparedSubs]);
+  const cues = useMemo(
+    () => (activeSub >= 0 && subList[activeSub] ? parseVtt(subList[activeSub].vtt) : []),
+    [activeSub, subList]
+  );
 
-  // Keep the single mounted text track in "showing" mode (the `default` attribute alone
-  // is unreliable for tracks added dynamically; this also re-applies after a src reload).
+  // Render the active cue ourselves, driven by currentTime. Deterministic — no <track>,
+  // so subtitles can't duplicate, linger, or get stuck across seeks / src reloads.
+  const [cueText, setCueText] = useState("");
   useEffect(() => {
     const v = videoRef.current;
-    if (!v) return;
-    const show = () => {
-      for (let i = 0; i < v.textTracks.length; i++) v.textTracks[i].mode = "showing";
+    if (!v || !cues.length) {
+      setCueText("");
+      return;
+    }
+    const update = () => {
+      const t = v.currentTime;
+      const c = cues.find((q) => t >= q.start && t < q.end);
+      setCueText(c ? c.text : "");
     };
-    show();
-    const id = window.setTimeout(show, 120);
-    v.textTracks.addEventListener?.("addtrack", show);
+    update();
+    v.addEventListener("timeupdate", update);
+    v.addEventListener("seeking", update);
+    v.addEventListener("seeked", update);
     return () => {
-      window.clearTimeout(id);
-      v.textTracks.removeEventListener?.("addtrack", show);
+      v.removeEventListener("timeupdate", update);
+      v.removeEventListener("seeking", update);
+      v.removeEventListener("seeked", update);
+      setCueText("");
     };
-  }, [activeSub, trackUrls, playSrc, itemId]);
+  }, [videoRef, itemId, cues, playSrc]);
 
   // Keyboard ±10s (Lightbox dispatches "uiskiprel") — the prepared file seeks natively.
   useEffect(() => {
@@ -357,20 +376,24 @@ export function VideoPlayer({
             className={`pointer-events-auto h-full w-full object-contain ${
               chromeHidden ? "cursor-none" : "cursor-pointer"
             }`}
-          >
-            {/* Exactly one track at a time, keyed by url so switching remounts it fresh
-                — the old track (and its cues) is removed, never left lingering. */}
-            {activeSub >= 0 && trackUrls[activeSub] && (
-              <track
-                key={trackUrls[activeSub].url}
-                default
-                kind="subtitles"
-                label={trackUrls[activeSub].label}
-                src={trackUrls[activeSub].url}
-              />
-            )}
-          </video>
+          />
         </div>
+
+        {/* Subtitles: rendered by us (not a <track>), pinned above the control bar so they
+            never duplicate or stick. */}
+        {cueText && (
+          <div
+            className="pointer-events-none absolute inset-x-0 z-20 flex justify-center px-6"
+            style={{ bottom: chromeHidden ? "6%" : "5.5rem" }}
+          >
+            <span
+              className="max-w-[90%] whitespace-pre-line rounded bg-black/60 px-2 py-0.5 text-center text-lg font-medium leading-snug text-white"
+              style={{ textShadow: "0 2px 4px rgba(0,0,0,0.95)" }}
+            >
+              {cueText}
+            </span>
+          </div>
+        )}
 
         {/* Preparing (remux/transcode to a temp file) / failure notices. */}
         {(preparing || prepError) && (
@@ -421,7 +444,7 @@ export function VideoPlayer({
         audioTracks={audioTracks}
         activeAudio={audioIndex}
         onSelectAudio={selectAudio}
-        subTracks={trackUrls.map((tr, i) => ({ i, label: tr.label }))}
+        subTracks={subList.map((s, i) => ({ i, label: s.label }))}
         activeSub={activeSub}
         onSelectSub={selectSub}
       />

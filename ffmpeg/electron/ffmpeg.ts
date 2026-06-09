@@ -128,6 +128,7 @@ export interface PrepareOpts {
   videoCopy: boolean; // true = -c:v copy (codec already mp4-friendly), false = encode
   audioCopy: boolean; // true = -c:a copy, false = transcode to aac
   encoder?: string | null; // hardware H.264 encoder (GPU); null/undefined = software
+  encoderBin?: string; // the ffmpeg binary providing the hw encoder (else bundled)
   audioIndex?: number; // pick a specific audio stream (multi-track mkv); -1 = default
   durationSec?: number; // total duration, for computing prepare progress
 }
@@ -186,26 +187,37 @@ function hwCandidates(): string[] {
   return ["h264_nvenc", "h264_qsv", "h264_vaapi"]; // linux
 }
 
-// Does this encoder actually work here? Encode 0.2s of test video to null.
-function canEncode(encoder: string): Promise<boolean> {
+// Does this encoder actually work with this binary? Encode 0.2s of test video to null.
+function canEncode(bin: string, encoder: string): Promise<boolean> {
   const cfg = encCfg(encoder);
   const args = [
     "-hide_banner", "-loglevel", "error", ...cfg.pre,
     "-f", "lavfi", "-i", "color=c=black:s=320x240:r=15:d=0.2",
     ...(cfg.vf ? ["-vf", cfg.vf] : []), ...cfg.codec, "-f", "null", "-",
   ];
-  return run(ffmpegBin(), args).then(() => true).catch(() => false);
+  return run(bin, args).then(() => true).catch(() => false);
 }
 
-let _hwEnc: string | null | undefined;
-/** First working GPU H.264 encoder (NVENC/QSV/VAAPI/AMF/VideoToolbox), or null for
- *  software. Probed once and cached — the result is hardware, it won't change. */
-export async function detectHwEncoder(): Promise<string | null> {
+export interface HwEncoder {
+  bin: string; // the ffmpeg binary that supports it (bundled, or a system ffmpeg)
+  encoder: string; // e.g. h264_nvenc
+}
+
+let _hwEnc: HwEncoder | null | undefined;
+/** First working GPU H.264 encoder + the binary that provides it. The bundled
+ *  ffmpeg-static has NO hardware encoders, so we also probe a system `ffmpeg` on PATH
+ *  (commonly built with NVENC/VAAPI/QSV). null = none → software libx264. Cached. */
+export async function detectHwEncoder(): Promise<HwEncoder | null> {
   if (_hwEnc !== undefined) return _hwEnc;
-  for (const enc of hwCandidates()) {
-    if (await canEncode(enc)) {
-      console.log("[ffmpeg] hardware encoder:", enc);
-      return (_hwEnc = enc);
+  const bins = [ffmpegBin()];
+  const sys = "ffmpeg" + EXE; // resolved on PATH
+  if (ffmpegBin() !== sys) bins.push(sys);
+  for (const bin of bins) {
+    for (const enc of hwCandidates()) {
+      if (await canEncode(bin, enc)) {
+        console.log(`[ffmpeg] hardware encoder: ${enc} (${bin})`);
+        return (_hwEnc = { bin, encoder: enc });
+      }
     }
   }
   console.log("[ffmpeg] no usable hardware encoder; using libx264 (CPU)");
@@ -262,7 +274,10 @@ export async function prepareFile(
   // -progress pipe:1 streams machine-readable progress to stdout (output is a file).
   args.push("-movflags", "+faststart", "-progress", "pipe:1", "-nostats", out);
 
-  await runWithProgress(ffmpegBin(), args, out, opts.durationSec ?? 0, onProgress);
+  // A hardware encode runs on the binary that supports it (often a system ffmpeg);
+  // copy / software libx264 use the bundled binary.
+  const bin = opts.encoder && opts.encoderBin ? opts.encoderBin : ffmpegBin();
+  await runWithProgress(bin, args, out, opts.durationSec ?? 0, onProgress);
   prepared.set(key, out);
   return out;
 }

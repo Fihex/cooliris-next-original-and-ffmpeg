@@ -293,17 +293,17 @@ ipcMain.handle("ff-prepare", async (_e, abs: string, audioIndex: number) => {
   if (!getConfig().ffmpeg.enabled) return null;
   const info = await probe(abs, path.extname(abs).slice(1).toLowerCase());
   const { videoCopy, audioCopy } = planCodecs(info, audioIndex);
-  const encoder = !videoCopy && getConfig().ffmpeg.hwAccel ? await detectHwEncoder() : null;
+  const hw = !videoCopy && getConfig().ffmpeg.hwAccel ? await detectHwEncoder() : null;
   const durationSec = info?.durationSec ?? 0;
   // Tell the renderer which path this prepare uses, so it can show CPU/GPU/remux.
-  const mode = videoCopy ? "Remux (copy)" : encoder ? `GPU · ${encoder}` : "CPU · libx264";
+  const mode = videoCopy ? "Remux (copy)" : hw ? `GPU · ${hw.encoder}` : "CPU · libx264";
   console.log(`[ffmpeg] prepare ${path.basename(abs)} → ${mode}`);
   win?.webContents.send("ff-prepare-mode", mode);
   let file: string;
   try {
     file = await prepareFile(
       abs,
-      { videoCopy, audioCopy, encoder, audioIndex, durationSec },
+      { videoCopy, audioCopy, encoder: hw?.encoder ?? null, encoderBin: hw?.bin, audioIndex, durationSec },
       (frac) => win?.webContents.send("ff-progress", Math.round(frac * 100))
     );
   } catch (e) {
