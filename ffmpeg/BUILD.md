@@ -100,9 +100,11 @@ position. Prepared files are cached for the session and deleted on quit.
 
 ## Runtime notes (ffmpeg edition)
 
-- A config file is created on first run at
-  `<userData>/cooliris.config.json` (Linux: `~/.config/Cooliris Next/`,
-  Windows: `%APPDATA%\Cooliris Next\`):
+- A config file is created on first run **next to the app** (so it's easy to find and
+  edit before launching) — beside the `.AppImage` on Linux, or next to the `.exe` on
+  Windows. If that folder is read-only, it falls back to the per-user data dir
+  (`~/.config/Cooliris Next/` or `%APPDATA%\Cooliris Next\`). It's named
+  `cooliris.config.json`:
 
   ```json
   { "ffmpeg": { "enabled": true, "hwAccel": false } }
