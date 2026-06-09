@@ -291,6 +291,10 @@ ipcMain.handle("ff-prepare", async (_e, abs: string, audioIndex: number) => {
   const { videoCopy, audioCopy } = planCodecs(info, audioIndex);
   const encoder = !videoCopy && getConfig().ffmpeg.hwAccel ? await detectHwEncoder() : null;
   const durationSec = info?.durationSec ?? 0;
+  // Tell the renderer which path this prepare uses, so it can show CPU/GPU/remux.
+  const mode = videoCopy ? "Remux (copy)" : encoder ? `GPU · ${encoder}` : "CPU · libx264";
+  console.log(`[ffmpeg] prepare ${path.basename(abs)} → ${mode}`);
+  win?.webContents.send("ff-prepare-mode", mode);
   let file: string;
   try {
     file = await prepareFile(

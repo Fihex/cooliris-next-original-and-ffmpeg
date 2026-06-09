@@ -30,4 +30,10 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.on("ff-progress", h);
     return () => ipcRenderer.removeListener("ff-progress", h);
   },
+  // The encode path chosen for the current prepare (e.g. "GPU · h264_nvenc", "CPU · libx264").
+  onFfPrepareMode: (cb: (mode: string) => void) => {
+    const h = (_e: unknown, mode: string) => cb(mode);
+    ipcRenderer.on("ff-prepare-mode", h);
+    return () => ipcRenderer.removeListener("ff-prepare-mode", h);
+  },
 });

@@ -162,6 +162,7 @@ export function VideoPlayer({
   const [playSrc, setPlaySrc] = useState(isTranscode ? "" : src);
   const [preparing, setPreparing] = useState(isTranscode);
   const [prepPct, setPrepPct] = useState(0);
+  const [prepMode, setPrepMode] = useState("");
   const [prepError, setPrepError] = useState(false);
   const [audioIndex, setAudioIndex] = useState(-1); // -1 = default track
   const [audioTracks, setAudioTracks] = useState<{ index: number; label: string }[]>([]);
@@ -185,9 +186,13 @@ export function VideoPlayer({
     let cancelled = false;
     setPreparing(true);
     setPrepPct(0);
+    setPrepMode("");
     setPrepError(false);
     const offProgress = window.electron?.onFfProgress?.((p) => {
       if (!cancelled) setPrepPct(p);
+    });
+    const offMode = window.electron?.onFfPrepareMode?.((m) => {
+      if (!cancelled) setPrepMode(m);
     });
     window.electron
       ?.ffPrepare?.(transcodeAbs, audioIndex)
@@ -212,6 +217,7 @@ export function VideoPlayer({
     return () => {
       cancelled = true;
       offProgress?.();
+      offMode?.();
     };
   }, [src, itemId, isTranscode, transcodeAbs, audioIndex]);
 
@@ -380,6 +386,9 @@ export function VideoPlayer({
                       style={{ width: `${prepPct}%` }}
                     />
                   </div>
+                  {prepMode && (
+                    <div className="mt-2 text-xs text-white/60">{prepMode}</div>
+                  )}
                 </>
               )}
             </div>

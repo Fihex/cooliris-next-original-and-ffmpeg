@@ -49,6 +49,7 @@ interface ElectronBridge {
   ffSubtitle(abs: string, index: number): Promise<string | null>;
   ffPrepare(abs: string, audioIndex: number): Promise<FfPrepare | null>;
   onFfProgress(cb: (pct: number) => void): () => void;
+  onFfPrepareMode(cb: (mode: string) => void): () => void;
 }
 
 export interface FfProbe {
