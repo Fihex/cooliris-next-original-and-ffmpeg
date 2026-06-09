@@ -35,7 +35,11 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
     mpv_set_option_string(mpv_, "vo", "libmpv");
     mpv_set_option_string(mpv_, "terminal", "no");
     mpv_set_option_string(mpv_, "idle", "yes");
-    mpv_set_option_string(mpv_, "hwdec", "auto-safe"); // hardware decode when available
+    // Software decode: reliable everywhere. (Hardware decode via the bundled/system
+    // libmpv proved flaky — "hardware accelerator failed to decode picture" — and could
+    // stall playback; mpv's SW decode is fast enough for this use.)
+    mpv_set_option_string(mpv_, "hwdec", "no");
+    mpv_request_log_messages(mpv_, "error");
     if (mpv_initialize(mpv_) < 0) {
       mpv_destroy(mpv_);
       mpv_ = nullptr;
@@ -58,6 +62,23 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
   mpv_handle* mpv_ = nullptr;
   mpv_render_context* ctx_ = nullptr;
   std::vector<uint8_t> buf_;
+
+  // Drain mpv's event queue (it can stall the core if left unread) and surface errors.
+  void DrainEvents() {
+    if (!mpv_) return;
+    for (;;) {
+      mpv_event* ev = mpv_wait_event(mpv_, 0);
+      if (!ev || ev->event_id == MPV_EVENT_NONE) break;
+      if (ev->event_id == MPV_EVENT_LOG_MESSAGE) {
+        auto* m = static_cast<mpv_event_log_message*>(ev->data);
+        fprintf(stderr, "[mpv:%s] %s", m->level, m->text);
+      } else if (ev->event_id == MPV_EVENT_END_FILE) {
+        auto* e = static_cast<mpv_event_end_file*>(ev->data);
+        if (e->reason == MPV_END_FILE_REASON_ERROR)
+          fprintf(stderr, "[mpv] file error: %s\n", mpv_error_string(e->error));
+      }
+    }
+  }
 
   void Cleanup() {
     if (ctx_) {
@@ -109,6 +130,7 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
   // videoSize() → { w, h } of the current video (decoded size), or 0×0 if none yet.
   Napi::Value VideoSize(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
+    DrainEvents();
     int64_t w = 0, h = 0;
     if (mpv_) {
       mpv_get_property(mpv_, "dwidth", MPV_FORMAT_INT64, &w);
@@ -125,6 +147,7 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
   Napi::Value RenderFrame(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
     if (!ctx_) return env.Null();
+    DrainEvents();
     int w = info[0].As<Napi::Number>().Int32Value();
     int h = info[1].As<Napi::Number>().Int32Value();
     if (w <= 0 || h <= 0) return env.Null();
