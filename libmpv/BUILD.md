@@ -1,60 +1,87 @@
-# Building Cooliris Next (original edition)
+# Building Cooliris Next — libmpv edition
 
-This is the **original** edition — the lightweight build with **no ffmpeg** and
-**no subtitle/caption** support. It plays whatever the browser engine (Chromium)
-can play natively (mp4/webm, jpg/png/gif, mp3/flac, …). For mkv/avi/HEVC, embedded
-subtitles, audio-track switching, etc., use the sibling `cooliris-next-ffmpeg`
-folder instead.
+This edition plays **every format instantly** (mkv/avi/HEVC/AC‑3/DTS, all audio +
+subtitle tracks) with **no transcoding**, by decoding with **libmpv** and painting frames
+into a `<canvas>`. mpv runs in its own Node process (never the Electron binary), so it
+uses a full ffmpeg with no conflict. See `MPV.md` for the architecture.
 
-## Prerequisites
+Unlike the `ffmpeg` edition, this one has a **native C++ addon** (`native/mpv.node`) that
+links libmpv — so building involves a compile step, and the runtime bundles libmpv.
 
+## Prerequisites (all platforms)
 - **Node.js 22+** and **npm**.
-- For building a **Windows** installer **on Linux/macOS**: **Wine**
-  (electron-builder uses it to assemble the NSIS installer).
-  - Arch/CachyOS: `sudo pacman -S wine`
-  - Debian/Ubuntu: `sudo apt install wine`
-  - Building Windows *on Windows* needs no Wine.
+- A **C/C++ toolchain** + **python** + **node-gyp** (to build the native addon).
 
-There are **no native/binary dependencies** — cover-art extraction is pure JS — so
-`npm install` is all that's needed, no special flags.
+Per-platform, additionally:
+- **Linux:** `libmpv` + headers + `pkg-config` (Arch/CachyOS: `sudo pacman -S mpv`;
+  Debian/Ubuntu: `sudo apt install libmpv-dev pkg-config`).
+- **Windows:** **Visual Studio Build Tools** (C++), a libmpv **dev** package
+  (`mpv-dev-x86_64-*.7z` from sourceforge → *mpv-player-windows/libmpv*), and **7‑Zip**.
 
 ## 1. Install dependencies
-
 ```bash
 npm install
 ```
 
-## 2. Build
-
+## 2. Build for Linux  (self-contained AppImage)
 ```bash
-# Linux only  → release/Cooliris Next-<version>.AppImage
-npm run electron:build:linux
+# build the native addon for your Node
+cd native && npx node-gyp rebuild && cd ..
 
-# Windows only → release/Cooliris Next Setup <version>.exe   (needs Wine on Linux)
-npm run electron:build:win
+# collect a self-contained runtime: a Node binary + libmpv and its deps → vendor/
+bash scripts/bundle-linux.sh
 
-# Both at once
-ELECTRON=1 npm run build && npx electron-builder --linux AppImage --win nsis
+# renderer + main, then package
+ELECTRON=1 npm run build
+npx electron-builder --linux AppImage          # → release/Cooliris Next-<ver>.AppImage
 ```
+At runtime the app runs the mpv host under `vendor/node` with
+`LD_LIBRARY_PATH=vendor/lib`, so **no system Node or mpv is required**.
 
-Unpacked (no installer), for quick testing:
+> If a rebuild seems stale, clear caches: `rm -rf node_modules/.vite dist dist-electron`.
 
-```bash
-ELECTRON=1 npm run build && npx electron-builder --linux dir   # release/linux-unpacked/
-ELECTRON=1 npm run build && npx electron-builder --win dir     # release/win-unpacked/
+## 3. Build for Windows  (run **on Windows**, in a Developer prompt)
+```powershell
+# 1. download + extract a libmpv dev package (mpv-dev-x86_64-*.7z)
+# 2. headers + import lib + dll:
+pwsh scripts/setup-windows.ps1 -MpvDev C:\path\to\mpv-dev-x86_64-vXXXX
+# 3. build the native addon (against your Node's ABI):
+cd native; npx node-gyp rebuild; cd ..
+# 4. self-contained runtime: vendor\{node.exe, libmpv-2.dll}
+pwsh scripts/bundle-windows.ps1
+# 5. renderer + main, then package
+$env:ELECTRON=1; npm run build
+npx electron-builder --win nsis                # → release\Cooliris Next Setup <ver>.exe
 ```
+Windows `libmpv-2.dll` is self-contained (ffmpeg baked in), so the bundle is just
+`node.exe` + that one DLL. At runtime `vendor\` is on `PATH` so the DLL loads.
 
-> **Note:** if a rebuild doesn't seem to pick up changes, clear the Vite/Electron
-> caches first: `rm -rf node_modules/.vite dist-electron dist release`.
+## Why you can't cross-build the Windows version from Linux (even with Wine)
 
-## 3. Output
+The **ffmpeg** edition *can* be cross-built from Linux with Wine — because that build has
+**no compilation**: the renderer/main are plain JS, the ffmpeg binaries are pre-built and
+just downloaded per OS, and electron-builder only uses Wine to **assemble the NSIS
+installer** (zip the files into a `.exe`). Wine is enough to *run* that packager tool.
 
-Everything lands in `release/`:
+This **libmpv** edition is different: it contains a **native C++ addon** that must be
+**compiled into a Windows `.node`** (linked against the Windows libmpv import library and
+the **Windows Node ABI**). That needs a real **Windows C++ compiler (MSVC)** — and:
 
-| Platform | File | Approx size |
-|----------|------|-------------|
-| Linux | `Cooliris Next-<version>.AppImage` | ~125 MB |
-| Windows | `Cooliris Next Setup <version>.exe` | ~100 MB |
+- **Wine is not a compiler.** Wine runs Windows *executables* on Linux; it does not
+  produce Windows object code. It can't turn `mpv_addon.cc` into a Windows `.node`.
+- Running MSVC itself *under* Wine is unsupported and breaks in practice (node-gyp +
+  MSBuild + the Windows SDK do not work reliably under Wine).
+- The realistic cross-compile alternative (MinGW) won't match the **MSVC Node ABI** that
+  Electron's Node expects, and linking libmpv + N‑API that way is fragile/unsupported.
 
-- **Linux:** `chmod +x "Cooliris Next-<version>.AppImage"` then run it.
-- **Windows:** run the `Setup` exe (per-user install, no admin needed).
+So a native addon has to be built with the target OS's own toolchain. The Windows build
+must be produced **on Windows** (a Windows PC or Windows CI such as GitHub Actions
+`windows-latest`); only the final installer assembly — not compilation — is what Wine
+ever helped with.
+
+## Runtime notes
+- Subtitles default **off**; choose a track (and adjust size / text color / background +
+  opacity) from the **CC** menu. Audio language switches live from the **🌐** menu.
+- mpv logs surface in the terminal prefixed `[mpv-host]` (run from a terminal to see them).
+- Dev (`npm run electron:preview`) uses the **system** Node + mpv; the `vendor/` bundle is
+  only used in the packaged app.
