@@ -27,8 +27,12 @@ and it even renders subtitles into the frame for us.
 - [x] **M2 — frames**: SW render API → `renderFrame(w,h)` returns the composited RGBA
       frame, `videoSize()` the dimensions, `hwdec=auto-safe`. Verified: decoded an mkv
       to a real (non-black) frame with no transcode.
-- [ ] **M3 — renderer integration**: paint frames in the lightbox; wire play/pause/seek/
-      volume; replace the `<video>` player.
+- [~] **M3 — renderer integration** (implemented; needs on-device run): `electron/mpv.ts`
+      loads the addon in the main process + IPC (`mpv-load/cmd/set/get/size/frame/stop`);
+      `MpvPlayer.tsx` paints frames into a <canvas> (~30fps, capped at 1280w to bound the
+      per-frame IPC) with play/pause/seek/volume + keyboard, wired into the Lightbox.
+      Addon rebuilt against Electron 42 ABI; renderer + main compile. Couldn't launch
+      Electron in the build sandbox, so visual playback is pending a run on a real desktop.
 - [ ] **M4 — tracks**: audio + subtitle track lists and switching (mpv properties; subs
       are burned into the frame by mpv — no overlay needed).
 - [ ] **M5 — packaging**: bundle `libmpv` per OS (Win `libmpv-2.dll`, Linux `libmpv.so`,

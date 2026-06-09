@@ -34,6 +34,15 @@ interface ElectronBridge {
   getPathForFile(file: File): string;
   statFile(abs: string): Promise<{ mtime: number; btime: number } | null>;
   scanPaths(paths: string[]): Promise<ScanResult | null>;
+  // libmpv all-format player (Option C).
+  mpvAvailable(): Promise<boolean>;
+  mpvLoad(abs: string): Promise<unknown>;
+  mpvCmd(args: string[]): Promise<boolean>;
+  mpvSet(name: string, value: string): Promise<boolean>;
+  mpvGet(name: string): Promise<string | null>;
+  mpvSize(): Promise<{ w: number; h: number }>;
+  mpvFrame(w: number, h: number): Promise<Uint8Array | null>;
+  mpvStop(): Promise<unknown>;
 }
 
 declare global {

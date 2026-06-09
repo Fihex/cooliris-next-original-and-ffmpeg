@@ -4,6 +4,17 @@ import { promises as fs, createReadStream } from "node:fs";
 import { Readable } from "node:stream";
 import path from "node:path";
 import { extractCoverArt } from "./coverArt";
+import {
+  mpvAvailable,
+  mpvLoad,
+  mpvCommand,
+  mpvSet,
+  mpvGet,
+  mpvVideoSize,
+  mpvFrame,
+  mpvStop,
+  mpvDestroy,
+} from "./mpv";
 
 // Content-Type for the local-media protocol — needed for correct playback/decoding.
 const MIME: Record<string, string> = {
@@ -242,6 +253,18 @@ ipcMain.handle("fetch-text", async (_e, url: string) => {
   return res.text();
 });
 
+/* ---------------------------------- libmpv ---------------------------------- */
+// All-format playback: the renderer loads a file, pulls RGBA frames each animation
+// frame, and drives playback through these. Frames are composited (video + subs) by mpv.
+ipcMain.handle("mpv-available", () => mpvAvailable());
+ipcMain.handle("mpv-load", (_e, abs: string) => mpvLoad(abs));
+ipcMain.handle("mpv-cmd", (_e, args: string[]) => mpvCommand(args));
+ipcMain.handle("mpv-set", (_e, name: string, value: string) => mpvSet(name, value));
+ipcMain.handle("mpv-get", (_e, name: string) => mpvGet(name));
+ipcMain.handle("mpv-size", () => mpvVideoSize());
+ipcMain.handle("mpv-frame", (_e, w: number, h: number) => mpvFrame(w, h));
+ipcMain.handle("mpv-stop", () => mpvStop());
+
 /* --------------------------------- window ----------------------------------- */
 function createWindow() {
   win = new BrowserWindow({
@@ -349,6 +372,8 @@ app.whenReady().then(() => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
+
+app.on("will-quit", () => mpvDestroy());
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();

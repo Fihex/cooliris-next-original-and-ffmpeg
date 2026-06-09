@@ -1,6 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { MediaItem } from "@/feed/types";
-import { VideoPlayer } from "./VideoPlayer";
+import { MpvPlayer } from "./MpvPlayer";
+
+// All videos play through libmpv (every format, no transcode). Recover the file path
+// from the coolmedia:// URL the scan produced.
+function decodeAbs(url: string): string {
+  try {
+    return decodeURIComponent(new URL(url).pathname.replace(/^\//, ""));
+  } catch {
+    return url;
+  }
+}
 
 interface LightboxProps {
   item: MediaItem;
@@ -130,29 +140,9 @@ export function Lightbox({
         else onClose();
         return;
       }
-      // On a video, the arrows drive playback instead of navigating items:
-      // ←/→ seek ∓10s, ↑/↓ change volume.
-      const v = videoRef.current;
-      if (isVideo && v) {
-        if (e.key === "ArrowRight") {
-          e.preventDefault();
-          v.currentTime = Math.min(v.duration || Infinity, v.currentTime + 10);
-          v.dispatchEvent(new CustomEvent("uiskip", { detail: "forward" }));
-        } else if (e.key === "ArrowLeft") {
-          e.preventDefault();
-          v.currentTime = Math.max(0, v.currentTime - 10);
-          v.dispatchEvent(new CustomEvent("uiskip", { detail: "back" }));
-        } else if (e.key === "ArrowUp") {
-          e.preventDefault();
-          v.muted = false;
-          v.volume = clamp(v.volume + 0.1, 0, 1);
-        } else if (e.key === "ArrowDown") {
-          e.preventDefault();
-          v.muted = false;
-          v.volume = clamp(v.volume - 0.1, 0, 1);
-        }
-        return;
-      }
+      // Videos play through MpvPlayer, which owns the arrow keys (seek / volume) —
+      // don't let the lightbox navigate items while watching one.
+      if (isVideo) return;
       if (e.key === "ArrowRight") onNext();
       else if (e.key === "ArrowLeft") onPrev();
     };
@@ -286,17 +276,17 @@ export function Lightbox({
           Images/audio use the shared stage: a reserved bottom band keeps the media
           centered above the info panel; zoom origin is the stage center. */}
       {isVideo ? (
-        <VideoPlayer
-          src={item.full}
+        <MpvPlayer
+          abs={decodeAbs(item.full)}
           itemId={item.id}
           t={t}
           smooth={smooth}
           stageRef={stageRef}
-          videoRef={videoRef}
           fullscreen={isFullscreen}
           chromeHidden={hideChrome}
           onFullscreen={toggleFullscreen}
           onRequestClose={onClose}
+          onPlayingChange={(p) => setVideoPaused(!p)}
         />
       ) : (
         <div ref={stageRef} className="absolute inset-0">

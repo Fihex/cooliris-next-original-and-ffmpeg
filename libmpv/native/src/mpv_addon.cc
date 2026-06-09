@@ -140,6 +140,8 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
       {MPV_RENDER_PARAM_INVALID, nullptr},
     };
     if (mpv_render_context_render(ctx_, rp) < 0) return env.Null();
+    // mpv's "rgb0" leaves the 4th byte as 0 → transparent on a canvas. Force opaque.
+    for (size_t i = 3; i < buf_.size(); i += 4) buf_[i] = 255;
     return Napi::Buffer<uint8_t>::New(env, buf_.data(), buf_.size());
   }
 

@@ -16,4 +16,13 @@ contextBridge.exposeInMainWorld("electron", {
   getPathForFile: (file: File) => webUtils.getPathForFile(file),
   statFile: (abs: string) => ipcRenderer.invoke("stat-file", abs),
   scanPaths: (paths: string[]) => ipcRenderer.invoke("scan-paths", paths),
+  // libmpv all-format player (Option C).
+  mpvAvailable: () => ipcRenderer.invoke("mpv-available"),
+  mpvLoad: (abs: string) => ipcRenderer.invoke("mpv-load", abs),
+  mpvCmd: (args: string[]) => ipcRenderer.invoke("mpv-cmd", args),
+  mpvSet: (name: string, value: string) => ipcRenderer.invoke("mpv-set", name, value),
+  mpvGet: (name: string) => ipcRenderer.invoke("mpv-get", name),
+  mpvSize: () => ipcRenderer.invoke("mpv-size"),
+  mpvFrame: (w: number, h: number) => ipcRenderer.invoke("mpv-frame", w, h),
+  mpvStop: () => ipcRenderer.invoke("mpv-stop"),
 });
