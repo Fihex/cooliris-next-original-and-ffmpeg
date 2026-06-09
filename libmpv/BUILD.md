@@ -56,6 +56,26 @@ npx electron-builder --win nsis                # → release\Cooliris Next Setup
 Windows `libmpv-2.dll` is self-contained (ffmpeg baked in), so the bundle is just
 `node.exe` + that one DLL. At runtime `vendor\` is on `PATH` so the DLL loads.
 
+## Unpacked builds (no installer — a folder you run directly)
+Swap the installer target for `dir`. You still do the same addon build + `vendor/`
+bundling first; only the final packaging differs (no AppImage/NSIS assembly, so it's
+faster and Wine isn't involved at all):
+```bash
+# Linux  → release/linux-unpacked/  (run ./"cooliris-next")
+ELECTRON=1 npm run build && npx electron-builder --linux dir
+```
+```powershell
+# Windows (on Windows) → release\win-unpacked\  (run "Cooliris Next.exe")
+$env:ELECTRON=1; npm run build; npx electron-builder --win dir
+```
+The unpacked folder contains everything the installer would (the `vendor/` runtime in
+`resources/vendor`, the addon in `resources/app.asar.unpacked`), so it's fully
+self-contained and portable — just copy the folder.
+
+> The **Windows** unpacked build must still be produced **on Windows**: `--win dir` skips
+> the installer/Wine step, but the native `mpv.node` inside it must be the Windows build
+> (a Linux-made `--win dir` would contain the Linux addon and won't run on Windows).
+
 ## Why you can't cross-build the Windows version from Linux (even with Wine)
 
 The **ffmpeg** edition *can* be cross-built from Linux with Wine — because that build has
