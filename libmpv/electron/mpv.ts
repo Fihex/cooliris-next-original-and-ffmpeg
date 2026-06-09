@@ -7,10 +7,14 @@ import { fork, execSync, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
+// These files (host script + addon) are asarUnpacked and must be read by the EXTERNAL
+// node process, which can't see inside the asar. So when packaged, point at the real
+// on-disk app.asar.unpacked path — NOT app.getAppPath() (that's the virtual asar path,
+// which Electron's patched fs reports as existing but plain node can't load).
 function pick(rel: string): string {
-  const dev = path.join(app.getAppPath(), rel);
-  const packed = path.join(process.resourcesPath, "app.asar.unpacked", rel);
-  return existsSync(dev) ? dev : packed;
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "app.asar.unpacked", rel)
+    : path.join(app.getAppPath(), rel);
 }
 const hostScript = () => pick(path.join("electron", "mpvHost.cjs"));
 const addonFile = () => pick(path.join("native", "build", "Release", "mpv.node"));
