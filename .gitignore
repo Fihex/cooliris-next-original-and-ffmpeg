@@ -8,9 +8,6 @@ release/
 # TypeScript / tooling caches
 *.tsbuildinfo
 
-# Portable runtime config (written next to the app)
-cooliris.config.json
-
 # OS / editor cruft
 .DS_Store
 Thumbs.db
