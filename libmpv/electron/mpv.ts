@@ -15,10 +15,10 @@ function pick(rel: string): string {
 const hostScript = () => pick(path.join("electron", "mpvHost.cjs"));
 const addonFile = () => pick(path.join("native", "build", "Release", "mpv.node"));
 
-// Self-contained runtime bundled by scripts/bundle-linux.sh (vendor/node + vendor/lib),
-// shipped as extraResources. When present, the app needs no system Node or mpv.
-const vendorDir = () =>
-  app.isPackaged ? path.join(process.resourcesPath, "vendor") : path.join(app.getAppPath(), "vendor");
+// Self-contained runtime bundled by scripts/bundle-*.sh (vendor/node + vendor/lib),
+// shipped as extraResources. Only used in the packaged app — in dev we use the system
+// Node + system mpv (avoids the bundle interfering with development).
+const vendorDir = () => (app.isPackaged ? path.join(process.resourcesPath, "vendor") : "");
 
 // A Node binary to run the host under (must NOT be the Electron binary): bundled if
 // present, else system Node.
@@ -69,12 +69,14 @@ function ensureChild(): ChildProcess {
       cb(msg.result);
     }
   });
-  child.on("exit", (code) => {
-    console.log("[mpv] host exited", code);
+  const dead = (why: string) => {
+    if (child) console.error("[mpv] host", why);
     child = null;
     pending.forEach((cb) => cb(null));
     pending.clear();
-  });
+  };
+  child.on("exit", (code) => dead(`exited ${code}`));
+  child.on("error", (e) => dead(`error: ${e.message}`));
   return child;
 }
 
@@ -82,7 +84,18 @@ function call<T = unknown>(fn: string, args: unknown[]): Promise<T> {
   return new Promise((resolve) => {
     const id = nextId++;
     pending.set(id, resolve as (v: unknown) => void);
-    ensureChild().send({ id, fn, args });
+    try {
+      // send can throw EPIPE if the host already died — fail soft instead of crashing.
+      ensureChild().send({ id, fn, args }, (err) => {
+        if (err) {
+          pending.delete(id);
+          resolve(null as T);
+        }
+      });
+    } catch {
+      pending.delete(id);
+      resolve(null as T);
+    }
   });
 }
 
