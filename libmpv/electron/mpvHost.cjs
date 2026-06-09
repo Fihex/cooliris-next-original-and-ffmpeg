@@ -1,12 +1,12 @@
-// mpv host — runs in an Electron utilityProcess (a plain Node process). Crucially it does
-// NOT load Chromium's cut-down libffmpeg.so, so libmpv uses the full system ffmpeg (all
-// codecs / subtitles). The main process talks to it over parentPort; frames come back as
-// transferred ArrayBuffers. Keep this file plain CommonJS — it's run directly, not bundled.
+// mpv host — runs under SYSTEM Node (forked by the main process), NOT the Electron
+// binary. So it never loads Chromium's cut-down libffmpeg.so; libmpv uses the full
+// system ffmpeg directly (all codecs/subtitles), with no LD_PRELOAD hacks. Talks to the
+// main process over Node IPC (advanced serialization → Buffers pass as binary).
+// Plain CommonJS — run directly, not bundled.
 const path = require("node:path");
 
 let player = null;
 try {
-  // dev: <root>/native/...   packaged: app.asar.unpacked/native/...
   const candidates = [
     path.join(__dirname, "..", "native", "build", "Release", "mpv.node"),
     path.join(process.resourcesPath || "", "app.asar.unpacked", "native", "build", "Release", "mpv.node"),
@@ -26,8 +26,8 @@ try {
   console.error("[mpv-host] init failed:", e && e.message);
 }
 
-process.parentPort.on("message", (e) => {
-  const { id, fn, args } = e.data || {};
+process.on("message", (m) => {
+  const { id, fn, args } = m || {};
   let result = null;
   try {
     if (!player) throw new Error("mpv unavailable");
@@ -43,7 +43,9 @@ process.parentPort.on("message", (e) => {
   } catch {
     result = null;
   }
-  // Transfer the frame's backing buffer (large, dedicated) to avoid a copy.
-  const transfer = result && result.buffer instanceof ArrayBuffer ? [result.buffer] : [];
-  process.parentPort.postMessage({ id, result }, transfer);
+  try {
+    process.send({ id, result });
+  } catch {
+    /* channel closed */
+  }
 });
