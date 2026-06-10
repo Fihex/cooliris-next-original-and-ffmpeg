@@ -21,9 +21,11 @@ ships **official, self-contained binaries for every OS**, which makes packaging
   auto-enables them) until chosen.
 
 ## Differences vs the libmpv edition
-- **Subtitle styling is selection-only.** libVLC 3 has no runtime equivalents of mpv's
-  `sub-font-size` / `sub-color` / `sub-back-color`, so the size/color/background pickers
-  don't exist here. Track selection (audio + subs) works the same.
+- **Subtitle styling works via player recreate.** libVLC 3 has no runtime equivalents of
+  mpv's `sub-font-size` / `sub-color` / `sub-back-color` — style options (freetype) are
+  creation-time only. The CC menu's Style tab therefore applies changes by recreating
+  the player with new options and restoring the file/position/tracks (a brief reload,
+  debounced). Track selection (audio + subs) works the same as the mpv edition.
 - **Track labels** come from VLC's descriptions (a display name; no separate language
   field).
 - **Volume** is 0–100 (mpv allowed up to 130).

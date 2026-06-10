@@ -43,6 +43,7 @@ interface ElectronBridge {
   vlcSize(): Promise<{ w: number; h: number }>;
   vlcFrame(w: number, h: number): Promise<Uint8Array | null>;
   vlcStop(): Promise<unknown>;
+  vlcStyle(args: string[]): Promise<boolean>;
 }
 
 declare global {

@@ -10,7 +10,6 @@ import { useEffect, useRef, useState } from "react";
  */
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
-const MAX_W = 1280; // cap render width → bounds the per-frame IPC payload
 const FRAME_MS = 33; // ~30fps
 
 interface Transform {
@@ -63,6 +62,14 @@ export function VlcPlayer({
   const [activeSid, setActiveSid] = useState("no");
   const [audioMenu, setAudioMenu] = useState(false);
   const [capsMenu, setCapsMenu] = useState(false);
+  const [capsTab, setCapsTab] = useState<"tracks" | "style">("tracks");
+  // Subtitle style. libVLC 3 only takes these at player creation, so applying a change
+  // recreates the player (host restores file/position/tracks — a brief reload).
+  const [subSize, setSubSize] = useState(48);
+  const [subColor, setSubColor] = useState("#ffffff");
+  const [subBg, setSubBg] = useState("#000000");
+  const [subBgAlpha, setSubBgAlpha] = useState(0); // 0 = transparent … 100 = opaque
+  const styleTimer = useRef<number>(0);
   const shownRef = useRef(false);
   const seeking = useRef(false);
   const trackRef = useRef<HTMLDivElement>(null);
@@ -123,11 +130,27 @@ export function VlcPlayer({
     setActiveAid(id);
     setAudioMenu(false);
   };
-  // Note: unlike the libmpv edition, libVLC 3 has no runtime subtitle styling (font
-  // size / colors / background) — the CC menu is selection-only here.
   const selectSub = (id: string) => {
     vlc?.vlcSet("sid", id);
     setActiveSid(id);
+  };
+
+  // Debounced style apply: sliders fire many events, and each apply means a player
+  // recreate + reload — batch them ~600ms after the last change.
+  const applyStyle = (size: number, color: string, bg: string, bgAlpha: number) => {
+    setSubSize(size);
+    setSubColor(color);
+    setSubBg(bg);
+    setSubBgAlpha(bgAlpha);
+    window.clearTimeout(styleTimer.current);
+    styleTimer.current = window.setTimeout(() => {
+      vlc?.vlcStyle([
+        `--freetype-fontsize=${size}`,
+        `--freetype-color=${parseInt(color.slice(1), 16)}`,
+        `--freetype-background-color=${parseInt(bg.slice(1), 16)}`,
+        `--freetype-background-opacity=${Math.round(bgAlpha * 2.55)}`,
+      ]);
+    }, 600);
   };
 
   // Load the file and pump frames into the canvas while this item is shown.
@@ -141,6 +164,11 @@ export function VlcPlayer({
     setCur(0);
     setDur(0);
     setPlaying(true);
+    // Ask VLC to render (video + subtitles) at ~display resolution, not the file's —
+    // this is what keeps subtitle text crisp when the video is smaller than the screen.
+    const dpr = window.devicePixelRatio || 1;
+    const targetW = Math.min(Math.round(window.screen.width * dpr), 1920);
+    vlc.vlcSet("render-width", String(targetW));
     vlc.vlcLoad(abs);
 
     const ctx = canvasRef.current?.getContext("2d") ?? null;
@@ -151,8 +179,9 @@ export function VlcPlayer({
         try {
           const sz = await vlc.vlcSize();
           if (sz && sz.w > 0 && ctx && canvasRef.current) {
-            const rw = Math.min(sz.w, MAX_W);
-            const rh = Math.max(1, Math.round((sz.h * rw) / sz.w));
+            // The addon reports the exact buffer size it renders at — request that.
+            const rw = sz.w;
+            const rh = sz.h;
             if (canvasRef.current.width !== rw || canvasRef.current.height !== rh) {
               canvasRef.current.width = rw;
               canvasRef.current.height = rh;
@@ -411,26 +440,92 @@ export function VlcPlayer({
               </svg>
             </button>
             {capsMenu && (
-              <div className="absolute bottom-full right-0 mb-2 min-w-32 overflow-hidden rounded-lg bg-black/90 py-1 text-sm ring-1 ring-white/10">
-                <button
-                  onClick={() => selectSub("no")}
-                  className={`block w-full px-3 py-1.5 text-left hover:bg-white/10 ${
-                    activeSid === "no" ? "text-white" : "text-white/70"
-                  }`}
-                >
-                  Off
-                </button>
-                {subTracks.map((tr) => (
-                  <button
-                    key={tr.id}
-                    onClick={() => selectSub(tr.id)}
-                    className={`block w-full truncate px-3 py-1.5 text-left hover:bg-white/10 ${
-                      activeSid === tr.id ? "text-white" : "text-white/70"
-                    }`}
-                  >
-                    {tr.label}
-                  </button>
-                ))}
+              <div className="absolute bottom-full right-0 mb-2 w-64 overflow-hidden rounded-lg bg-black/90 text-sm ring-1 ring-white/10">
+                {/* Tabs keep the menu compact — many subtitle tracks no longer push the
+                    style controls off-screen. */}
+                <div className="flex border-b border-white/10 text-xs">
+                  {(["tracks", "style"] as const).map((tab) => (
+                    <button
+                      key={tab}
+                      onClick={() => setCapsTab(tab)}
+                      className={`flex-1 px-3 py-2 uppercase tracking-wide ${
+                        capsTab === tab ? "bg-white/10 text-white" : "text-white/50 hover:text-white"
+                      }`}
+                    >
+                      {tab === "tracks" ? "Subtitles" : "Style"}
+                    </button>
+                  ))}
+                </div>
+
+                {capsTab === "tracks" ? (
+                  <div className="max-h-56 overflow-y-auto py-1">
+                    <button
+                      onClick={() => selectSub("no")}
+                      className={`block w-full px-3 py-1.5 text-left hover:bg-white/10 ${
+                        activeSid === "no" ? "text-white" : "text-white/70"
+                      }`}
+                    >
+                      Off
+                    </button>
+                    {subTracks.map((tr) => (
+                      <button
+                        key={tr.id}
+                        onClick={() => selectSub(tr.id)}
+                        className={`block w-full truncate px-3 py-1.5 text-left hover:bg-white/10 ${
+                          activeSid === tr.id ? "text-white" : "text-white/70"
+                        }`}
+                      >
+                        {tr.label}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="space-y-2 px-3 py-2 text-white/80">
+                    <label className="flex items-center justify-between gap-2">
+                      <span>Size</span>
+                      <input
+                        type="range"
+                        min={20}
+                        max={100}
+                        value={subSize}
+                        onChange={(e) => applyStyle(Number(e.target.value), subColor, subBg, subBgAlpha)}
+                        className="w-28 accent-white"
+                      />
+                    </label>
+                    <label className="flex items-center justify-between gap-2">
+                      <span>Text color</span>
+                      <input
+                        type="color"
+                        value={subColor}
+                        onChange={(e) => applyStyle(subSize, e.target.value, subBg, subBgAlpha)}
+                        className="h-6 w-10 cursor-pointer rounded bg-transparent"
+                      />
+                    </label>
+                    <label className="flex items-center justify-between gap-2">
+                      <span>Background</span>
+                      <input
+                        type="color"
+                        value={subBg}
+                        onChange={(e) => applyStyle(subSize, subColor, e.target.value, subBgAlpha)}
+                        className="h-6 w-10 cursor-pointer rounded bg-transparent"
+                      />
+                    </label>
+                    <label className="flex items-center justify-between gap-2">
+                      <span>BG opacity</span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={100}
+                        value={subBgAlpha}
+                        onChange={(e) => applyStyle(subSize, subColor, subBg, Number(e.target.value))}
+                        className="w-28 accent-white"
+                      />
+                    </label>
+                    <div className="pt-1 text-[11px] leading-snug text-white/40">
+                      Applies with a quick reload (VLC sets style at startup).
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>

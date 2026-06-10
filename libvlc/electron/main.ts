@@ -13,6 +13,7 @@ import {
   vlcVideoSize,
   vlcFrame,
   vlcStop,
+  vlcStyle,
   vlcDestroy,
 } from "./vlc";
 
@@ -264,6 +265,7 @@ ipcMain.handle("vlc-get", (_e, name: string) => vlcGet(name));
 ipcMain.handle("vlc-size", () => vlcVideoSize());
 ipcMain.handle("vlc-frame", (_e, w: number, h: number) => vlcFrame(w, h));
 ipcMain.handle("vlc-stop", () => vlcStop());
+ipcMain.handle("vlc-style", (_e, args: string[]) => vlcStyle(args));
 
 /* --------------------------------- window ----------------------------------- */
 function createWindow() {

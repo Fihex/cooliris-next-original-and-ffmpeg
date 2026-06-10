@@ -25,4 +25,5 @@ contextBridge.exposeInMainWorld("electron", {
   vlcSize: () => ipcRenderer.invoke("vlc-size"),
   vlcFrame: (w: number, h: number) => ipcRenderer.invoke("vlc-frame", w, h),
   vlcStop: () => ipcRenderer.invoke("vlc-stop"),
+  vlcStyle: (args: string[]) => ipcRenderer.invoke("vlc-style", args),
 });

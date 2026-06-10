@@ -18,7 +18,7 @@
 #include <vector>
 
 namespace {
-constexpr unsigned MAX_WIDTH = 1280; // cap render width (bounds frame IPC size)
+constexpr unsigned MAX_WIDTH = 1920; // cap render width (bounds frame IPC size)
 
 uint8_t* alignedPtr(std::vector<uint8_t>& v, size_t size) {
   v.resize(size + 32);
@@ -52,9 +52,20 @@ class VlcPlayer : public Napi::ObjectWrap<VlcPlayer> {
 
   VlcPlayer(const Napi::CallbackInfo& info) : Napi::ObjectWrap<VlcPlayer>(info) {
     Napi::Env env = info.Env();
-    inst_ = libvlc_new(0, nullptr);
+    // Optional ctor arg: an array of VLC command-line options. This is how subtitle
+    // style is applied on libVLC 3 (e.g. --freetype-fontsize=…) — these options are
+    // creation-time only, so a style change means recreating the player (host does it).
+    std::vector<std::string> argStore;
+    std::vector<const char*> argv;
+    if (info.Length() > 0 && info[0].IsArray()) {
+      Napi::Array arr = info[0].As<Napi::Array>();
+      for (uint32_t i = 0; i < arr.Length(); i++)
+        argStore.push_back(arr.Get(i).ToString().Utf8Value());
+      for (auto& s : argStore) argv.push_back(s.c_str());
+    }
+    inst_ = libvlc_new((int)argv.size(), argv.empty() ? nullptr : argv.data());
     if (!inst_) {
-      Napi::Error::New(env, "libvlc_new failed (is the VLC plugin path set?)")
+      Napi::Error::New(env, "libvlc_new failed (bad option or missing VLC plugin path?)")
           .ThrowAsJavaScriptException();
       return;
     }
@@ -83,6 +94,10 @@ class VlcPlayer : public Napi::ObjectWrap<VlcPlayer> {
   uint8_t* front_ = nullptr;
   unsigned vw_ = 0, vh_ = 0, pitch_ = 0;
   std::atomic<bool> haveFrame_{false};
+  // Render target width (set from JS to ~display width). VLC scales the video AND
+  // renders subtitles at this size, so text stays crisp instead of being upscaled
+  // from the source resolution. 0 = just cap the source at MAX_WIDTH.
+  std::atomic<unsigned> desiredW_{0};
 
   // Cached track list (built lazily from VLC track descriptions).
   struct Track {
@@ -109,12 +124,13 @@ class VlcPlayer : public Napi::ObjectWrap<VlcPlayer> {
   static unsigned SetupCb(void** opaque, char* chroma, unsigned* width, unsigned* height,
                           unsigned* pitches, unsigned* lines) {
     auto* self = static_cast<VlcPlayer*>(*opaque);
-    // Cap the decode target; VLC scales to the size we request here.
-    unsigned w = *width, h = *height;
-    if (w > MAX_WIDTH) {
-      h = (unsigned)((uint64_t)h * MAX_WIDTH / w);
-      w = MAX_WIDTH;
-    }
+    // Pick the render size: the JS-requested display width when set (up or down —
+    // subtitles get rasterised at this size), else the source width; always capped.
+    unsigned srcW = *width, srcH = *height;
+    unsigned w = self->desiredW_ > 0 ? self->desiredW_.load() : srcW;
+    if (w > MAX_WIDTH) w = MAX_WIDTH;
+    if (w < 320) w = 320;
+    unsigned h = (unsigned)((uint64_t)srcH * w / (srcW ? srcW : 1));
     w &= ~1u;
     h &= ~1u;
     if (!w || !h) return 0;
@@ -234,6 +250,12 @@ class VlcPlayer : public Napi::ObjectWrap<VlcPlayer> {
       if (v < 0) v = 0;
       if (v > 100) v = 100;
       return libvlc_audio_set_volume(mp_, v) == 0;
+    }
+    if (name == "render-width") {
+      // Takes effect at the next playback setup (set before loadfile).
+      int w = atoi(val.c_str());
+      desiredW_ = w > 0 ? (unsigned)w : 0u;
+      return true;
     }
     if (name == "aid") return libvlc_audio_set_track(mp_, atoi(val.c_str())) == 0;
     if (name == "sid") {

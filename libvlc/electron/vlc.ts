@@ -122,6 +122,9 @@ export const vlcGet = (name: string) => call<string | null>("get", [name]);
 export const vlcVideoSize = () => call<{ w: number; h: number }>("size", []);
 export const vlcFrame = (w: number, h: number) => call<Uint8Array | null>("frame", [w, h]);
 export const vlcStop = () => call("stop", []);
+// Subtitle style on libVLC 3 is creation-time only: the host recreates the player with
+// these VLC options and restores file/position/tracks (a brief reload).
+export const vlcStyle = (args: string[]) => call<boolean>("style", [args]);
 export function vlcDestroy(): void {
   if (child) {
     try {

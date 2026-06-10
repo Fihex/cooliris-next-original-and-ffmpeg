@@ -1,0 +1,67 @@
+# Builds the libVLC edition for Windows on a real Windows runner (the native addon
+# needs MSVC, so it cannot be cross-built from Linux/Wine). Produces the NSIS installer
+# and the unpacked folder as downloadable artifacts.
+#
+# Run it from GitHub → Actions → "build libvlc (Windows)" → Run workflow.
+name: build libvlc (Windows)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download official VLC (SDK + DLLs + plugins)
+        shell: pwsh
+        working-directory: libvlc
+        run: |
+          Invoke-WebRequest -Uri "https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.zip" -OutFile vlc.zip
+          Expand-Archive vlc.zip -DestinationPath .
+
+      - name: Install dependencies
+        working-directory: libvlc
+        run: npm install
+
+      - name: Prepare VLC SDK (headers + import libs)
+        shell: pwsh
+        working-directory: libvlc
+        run: pwsh scripts/setup-windows.ps1 -VlcDir (Resolve-Path .\vlc-3.0.21)
+
+      - name: Build native addon (vlc.node)
+        working-directory: libvlc/native
+        run: npx node-gyp rebuild
+
+      - name: Bundle self-contained runtime (node.exe + libvlc + plugins)
+        shell: pwsh
+        working-directory: libvlc
+        run: pwsh scripts/bundle-windows.ps1 -VlcDir (Resolve-Path .\vlc-3.0.21)
+
+      - name: Build renderer + main
+        shell: pwsh
+        working-directory: libvlc
+        run: |
+          $env:ELECTRON = "1"
+          npm run build
+
+      - name: Package (NSIS installer + unpacked folder)
+        working-directory: libvlc
+        run: npx electron-builder --win nsis dir
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: cooliris-libvlc-windows-installer
+          path: libvlc/release/*.exe
+
+      - name: Upload unpacked folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: cooliris-libvlc-windows-unpacked
+          path: libvlc/release/win-unpacked/**
