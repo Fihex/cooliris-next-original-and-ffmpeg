@@ -10,7 +10,7 @@ import { useEffect, useRef, useState } from "react";
  */
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
-const MAX_W = 1280; // cap render width → bounds the per-frame IPC payload
+const MAX_W = 1920; // cap render width → bounds the per-frame IPC payload
 const FRAME_MS = 33; // ~30fps
 
 interface Transform {
@@ -63,6 +63,7 @@ export function MpvPlayer({
   const [activeSid, setActiveSid] = useState("no");
   const [audioMenu, setAudioMenu] = useState(false);
   const [capsMenu, setCapsMenu] = useState(false);
+  const [capsTab, setCapsTab] = useState<"tracks" | "style">("tracks");
   // Subtitle style (applied live via mpv properties).
   const [subSize, setSubSize] = useState(44);
   const [subColor, setSubColor] = useState("#ffffff");
@@ -180,7 +181,11 @@ export function MpvPlayer({
         try {
           const sz = await mpv.mpvSize();
           if (sz && sz.w > 0 && ctx && canvasRef.current) {
-            const rw = Math.min(sz.w, MAX_W);
+            // Render at ~display width (not the file's), preserving the video's aspect —
+            // mpv composites subtitles at this size, so the text stays crisp instead of
+            // being upscaled with the video. Capped to bound the per-frame IPC.
+            const dpr = window.devicePixelRatio || 1;
+            const rw = Math.min(Math.round(window.screen.width * dpr), MAX_W);
             const rh = Math.max(1, Math.round((sz.h * rw) / sz.w));
             if (canvasRef.current.width !== rw || canvasRef.current.height !== rh) {
               canvasRef.current.width = rw;
@@ -440,70 +445,89 @@ export function MpvPlayer({
               </svg>
             </button>
             {capsMenu && (
-              <div className="absolute bottom-full right-0 mb-2 w-60 overflow-hidden rounded-lg bg-black/90 py-1 text-sm ring-1 ring-white/10">
-                <button
-                  onClick={() => selectSub("no")}
-                  className={`block w-full px-3 py-1.5 text-left hover:bg-white/10 ${
-                    activeSid === "no" ? "text-white" : "text-white/70"
-                  }`}
-                >
-                  Off
-                </button>
-                {subTracks.map((tr) => (
-                  <button
-                    key={tr.id}
-                    onClick={() => selectSub(tr.id)}
-                    className={`block w-full truncate px-3 py-1.5 text-left hover:bg-white/10 ${
-                      activeSid === tr.id ? "text-white" : "text-white/70"
-                    }`}
-                  >
-                    {tr.label}
-                  </button>
-                ))}
-
-                {/* Subtitle style — applied live. */}
-                <div className="mt-1 space-y-2 border-t border-white/10 px-3 pb-2 pt-2 text-white/80">
-                  <label className="flex items-center justify-between gap-2">
-                    <span>Size</span>
-                    <input
-                      type="range"
-                      min={20}
-                      max={90}
-                      value={subSize}
-                      onChange={(e) => applySubSize(Number(e.target.value))}
-                      className="w-28 accent-white"
-                    />
-                  </label>
-                  <label className="flex items-center justify-between gap-2">
-                    <span>Text color</span>
-                    <input
-                      type="color"
-                      value={subColor}
-                      onChange={(e) => applySubColor(e.target.value)}
-                      className="h-6 w-10 cursor-pointer rounded bg-transparent"
-                    />
-                  </label>
-                  <label className="flex items-center justify-between gap-2">
-                    <span>Background</span>
-                    <input
-                      type="color"
-                      value={subBg}
-                      onChange={(e) => applySubBg(e.target.value, subBgAlpha)}
-                      className="h-6 w-10 cursor-pointer rounded bg-transparent"
-                    />
-                  </label>
-                  <label className="flex items-center justify-between gap-2">
-                    <span>BG opacity</span>
-                    <input
-                      type="range"
-                      min={0}
-                      max={100}
-                      value={subBgAlpha}
-                      onChange={(e) => applySubBg(subBg, Number(e.target.value))}
-                      className="w-28 accent-white"
-                    />
-                  </label>
+              <div className="absolute bottom-full right-0 mb-2 w-64 overflow-hidden rounded-lg bg-black/90 text-sm ring-1 ring-white/10">
+                {/* Tabs keep the menu compact — many subtitle tracks no longer push the
+                    style controls off-screen. */}
+                <div className="flex border-b border-white/10 text-xs">
+                  {(["tracks", "style"] as const).map((tab) => (
+                    <button
+                      key={tab}
+                      onClick={() => setCapsTab(tab)}
+                      className={`flex-1 px-3 py-2 uppercase tracking-wide ${
+                        capsTab === tab ? "bg-white/10 text-white" : "text-white/50 hover:text-white"
+                      }`}
+                    >
+                      {tab === "tracks" ? "Subtitles" : "Style"}
+                    </button>
+                  ))}
                 </div>
+
+                {capsTab === "tracks" ? (
+                  <div className="max-h-56 overflow-y-auto py-1">
+                    <button
+                      onClick={() => selectSub("no")}
+                      className={`block w-full px-3 py-1.5 text-left hover:bg-white/10 ${
+                        activeSid === "no" ? "text-white" : "text-white/70"
+                      }`}
+                    >
+                      Off
+                    </button>
+                    {subTracks.map((tr) => (
+                      <button
+                        key={tr.id}
+                        onClick={() => selectSub(tr.id)}
+                        className={`block w-full truncate px-3 py-1.5 text-left hover:bg-white/10 ${
+                          activeSid === tr.id ? "text-white" : "text-white/70"
+                        }`}
+                      >
+                        {tr.label}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="space-y-2 px-3 py-2 text-white/80">
+                    <label className="flex items-center justify-between gap-2">
+                      <span>Size</span>
+                      <input
+                        type="range"
+                        min={20}
+                        max={90}
+                        value={subSize}
+                        onChange={(e) => applySubSize(Number(e.target.value))}
+                        className="w-28 accent-white"
+                      />
+                    </label>
+                    <label className="flex items-center justify-between gap-2">
+                      <span>Text color</span>
+                      <input
+                        type="color"
+                        value={subColor}
+                        onChange={(e) => applySubColor(e.target.value)}
+                        className="h-6 w-10 cursor-pointer rounded bg-transparent"
+                      />
+                    </label>
+                    <label className="flex items-center justify-between gap-2">
+                      <span>Background</span>
+                      <input
+                        type="color"
+                        value={subBg}
+                        onChange={(e) => applySubBg(e.target.value, subBgAlpha)}
+                        className="h-6 w-10 cursor-pointer rounded bg-transparent"
+                      />
+                    </label>
+                    <label className="flex items-center justify-between gap-2">
+                      <span>BG opacity</span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={100}
+                        value={subBgAlpha}
+                        onChange={(e) => applySubBg(subBg, Number(e.target.value))}
+                        className="w-28 accent-white"
+                      />
+                    </label>
+                  </div>
+                )}
               </div>
             )}
           </div>
