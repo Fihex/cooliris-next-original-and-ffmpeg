@@ -8,15 +8,62 @@ uses a full ffmpeg with no conflict. See `MPV.md` for the architecture.
 Unlike the `ffmpeg` edition, this one has a **native C++ addon** (`native/mpv.node`) that
 links libmpv — so building involves a compile step, and the runtime bundles libmpv.
 
-## Prerequisites (all platforms)
-- **Node.js 22+** and **npm**.
-- A **C/C++ toolchain** + **python** + **node-gyp** (to build the native addon).
+## What to install before building
 
-Per-platform, additionally:
-- **Linux:** `libmpv` + headers + `pkg-config` (Arch/CachyOS: `sudo pacman -S mpv`;
-  Debian/Ubuntu: `sudo apt install libmpv-dev pkg-config`).
-- **Windows:** **Visual Studio Build Tools** (C++), a libmpv **dev** package
-  (`mpv-dev-x86_64-*.7z` from sourceforge → *mpv-player-windows/libmpv*), and **7‑Zip**.
+Because of the native addon, you need a compiler toolchain in addition to Node — this is
+the one edition where `npm install` alone is not enough.
+
+### Linux
+
+Arch / CachyOS — one command covers everything:
+```bash
+sudo pacman -S --needed base-devel python nodejs npm mpv pkgconf
+```
+Debian / Ubuntu equivalent:
+```bash
+sudo apt install build-essential python3 nodejs npm libmpv-dev pkg-config
+```
+
+What each piece is for:
+
+| Package | Why it's needed |
+|---|---|
+| `base-devel` / `build-essential` | gcc + make — node-gyp compiles `mpv_addon.cc` with these |
+| `python` | node-gyp is a Python tool |
+| `nodejs` + `npm` | build tooling, and the binary that gets bundled into `vendor/` to run the mpv host |
+| `mpv` / `libmpv-dev` | **libmpv itself + its headers** (`/usr/include/mpv/*.h`) — what the addon links against, and what `bundle-linux.sh` copies into `vendor/lib` |
+| `pkgconf` / `pkg-config` | how `binding.gyp` locates libmpv (`pkg-config --cflags --libs mpv`) |
+
+**No Wine is needed for anything in this edition** (and it wouldn't help — see the
+cross-build section below).
+
+Sanity check before building: `pkg-config --modversion mpv` should print a version
+(e.g. `2.5.0`). If it doesn't, the headers aren't installed.
+
+### Windows  (the Windows build must be made *on* Windows)
+
+Install, in order:
+
+1. **Node.js LTS** — installer from <https://nodejs.org>. (Skip the installer's optional
+   "tools for native modules" checkbox; install the build tools yourself in step 2 —
+   it's more reliable.)
+2. **Visual Studio Build Tools 2022** — from
+   <https://visualstudio.microsoft.com/downloads/> → *Tools for Visual Studio*. In the
+   installer select the **“Desktop development with C++”** workload. This provides MSVC
+   (the compiler) and the Windows SDK — what node-gyp uses to compile the addon, and
+   `lib.exe`, which `setup-windows.ps1` uses to generate the import library.
+3. **Python 3** — from <https://python.org> (check “Add to PATH”). node-gyp requires it.
+   (The VS installer can also add it as a component — either way works.)
+4. **7‑Zip** — from <https://7-zip.org>, to extract the libmpv package.
+5. **The libmpv dev package** — download `mpv-dev-x86_64-*.7z` from
+   SourceForge → *mpv-player-windows / libmpv*
+   (<https://sourceforge.net/projects/mpv-player-windows/files/libmpv/>) and extract it
+   somewhere. It contains the headers (`include/mpv/*.h`), the self-contained
+   `libmpv-2.dll` (ffmpeg baked in), and the `.def` file used to generate `mpv.lib`.
+
+Then run the build steps below **from a “Developer PowerShell for VS 2022”** (or an
+*x64 Native Tools* prompt) — that's what puts `lib.exe` and the MSVC environment on
+PATH; a plain terminal will fail at `setup-windows.ps1`.
 
 ## 1. Install dependencies
 ```bash
