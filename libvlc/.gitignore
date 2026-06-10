@@ -1,0 +1,9 @@
+node_modules
+dist
+dist-ssr
+dist-electron
+release
+*.local
+.DS_Store
+.vite
+*.tsbuildinfo

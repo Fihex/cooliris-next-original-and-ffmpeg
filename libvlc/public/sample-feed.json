@@ -1,0 +1,131 @@
+{
+  "title": "Offline sample wall",
+  "items": [
+    {
+      "id": "s1",
+      "type": "image",
+      "thumb": "/samples/01.svg",
+      "full": "/samples/01.svg",
+      "title": "Sunset"
+    },
+    {
+      "id": "s2",
+      "type": "image",
+      "thumb": "/samples/02.svg",
+      "full": "/samples/02.svg",
+      "title": "Indigo"
+    },
+    {
+      "id": "s3",
+      "type": "image",
+      "thumb": "/samples/03.svg",
+      "full": "/samples/03.svg",
+      "title": "Emerald"
+    },
+    {
+      "id": "s4",
+      "type": "image",
+      "thumb": "/samples/04.svg",
+      "full": "/samples/04.svg",
+      "title": "Crimson"
+    },
+    {
+      "id": "s5",
+      "type": "image",
+      "thumb": "/samples/05.svg",
+      "full": "/samples/05.svg",
+      "title": "Amber"
+    },
+    {
+      "id": "s6",
+      "type": "image",
+      "thumb": "/samples/06.svg",
+      "full": "/samples/06.svg",
+      "title": "Orchid"
+    },
+    {
+      "id": "s7",
+      "type": "image",
+      "thumb": "/samples/07.svg",
+      "full": "/samples/07.svg",
+      "title": "Teal"
+    },
+    {
+      "id": "s8",
+      "type": "image",
+      "thumb": "/samples/08.svg",
+      "full": "/samples/08.svg",
+      "title": "Ember"
+    },
+    {
+      "id": "s9",
+      "type": "image",
+      "thumb": "/samples/09.svg",
+      "full": "/samples/09.svg",
+      "title": "Azure"
+    },
+    {
+      "id": "s10",
+      "type": "image",
+      "thumb": "/samples/10.svg",
+      "full": "/samples/10.svg",
+      "title": "Rose"
+    },
+    {
+      "id": "s11",
+      "type": "image",
+      "thumb": "/samples/11.svg",
+      "full": "/samples/11.svg",
+      "title": "Violet"
+    },
+    {
+      "id": "s12",
+      "type": "image",
+      "thumb": "/samples/12.svg",
+      "full": "/samples/12.svg",
+      "title": "Sky"
+    },
+    {
+      "id": "s13",
+      "type": "image",
+      "thumb": "/samples/13.svg",
+      "full": "/samples/13.svg",
+      "title": "Blush"
+    },
+    {
+      "id": "s14",
+      "type": "image",
+      "thumb": "/samples/14.svg",
+      "full": "/samples/14.svg",
+      "title": "Lagoon"
+    },
+    {
+      "id": "s15",
+      "type": "image",
+      "thumb": "/samples/15.svg",
+      "full": "/samples/15.svg",
+      "title": "Plum"
+    },
+    {
+      "id": "s16",
+      "type": "image",
+      "thumb": "/samples/16.svg",
+      "full": "/samples/16.svg",
+      "title": "Dusk"
+    },
+    {
+      "id": "s17",
+      "type": "image",
+      "thumb": "/samples/17.svg",
+      "full": "/samples/17.svg",
+      "title": "Sand"
+    },
+    {
+      "id": "s18",
+      "type": "image",
+      "thumb": "/samples/18.svg",
+      "full": "/samples/18.svg",
+      "title": "Lime"
+    }
+  ]
+}

@@ -22,3 +22,4 @@ vendor/
 
 # Windows libmpv dev files (downloaded by scripts/setup-windows.ps1)
 **/native/mpv-dev/
+**/native/vlc-sdk/
