@@ -140,7 +140,9 @@ export function MpvPlayer({
   };
   // Background box: mpv only draws one with a box border-style. With opacity 0 keep the
   // plain outline (readable, no box); above 0 switch to a background box of the chosen
-  // color. mpv color is #AARRGGBB (alpha first; FF = opaque).
+  // color. mpv color is #AARRGGBB (alpha first; FF = opaque). In background-box mode
+  // sub-shadow-offset acts as the box padding around the text — without it the text
+  // touches the box edges; it must be reset in outline mode or it becomes a drop shadow.
   const applySubBg = (c: string, a: number) => {
     setSubBg(c);
     setSubBgAlpha(a);
@@ -150,8 +152,10 @@ export function MpvPlayer({
         .padStart(2, "0");
       mpv?.mpvSet("sub-border-style", "background-box");
       mpv?.mpvSet("sub-back-color", `#${aa}${c.slice(1)}`);
+      mpv?.mpvSet("sub-shadow-offset", "8"); // box padding (scaled px)
     } else {
       mpv?.mpvSet("sub-border-style", "outline-and-shadow");
+      mpv?.mpvSet("sub-shadow-offset", "0");
     }
   };
 
