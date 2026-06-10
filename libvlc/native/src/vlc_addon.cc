@@ -57,12 +57,16 @@ class VlcPlayer : public Napi::ObjectWrap<VlcPlayer> {
     // creation-time only, so a style change means recreating the player (host does it).
     std::vector<std::string> argStore;
     std::vector<const char*> argv;
+    // Software decode, always: VLC's default GPU decode (VDPAU/VAAPI) can fail in the
+    // GPU→CPU converter that vmem needs (audio plays, video stuck on Loading) — same
+    // reliability call as hwdec=no in the libmpv edition. SW decode is plenty fast.
+    argStore.push_back("--avcodec-hw=none");
     if (info.Length() > 0 && info[0].IsArray()) {
       Napi::Array arr = info[0].As<Napi::Array>();
       for (uint32_t i = 0; i < arr.Length(); i++)
         argStore.push_back(arr.Get(i).ToString().Utf8Value());
-      for (auto& s : argStore) argv.push_back(s.c_str());
     }
+    for (auto& s : argStore) argv.push_back(s.c_str());
     inst_ = libvlc_new((int)argv.size(), argv.empty() ? nullptr : argv.data());
     if (!inst_) {
       Napi::Error::New(env, "libvlc_new failed (bad option or missing VLC plugin path?)")
