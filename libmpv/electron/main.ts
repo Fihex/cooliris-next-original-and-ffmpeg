@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol, screen } from "electron";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promises as fs, createReadStream } from "node:fs";
 import { Readable } from "node:stream";
@@ -388,8 +388,6 @@ app.whenReady().then(() => {
   // host's env when it spawns. Windows-only; off by default → unchanged frame-pump path.
   if (EMBED_MODE && win) {
     try {
-      // Maximize before mpv attaches so its --wid child fills the screen → fullscreen
-      // video from the first open (otherwise it filled the default 1440x900 window).
       win.maximize();
       const handle = win.getNativeWindowHandle(); // Buffer holding the HWND pointer
       const wid = handle.readBigUInt64LE(0).toString();
@@ -398,11 +396,29 @@ app.whenReady().then(() => {
     } catch (e) {
       console.error("[mpv] getNativeWindowHandle failed; embed disabled:", e);
     }
+    // Attach mpv only AFTER the window is shown + maximized. mpv's --wid surface takes its
+    // size from the window's client rect at creation and (cross-process) doesn't track
+    // later resizes — so if it attaches while the window is still hidden/1440x900, the
+    // video comes up small in the top-left (only a reload re-fit it). Warming here, once
+    // the window is realized full-size, makes the FIRST open fullscreen.
+    win.webContents.once("did-finish-load", () => {
+      win?.maximize();
+      // Belt-and-suspenders: force the window to the display work area in case maximize()
+      // is a no-op on a frameless+transparent window (then the mpv surface fills it).
+      try {
+        const { workArea } = screen.getPrimaryDisplay();
+        win?.setBounds(workArea);
+      } catch {
+        /* ignore */
+      }
+      win?.show();
+      mpvWarm();
+    });
+  } else {
+    // Non-embed: warm immediately (fork is non-blocking, runs in a child process) for the
+    // fastest first open.
+    mpvWarm();
   }
-  // Warm the engine immediately — the fork is non-blocking and runs in a child process,
-  // and the window only appears on ready-to-show, so this just gives libmpv the maximum
-  // head start (cold ~117MB DLL load) to be ready before the user opens a file.
-  mpvWarm();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
