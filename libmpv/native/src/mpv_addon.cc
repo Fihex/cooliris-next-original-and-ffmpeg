@@ -5,6 +5,8 @@
 #include <napi.h>
 #include <mpv/client.h>
 #include <mpv/render.h>
+#include <cstdint>  // uint8_t / int64_t — MSVC needs this explicitly (GCC pulls it in)
+#include <cstdio>   // fprintf / stderr — likewise (see DrainEvents); else MSVC fails
 #include <string>
 #include <vector>
 
