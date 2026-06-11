@@ -24,5 +24,17 @@ Copy-Item -Force (Join-Path $VlcDir "libvlc.dll") $vendor
 Copy-Item -Force (Join-Path $VlcDir "libvlccore.dll") $vendor
 Copy-Item -Recurse -Force (Join-Path $VlcDir "plugins") (Join-Path $vendor "plugins")
 
-Write-Host "vendor\ ready: node.exe + libvlc.dll + libvlccore.dll + plugins\"
+# vlc-cache-gen builds plugins.dat so libVLC doesn't rescan every plugin DLL on each
+# launch (that scan is ~30s on Windows). The cache validates plugins by mtime+size, so
+# it must be (re)generated against the FINAL packaged files — the electron-builder
+# afterPack hook (scripts/after-pack.cjs) runs this exe on the packed vendor\plugins.
+$cacheGen = Join-Path $VlcDir "vlc-cache-gen.exe"
+if (Test-Path $cacheGen) {
+  Copy-Item -Force $cacheGen $vendor
+  Write-Host "bundled vlc-cache-gen.exe (afterPack will build plugins.dat)"
+} else {
+  Write-Warning "vlc-cache-gen.exe not found in $VlcDir — startup will be slow (no plugin cache)"
+}
+
+Write-Host "vendor\ ready: node.exe + libvlc.dll + libvlccore.dll + plugins\ + vlc-cache-gen.exe"
 Write-Host ("node: " + (& (Join-Path $vendor 'node.exe') -v))
