@@ -249,6 +249,9 @@ function createWindow() {
     height: 900,
     backgroundColor: "#000000",
     autoHideMenuBar: true,
+    // Don't show the window until the renderer has painted its first frame (the black
+    // boot splash) — otherwise Windows briefly shows an empty white window first.
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -258,6 +261,7 @@ function createWindow() {
       backgroundThrottling: false,
     },
   });
+  win.once("ready-to-show", () => win?.show());
 
   if (VITE_DEV_SERVER_URL) {
     win.loadURL(VITE_DEV_SERVER_URL);

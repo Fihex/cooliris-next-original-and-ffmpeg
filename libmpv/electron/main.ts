@@ -273,6 +273,9 @@ function createWindow() {
     height: 900,
     backgroundColor: "#000000",
     autoHideMenuBar: true,
+    // Don't show the window until the renderer has painted its first frame (the black
+    // boot splash) — otherwise Windows briefly shows an empty white window first.
+    show: false,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -282,6 +285,7 @@ function createWindow() {
       backgroundThrottling: false,
     },
   });
+  win.once("ready-to-show", () => win?.show());
 
   if (VITE_DEV_SERVER_URL) {
     win.loadURL(VITE_DEV_SERVER_URL);
@@ -368,9 +372,10 @@ app.whenReady().then(() => {
   });
 
   createWindow();
-  // Warm the engine AFTER the UI has painted so first paint isn't delayed by the engine
-  // init. Still ready well before the user opens a file.
-  win?.webContents.once("did-finish-load", () => setTimeout(mpvWarm, 1500));
+  // Warm the engine as soon as the renderer has loaded (the window is already shown via
+  // ready-to-show, and the warm runs in a child process), so libmpv is ready by the time
+  // the user opens a file rather than paying the cold ~117MB DLL load on first open.
+  win?.webContents.once("did-finish-load", () => mpvWarm());
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
