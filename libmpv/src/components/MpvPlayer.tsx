@@ -11,7 +11,7 @@ import { useEffect, useRef, useState } from "react";
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const MAX_W = 1920; // cap render width → bounds the per-frame IPC payload
-const FRAME_MS = 33; // ~30fps
+const FRAME_MS = 16; // up to ~60fps (was 30); the engine sets real cadence, we sample latest
 
 interface Transform {
   s: number;
@@ -189,23 +189,37 @@ export function MpvPlayer({
     mpv.mpvLoad(abs);
 
     const ctx = canvasRef.current?.getContext("2d") ?? null;
+    // Resolve the render size once and re-check only ~1×/s, NOT every frame. The per-frame
+    // size query was a second IPC round-trip on top of the frame fetch; on Windows (slower
+    // pipes) that doubled per-frame latency and is the main reason video felt low-fps.
+    let rw = 0;
+    let rh = 0;
+    let lastSizeCheck = -1000;
+    const dpr = window.devicePixelRatio || 1;
     const pump = async (ts: number) => {
       if (cancelled) return;
       if (ts - last >= FRAME_MS) {
         last = ts;
         try {
-          const sz = await mpv.mpvSize();
-          if (sz && sz.w > 0 && ctx && canvasRef.current) {
-            // Render at ~display width (not the file's), preserving the video's aspect —
-            // mpv composites subtitles at this size, so the text stays crisp instead of
-            // being upscaled with the video. Capped to bound the per-frame IPC.
-            const dpr = window.devicePixelRatio || 1;
-            const rw = Math.min(Math.round(window.screen.width * dpr), MAX_W);
-            const rh = Math.max(1, Math.round((sz.h * rw) / sz.w));
-            if (canvasRef.current.width !== rw || canvasRef.current.height !== rh) {
-              canvasRef.current.width = rw;
-              canvasRef.current.height = rh;
+          if (rw === 0 || ts - lastSizeCheck > 1000) {
+            lastSizeCheck = ts;
+            const sz = await mpv.mpvSize();
+            if (sz && sz.w > 0) {
+              // Render at ~display width (preserving aspect) so mpv composites subtitles
+              // at this size and the text stays crisp instead of being upscaled.
+              const nw = Math.min(Math.round(window.screen.width * dpr), MAX_W);
+              const nh = Math.max(1, Math.round((sz.h * nw) / sz.w));
+              if (nw !== rw || nh !== rh) {
+                rw = nw;
+                rh = nh;
+                if (canvasRef.current) {
+                  canvasRef.current.width = rw;
+                  canvasRef.current.height = rh;
+                }
+              }
             }
+          }
+          if (rw > 0 && ctx && canvasRef.current) {
             const buf = await mpv.mpvFrame(rw, rh);
             if (!cancelled && buf && buf.length === rw * rh * 4) {
               ctx.putImageData(new ImageData(new Uint8ClampedArray(buf), rw, rh), 0, 0);

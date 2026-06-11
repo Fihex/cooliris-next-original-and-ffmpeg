@@ -10,7 +10,7 @@ import { useEffect, useRef, useState } from "react";
  */
 
 const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
-const FRAME_MS = 33; // ~30fps
+const FRAME_MS = 16; // up to ~60fps (was 30); the engine sets real cadence, we sample latest
 
 interface Transform {
   s: number;
@@ -205,20 +205,31 @@ export function VlcPlayer({
     vlc.vlcLoad(abs);
 
     const ctx = canvasRef.current?.getContext("2d") ?? null;
+    // The render size is fixed once playback starts, so resolve it once and re-check
+    // only ~1×/s — NOT every frame. The per-frame size query was a second IPC round-trip
+    // on top of the frame fetch, and on Windows (slower pipes) that doubled per-frame
+    // latency, which is the main reason video felt low-fps there.
+    let rw = 0;
+    let rh = 0;
+    let lastSizeCheck = -1000;
     const pump = async (ts: number) => {
       if (cancelled) return;
       if (ts - last >= FRAME_MS) {
         last = ts;
         try {
-          const sz = await vlc.vlcSize();
-          if (sz && sz.w > 0 && ctx && canvasRef.current) {
-            // The addon reports the exact buffer size it renders at — request that.
-            const rw = sz.w;
-            const rh = sz.h;
-            if (canvasRef.current.width !== rw || canvasRef.current.height !== rh) {
-              canvasRef.current.width = rw;
-              canvasRef.current.height = rh;
+          if (rw === 0 || ts - lastSizeCheck > 1000) {
+            lastSizeCheck = ts;
+            const sz = await vlc.vlcSize();
+            if (sz && sz.w > 0 && (sz.w !== rw || sz.h !== rh)) {
+              rw = sz.w;
+              rh = sz.h;
+              if (canvasRef.current) {
+                canvasRef.current.width = rw;
+                canvasRef.current.height = rh;
+              }
             }
+          }
+          if (rw > 0 && ctx && canvasRef.current) {
             const buf = await vlc.vlcFrame(rw, rh);
             if (!cancelled && buf && buf.length === rw * rh * 4) {
               ctx.putImageData(new ImageData(new Uint8ClampedArray(buf), rw, rh), 0, 0);
