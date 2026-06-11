@@ -7,6 +7,7 @@
 #include <mpv/render.h>
 #include <cstdint>  // uint8_t / int64_t — MSVC needs this explicitly (GCC pulls it in)
 #include <cstdio>   // fprintf / stderr — likewise (see DrainEvents); else MSVC fails
+#include <cstdlib>  // strtoll (parse the window id)
 #include <string>
 #include <vector>
 
@@ -32,6 +33,35 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
     if (!mpv_) {
       Napi::Error::New(env, "mpv_create failed").ThrowAsJavaScriptException();
       return;
+    }
+    // Embedded-window mode (Option 1): if a native window id is passed, mpv renders
+    // DIRECTLY into that window with hardware decode (vo=gpu) — native fps, no per-frame
+    // copy. We then skip the SW render context entirely. Used for the lightbox on Windows.
+    if (info.Length() > 0 && info[0].IsObject()) {
+      Napi::Object cfg = info[0].As<Napi::Object>();
+      if (cfg.Has("wid")) {
+        std::string widStr = cfg.Get("wid").ToString().Utf8Value();
+        int64_t wid = (int64_t)strtoll(widStr.c_str(), nullptr, 10);
+        if (wid != 0) {
+          embedded_ = true;
+          mpv_set_option(mpv_, "wid", MPV_FORMAT_INT64, &wid);
+          mpv_set_option_string(mpv_, "vo", "gpu");
+          mpv_set_option_string(mpv_, "hwdec", "auto-safe"); // HW decode, SW fallback
+          mpv_set_option_string(mpv_, "terminal", "no");
+          mpv_set_option_string(mpv_, "idle", "yes");
+          mpv_set_option_string(mpv_, "sid", "no");
+          mpv_set_option_string(mpv_, "sub-auto", "all");
+          mpv_set_option_string(mpv_, "sub-font-size", "44");
+          mpv_set_option_string(mpv_, "keep-open", "yes"); // don't close the window at EOF
+          mpv_request_log_messages(mpv_, "info");
+          if (mpv_initialize(mpv_) < 0) {
+            mpv_destroy(mpv_);
+            mpv_ = nullptr;
+            Napi::Error::New(env, "mpv_initialize (embed) failed").ThrowAsJavaScriptException();
+          }
+          return;
+        }
+      }
     }
     // Route video through the libmpv render API (we pull frames), no window.
     mpv_set_option_string(mpv_, "vo", "libmpv");
@@ -69,6 +99,7 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
   mpv_handle* mpv_ = nullptr;
   mpv_render_context* ctx_ = nullptr;
   std::vector<uint8_t> buf_;
+  bool embedded_ = false; // true → mpv renders into a native window (no SW render context)
 
   // Drain mpv's event queue (it can stall the core if left unread) and surface errors.
   void DrainEvents() {

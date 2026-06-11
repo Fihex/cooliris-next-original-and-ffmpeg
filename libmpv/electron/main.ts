@@ -7,6 +7,7 @@ import { extractCoverArt } from "./coverArt";
 import {
   mpvAvailable,
   mpvWarm,
+  setEmbedWid,
   mpvLoad,
   mpvCommand,
   mpvSet,
@@ -372,6 +373,19 @@ app.whenReady().then(() => {
   });
 
   createWindow();
+  // Option 1 (experimental, opt-in via COOLIRIS_MPV_EMBED=1): render hardware-decoded mpv
+  // straight into this window for native fps. Must run before mpvWarm so the wid is in the
+  // host's env when it spawns. Windows-only; off by default → unchanged frame-pump path.
+  if (process.env.COOLIRIS_MPV_EMBED === "1" && process.platform === "win32" && win) {
+    try {
+      const handle = win.getNativeWindowHandle(); // Buffer holding the HWND pointer
+      const wid = handle.readBigUInt64LE(0).toString();
+      setEmbedWid(wid);
+      console.log("[mpv] embed mode ON, wid =", wid);
+    } catch (e) {
+      console.error("[mpv] getNativeWindowHandle failed; embed disabled:", e);
+    }
+  }
   // Warm the engine immediately — the fork is non-blocking and runs in a child process,
   // and the window only appears on ready-to-show, so this just gives libmpv the maximum
   // head start (cold ~117MB DLL load) to be ready before the user opens a file.

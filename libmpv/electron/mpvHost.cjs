@@ -21,7 +21,12 @@ try {
     }
   }
   if (!addon) throw new Error("mpv.node not found");
-  player = new addon.MpvPlayer();
+  // Embed mode (Option 1): MPV_EMBED_WID = the native window id to render into. When set,
+  // mpv draws hardware-decoded video straight into that window (no frame pump). Empty =
+  // the normal SW render-API path.
+  const wid = process.env.MPV_EMBED_WID;
+  player = wid ? new addon.MpvPlayer({ wid }) : new addon.MpvPlayer();
+  if (wid) console.error("[mpv-host] embed mode, wid =", wid);
 } catch (e) {
   console.error("[mpv-host] init failed:", e && e.message);
 }

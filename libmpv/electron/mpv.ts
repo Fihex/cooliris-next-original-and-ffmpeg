@@ -49,9 +49,18 @@ let child: ChildProcess | null = null;
 let nextId = 1;
 const pending = new Map<number, (v: unknown) => void>();
 
+// Option 1 (embedded mpv): the native window id to render hardware-decoded video into.
+// Set by main.ts before the host is forked; passed to the addon via env. Empty = the
+// normal SW frame-pump path. Must be set BEFORE ensureChild()/warm spawns the host.
+let embedWid = "";
+export function setEmbedWid(wid: string): void {
+  embedWid = wid;
+}
+
 function ensureChild(): ChildProcess {
   if (child) return child;
   const env = { ...process.env };
+  if (embedWid) env.MPV_EMBED_WID = embedWid;
   // Point the addon at the bundled libmpv (+ deps) so no system mpv is needed. On Windows
   // libmpv-2.dll sits next to vendor/node.exe and is found via PATH; on Linux the deps
   // live in vendor/lib via LD_LIBRARY_PATH.
