@@ -2,11 +2,15 @@
 # needs MSVC, so it cannot be cross-built from Linux/Wine). Produces the NSIS installer
 # and the unpacked folder as downloadable artifacts.
 #
-# Run it from GitHub → Actions → "build libvlc (Windows)" → Run workflow.
+# Run it from GitHub → Actions → "build libvlc (Windows)" → Run workflow,
+# or just push a tag like `libvlc-win-1` (no Actions UI / token needed).
 name: build libvlc (Windows)
 
 on:
   workflow_dispatch: {}
+  push:
+    tags:
+      - 'libvlc-win-*'
 
 jobs:
   windows:
