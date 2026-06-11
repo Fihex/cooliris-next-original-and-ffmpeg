@@ -26,8 +26,24 @@ jobs:
         shell: pwsh
         working-directory: libvlc
         run: |
-          Invoke-WebRequest -Uri "https://get.videolan.org/vlc/3.0.21/win64/vlc-3.0.21-win64.zip" -OutFile vlc.zip
-          Expand-Archive vlc.zip -DestinationPath .
+          # get.videolan.org geo-redirects to a mirror; many mirrors carry only the
+          # .7z (no .zip), so fetch the .7z (universally mirrored) and extract with the
+          # 7-Zip that ships on windows runners. Retry to ride out a flaky mirror.
+          $ver = "3.0.21"
+          $url = "https://get.videolan.org/vlc/$ver/win64/vlc-$ver-win64.7z"
+          $ok = $false
+          for ($i = 1; $i -le 4; $i++) {
+            try {
+              Write-Host "Download attempt $i : $url"
+              Invoke-WebRequest -Uri $url -OutFile vlc.7z -MaximumRedirection 6 -UseBasicParsing
+              if ((Get-Item vlc.7z).Length -gt 30MB) { $ok = $true; break }
+              Write-Host "file too small, retrying"
+            } catch { Write-Host "attempt $i failed: $($_.Exception.Message)" }
+            Start-Sleep -Seconds 6
+          }
+          if (-not $ok) { throw "VLC download failed after retries" }
+          & 'C:\Program Files\7-Zip\7z.exe' x vlc.7z -y | Out-Null
+          if (-not (Test-Path ".\vlc-$ver")) { throw "extraction did not produce vlc-$ver" }
 
       - name: Install dependencies
         working-directory: libvlc
