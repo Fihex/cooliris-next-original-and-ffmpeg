@@ -374,10 +374,10 @@ app.whenReady().then(() => {
   });
 
   createWindow();
-  // Warm the engine as soon as the renderer has loaded (the window is already shown via
-  // ready-to-show, and the warm runs in a child process), so libVLC is ready by the time
-  // the user opens a file rather than paying the engine init on first open.
-  win?.webContents.once("did-finish-load", () => vlcWarm());
+  // Warm the engine immediately — the fork is non-blocking and runs in a child process,
+  // and the window only appears on ready-to-show, so this just gives libVLC the maximum
+  // head start to be ready before the user opens a file.
+  vlcWarm();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

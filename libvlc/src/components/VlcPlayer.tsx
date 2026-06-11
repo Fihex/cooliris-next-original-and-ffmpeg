@@ -87,54 +87,46 @@ export function VlcPlayer({
     setAudioTracks([]);
     setSubTracks([]);
     setActiveSid("no");
-    // VLC demuxes tracks progressively: the video track is reported first, then audio
-    // and subtitle tracks a moment later. Don't latch on the first non-zero count (that
-    // captured an empty audio/sub menu on a fast open) — keep refreshing the lists until
-    // the track count has been stable for a few ticks, or until a timeout.
+    // VLC adds tracks progressively: the video track first, then audio and (auto-detected
+    // sidecar) subtitle tracks a few seconds later as the input is parsed. So keep
+    // refreshing for the lifetime of the open video — updating only when the set actually
+    // changes — instead of latching once it briefly looks "stable" (that missed the
+    // late-arriving subtitle/audio tracks, which then only showed after a reopen).
     let forcedSubsOff = false;
-    let lastCount = -1;
-    let stableTicks = 0;
-    let elapsed = 0;
-    let id = 0;
+    let lastSig = "";
     const tick = async () => {
       if (!alive) return;
-      elapsed += 300;
       const count = parseInt((await vlc.vlcGet("track-list/count")) || "0", 10);
-      if (count > 0) {
-        const a: { id: string; label: string }[] = [];
-        const s: { id: string; label: string }[] = [];
-        for (let i = 0; i < count; i++) {
-          const type = await vlc.vlcGet(`track-list/${i}/type`);
-          const tid = (await vlc.vlcGet(`track-list/${i}/id`)) || "";
-          const lang = await vlc.vlcGet(`track-list/${i}/lang`);
-          const title = await vlc.vlcGet(`track-list/${i}/title`);
-          const langStr = lang && lang !== "null" ? `${lang} ` : "";
-          const label = `${langStr}${title && title !== "null" ? title : "Track " + tid}`.trim();
-          if (type === "audio") a.push({ id: tid, label });
-          else if (type === "sub") s.push({ id: tid, label });
-        }
-        if (!alive) return;
+      if (count <= 0) return;
+      const a: { id: string; label: string }[] = [];
+      const s: { id: string; label: string }[] = [];
+      for (let i = 0; i < count; i++) {
+        const type = await vlc.vlcGet(`track-list/${i}/type`);
+        const tid = (await vlc.vlcGet(`track-list/${i}/id`)) || "";
+        const lang = await vlc.vlcGet(`track-list/${i}/lang`);
+        const title = await vlc.vlcGet(`track-list/${i}/title`);
+        const langStr = lang && lang !== "null" ? `${lang} ` : "";
+        const label = `${langStr}${title && title !== "null" ? title : "Track " + tid}`.trim();
+        if (type === "audio") a.push({ id: tid, label });
+        else if (type === "sub") s.push({ id: tid, label });
+      }
+      if (!alive) return;
+      const sig = JSON.stringify([a, s]);
+      if (sig !== lastSig) {
+        lastSig = sig;
         setAudioTracks(a);
         setSubTracks(s);
         setActiveAid((await vlc.vlcGet("aid")) || "");
-        // VLC auto-enables a subtitle track on load — keep subs off until chosen, but
-        // only force it once so a user's later pick isn't clobbered by a refresh.
-        if (!forcedSubsOff) {
-          vlc.vlcSet("sid", "no");
-          forcedSubsOff = true;
-        }
       }
-      // Stop once the track set has settled (count unchanged ~1.2s) or after ~10s.
-      if (count === lastCount) stableTicks++;
-      else {
-        lastCount = count;
-        stableTicks = 0;
-      }
-      if ((count > 0 && stableTicks >= 4) || elapsed >= 10000) {
-        window.clearInterval(id);
+      // VLC auto-enables a subtitle track on load — keep subs off until chosen, but
+      // only force it once so a user's later pick isn't clobbered by a refresh.
+      if (!forcedSubsOff) {
+        vlc.vlcSet("sid", "no");
+        forcedSubsOff = true;
       }
     };
-    id = window.setInterval(tick, 300);
+    tick();
+    const id = window.setInterval(tick, 1000);
     return () => {
       alive = false;
       window.clearInterval(id);

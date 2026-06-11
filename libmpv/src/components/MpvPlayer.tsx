@@ -84,44 +84,38 @@ export function MpvPlayer({
     setAudioTracks([]);
     setSubTracks([]);
     setActiveSid("no");
-    // Tracks are demuxed progressively (video first, then audio/subs). Don't latch on the
-    // first non-zero count — keep refreshing until the count is stable, or a timeout.
-    let lastCount = -1;
-    let stableTicks = 0;
-    let elapsed = 0;
-    let id = 0;
+    // Tracks are demuxed progressively (video first, then audio + sidecar subtitles a few
+    // seconds later). Keep refreshing for the lifetime of the open video — updating only
+    // when the set changes — instead of latching once it briefly looks "stable" (that
+    // missed late-arriving subtitle/audio tracks, which then only showed after a reopen).
+    let lastSig = "";
     const tick = async () => {
       if (!alive) return;
-      elapsed += 300;
       const count = parseInt((await mpv.mpvGet("track-list/count")) || "0", 10);
-      if (count > 0) {
-        const a: { id: string; label: string }[] = [];
-        const s: { id: string; label: string }[] = [];
-        for (let i = 0; i < count; i++) {
-          const type = await mpv.mpvGet(`track-list/${i}/type`);
-          const tid = (await mpv.mpvGet(`track-list/${i}/id`)) || "";
-          const lang = await mpv.mpvGet(`track-list/${i}/lang`);
-          const title = await mpv.mpvGet(`track-list/${i}/title`);
-          const langStr = lang && lang !== "null" ? `${lang} ` : "";
-          const label = `${langStr}${title && title !== "null" ? title : "Track " + tid}`.trim();
-          if (type === "audio") a.push({ id: tid, label });
-          else if (type === "sub") s.push({ id: tid, label });
-        }
-        if (!alive) return;
+      if (count <= 0) return;
+      const a: { id: string; label: string }[] = [];
+      const s: { id: string; label: string }[] = [];
+      for (let i = 0; i < count; i++) {
+        const type = await mpv.mpvGet(`track-list/${i}/type`);
+        const tid = (await mpv.mpvGet(`track-list/${i}/id`)) || "";
+        const lang = await mpv.mpvGet(`track-list/${i}/lang`);
+        const title = await mpv.mpvGet(`track-list/${i}/title`);
+        const langStr = lang && lang !== "null" ? `${lang} ` : "";
+        const label = `${langStr}${title && title !== "null" ? title : "Track " + tid}`.trim();
+        if (type === "audio") a.push({ id: tid, label });
+        else if (type === "sub") s.push({ id: tid, label });
+      }
+      if (!alive) return;
+      const sig = JSON.stringify([a, s]);
+      if (sig !== lastSig) {
+        lastSig = sig;
         setAudioTracks(a);
         setSubTracks(s);
         setActiveAid((await mpv.mpvGet("aid")) || "");
       }
-      if (count === lastCount) stableTicks++;
-      else {
-        lastCount = count;
-        stableTicks = 0;
-      }
-      if ((count > 0 && stableTicks >= 4) || elapsed >= 10000) {
-        window.clearInterval(id);
-      }
     };
-    id = window.setInterval(tick, 300);
+    tick();
+    const id = window.setInterval(tick, 1000);
     return () => {
       alive = false;
       window.clearInterval(id);

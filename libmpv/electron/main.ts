@@ -372,10 +372,10 @@ app.whenReady().then(() => {
   });
 
   createWindow();
-  // Warm the engine as soon as the renderer has loaded (the window is already shown via
-  // ready-to-show, and the warm runs in a child process), so libmpv is ready by the time
-  // the user opens a file rather than paying the cold ~117MB DLL load on first open.
-  win?.webContents.once("did-finish-load", () => mpvWarm());
+  // Warm the engine immediately — the fork is non-blocking and runs in a child process,
+  // and the window only appears on ready-to-show, so this just gives libmpv the maximum
+  // head start (cold ~117MB DLL load) to be ready before the user opens a file.
+  mpvWarm();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
