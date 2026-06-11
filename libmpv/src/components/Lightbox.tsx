@@ -137,8 +137,14 @@ export function Lightbox({
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         // Esc leaves fullscreen first; only closes the lightbox when not fullscreen.
-        if (document.fullscreenElement) document.exitFullscreen();
-        else onClose();
+        if (EMBED) {
+          if (isFullscreen) window.electron?.winFullscreen(false).then(() => setIsFullscreen(false));
+          else onClose();
+        } else if (document.fullscreenElement) {
+          document.exitFullscreen();
+        } else {
+          onClose();
+        }
         return;
       }
       // Videos play through MpvPlayer, which owns the arrow keys (seek / volume) —
@@ -149,7 +155,7 @@ export function Lightbox({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose, onPrev, onNext, item.type]);
+  }, [onClose, onPrev, onNext, item.type, isFullscreen]);
 
   const zoomAt = useCallback((factor: number, clientX: number, clientY: number) => {
     setT((p) => {
@@ -246,11 +252,21 @@ export function Lightbox({
 
   // Fullscreen the whole lightbox (so our custom control bar stays visible too).
   const toggleFullscreen = useCallback(() => {
+    // Embed mode: toggle the OS WINDOW fullscreen (the browser's requestFullscreen would
+    // paint over the mpv video surface, hiding it). Also re-fits the mpv --wid surface.
+    if (EMBED) {
+      const next = !isFullscreen;
+      window.electron?.winFullscreen(next).then((on) => {
+        setIsFullscreen(!!on);
+        setT({ s: 1, x: 0, y: 0 });
+      });
+      return;
+    }
     const el = wrapRef.current;
     if (!el) return;
     if (document.fullscreenElement) document.exitFullscreen();
     else el.requestFullscreen?.();
-  }, []);
+  }, [isFullscreen]);
 
   const isVideo = item.type === "video";
   const isAudio = item.type === "audio";

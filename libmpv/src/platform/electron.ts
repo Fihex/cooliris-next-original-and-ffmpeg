@@ -43,6 +43,7 @@ interface ElectronBridge {
   mpvSize(): Promise<{ w: number; h: number }>;
   mpvFrame(w: number, h: number): Promise<Uint8Array | null>;
   mpvStop(): Promise<unknown>;
+  winFullscreen(on: boolean): Promise<boolean>;
 }
 
 declare global {

@@ -271,6 +271,13 @@ ipcMain.handle("mpv-get", (_e, name: string) => mpvGet(name));
 ipcMain.handle("mpv-size", () => mpvVideoSize());
 ipcMain.handle("mpv-frame", (_e, w: number, h: number) => mpvFrame(w, h));
 ipcMain.handle("mpv-stop", () => mpvStop());
+// Toggle the OS window fullscreen (embed mode). setFullScreen also resizes the window,
+// which makes the embedded mpv --wid surface re-fit to fill it. Returns the new state.
+ipcMain.handle("win-fullscreen", (_e, on: boolean) => {
+  if (!win) return false;
+  win.setFullScreen(!!on);
+  return win.isFullScreen();
+});
 
 /* --------------------------------- window ----------------------------------- */
 function createWindow() {

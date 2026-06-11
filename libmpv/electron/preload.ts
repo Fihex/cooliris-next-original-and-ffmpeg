@@ -25,4 +25,8 @@ contextBridge.exposeInMainWorld("electron", {
   mpvSize: () => ipcRenderer.invoke("mpv-size"),
   mpvFrame: (w: number, h: number) => ipcRenderer.invoke("mpv-frame", w, h),
   mpvStop: () => ipcRenderer.invoke("mpv-stop"),
+  // Toggle the OS window fullscreen (embed mode uses this instead of the browser's
+  // requestFullscreen, which would paint over the mpv video surface). Returns the
+  // resulting fullscreen state.
+  winFullscreen: (on: boolean) => ipcRenderer.invoke("win-fullscreen", on),
 });
