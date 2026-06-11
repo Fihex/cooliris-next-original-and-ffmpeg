@@ -26,24 +26,26 @@ jobs:
         shell: pwsh
         working-directory: libvlc
         run: |
-          # get.videolan.org geo-redirects to a mirror; many mirrors carry only the
-          # .7z (no .zip), so fetch the .7z (universally mirrored) and extract with the
-          # 7-Zip that ships on windows runners. Retry to ride out a flaky mirror.
+          $ErrorActionPreference = "Stop"
+          # get.videolan.org geo-redirects to a mirror; many mirrors carry only the .7z
+          # (no .zip) and some redirect https->http, which pwsh's Invoke-WebRequest
+          # refuses. curl.exe (preinstalled) follows those redirects, so use it.
           $ver = "3.0.21"
           $url = "https://get.videolan.org/vlc/$ver/win64/vlc-$ver-win64.7z"
-          $ok = $false
-          for ($i = 1; $i -le 4; $i++) {
-            try {
-              Write-Host "Download attempt $i : $url"
-              Invoke-WebRequest -Uri $url -OutFile vlc.7z -MaximumRedirection 6 -UseBasicParsing
-              if ((Get-Item vlc.7z).Length -gt 30MB) { $ok = $true; break }
-              Write-Host "file too small, retrying"
-            } catch { Write-Host "attempt $i failed: $($_.Exception.Message)" }
-            Start-Sleep -Seconds 6
-          }
-          if (-not $ok) { throw "VLC download failed after retries" }
-          & 'C:\Program Files\7-Zip\7z.exe' x vlc.7z -y | Out-Null
+          Write-Host "Downloading $url"
+          curl.exe -L --fail --retry 5 --retry-all-errors --connect-timeout 30 -o vlc.7z $url
+          if ($LASTEXITCODE -ne 0) { throw "curl failed ($LASTEXITCODE)" }
+          $size = (Get-Item vlc.7z).Length
+          Write-Host "Downloaded vlc.7z = $size bytes"
+          if ($size -lt 30MB) { throw "vlc.7z too small ($size)" }
+          # Locate 7-Zip (present on GitHub windows images; path-robust just in case).
+          $sevenzip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+          if (-not $sevenzip) { $sevenzip = "C:\Program Files\7-Zip\7z.exe" }
+          if (-not (Test-Path $sevenzip)) { throw "7-Zip not found" }
+          & $sevenzip x vlc.7z -y -bso0 -bsp0
+          if ($LASTEXITCODE -ne 0) { throw "7z extract failed ($LASTEXITCODE)" }
           if (-not (Test-Path ".\vlc-$ver")) { throw "extraction did not produce vlc-$ver" }
+          Write-Host "Extracted to vlc-$ver"
 
       - name: Install dependencies
         working-directory: libvlc
