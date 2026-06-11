@@ -36,10 +36,14 @@ Sanity check: `pkg-config --modversion libvlc` should print a version (e.g. `3.0
 2. **Visual Studio Build Tools 2022** — workload **“Desktop development with C++”**
    (MSVC + Windows SDK for node-gyp).
 3. **Python 3** — <https://python.org> (node-gyp needs it).
-4. **The official VLC Windows zip** — `vlc-3.x.x-win64.zip` from
-   <https://get.videolan.org/vlc/> (pick a version → `win64/`). Extract it anywhere.
-   It already contains the **SDK** (`sdk\include`, `sdk\lib` with import libraries),
-   the DLLs, and the plugin tree — no extra packages, no import-lib generation.
+4. **The official VLC Windows archive** — from <https://get.videolan.org/vlc/> (pick a
+   version → `win64/`). Prefer `vlc-3.x.x-win64.7z` (the `.zip` is missing from many
+   mirrors); extract it anywhere with 7-Zip. It already contains the **SDK**
+   (`sdk\include`, `sdk\lib` with import libraries), the DLLs, and the plugin tree — no
+   extra packages, no import-lib generation.
+
+> Only needed for the **local** build (Option B). The GitHub Actions path (Option A)
+> downloads VLC itself.
 
 ## 1. Install dependencies
 ```bash
@@ -58,7 +62,42 @@ At runtime the vlc host runs under `vendor/node` with `LD_LIBRARY_PATH=vendor/li
 
 > Stale rebuild? Clear caches: `rm -rf node_modules/.vite dist dist-electron`.
 
-## 3. Build for Windows  (Developer PowerShell for VS 2022)
+## 3. Build for Windows
+
+There are two ways. **Option A needs no Windows PC** and is the recommended path —
+it's the one that actually produced the released installer.
+
+### Option A — GitHub Actions (no Windows machine, no token)  ✅ recommended
+The workflow [`.github/workflows/build-libvlc-windows.yml`](../.github/workflows/build-libvlc-windows.yml)
+builds on a real `windows-latest` runner: it downloads the official VLC SDK + DLLs +
+plugins, compiles the native addon with MSVC, bundles the self-contained runtime, and
+packages the NSIS installer **and** the unpacked folder — then uploads both as artifacts.
+
+Trigger it either way:
+- **Push a tag** (simplest — a plain `git push` is enough, no Actions UI):
+  ```bash
+  git tag libvlc-win-$(date +%s)
+  git push origin --tags
+  ```
+- or GitHub → **Actions** → **“build libvlc (Windows)”** → **Run workflow**.
+
+When it finishes (~6–8 min), open the run page and download from **Artifacts**:
+| Artifact | Contents |
+|---|---|
+| `cooliris-libvlc-windows-installer` | the NSIS `.exe` installer |
+| `cooliris-libvlc-windows-unpacked` | self-contained `win-unpacked\` — unzip & run `Cooliris Next.exe` |
+
+Both are self-contained (bundled `node.exe` + libvlc + plugins) — no system VLC/Node on
+the target PC.
+
+> Mirror note: the workflow downloads the VLC **`.7z`** with `curl.exe` (not the `.zip`
+> via `Invoke-WebRequest`). `get.videolan.org` geo-redirects to mirrors that often lack
+> the `.zip` and sometimes redirect https→http, which pwsh refuses — `curl.exe` + `.7z`
+> avoids both. Keep that in mind if you re-pin the VLC version.
+
+### Option B — locally, on a Windows machine  (Developer PowerShell for VS 2022)
+Install the prerequisites above (Node, VS Build Tools 2022, Python 3, the VLC win64
+archive), extract VLC anywhere, then:
 ```powershell
 pwsh scripts/setup-windows.ps1 -VlcDir C:\path\to\vlc-3.0.21   # SDK → native\vlc-sdk
 cd native; npx node-gyp rebuild; cd ..                          # vlc.node
@@ -75,8 +114,8 @@ The folder is fully self-contained (vendor runtime + unpacked addon) — just co
 ## Why the Windows build can't be cross-built from Linux
 Same reason as the libmpv edition: the native addon must be compiled with **MSVC**
 against the Windows Node ABI — Wine runs Windows executables but is not a compiler, and
-MSVC/node-gyp don't work under it. Build on a Windows PC or Windows CI
-(e.g. GitHub Actions `windows-latest`).
+MSVC/node-gyp don't work under it. So build on a Windows PC (Option B) or on Windows CI
+(Option A above — what we actually use).
 
 ## Runtime notes
 - Subtitles default **off**; pick a track from the **CC** menu (selection-only on VLC —
