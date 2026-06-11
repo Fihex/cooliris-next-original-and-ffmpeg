@@ -3,6 +3,9 @@ productName: Cooliris Next
 directories:
   output: release
   buildResources: build
+# Windows-only: pre-build the libVLC plugin cache (plugins.dat) so the first open is fast
+# instead of a ~30s plugin rescan. No-op on Linux/mac.
+afterPack: ./scripts/after-pack.cjs
 # Vite emits the renderer to dist/ and the main/preload to dist-electron/. The libVLC
 # layer needs the native addon + the host script shipped and unpacked (spawned/dlopen'd).
 files:

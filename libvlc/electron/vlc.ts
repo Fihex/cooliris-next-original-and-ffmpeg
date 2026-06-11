@@ -68,11 +68,14 @@ function pluginDir(): string | undefined {
       /* not copied yet */
     }
     if (have !== want) {
-      // Fresh copy on first run or after an app update (so new plugins replace old, and
-      // any stale plugins.dat is dropped → libVLC rebuilds it once against these files).
+      // Fresh copy on first run or after an app update. preserveTimestamps keeps the
+      // pre-built plugins.dat (shipped in the bundle) valid for these copied files —
+      // VLC validates the cache by each plugin's mtime+size — so the first open is fast
+      // rather than a ~30s rescan. If the cache is ever invalid, libVLC just rebuilds it
+      // here once (this dir is writable) and reuses it next launch.
       rmSync(dest, { recursive: true, force: true });
       mkdirSync(dest, { recursive: true });
-      cpSync(bundled, dest, { recursive: true });
+      cpSync(bundled, dest, { recursive: true, preserveTimestamps: true });
       writeFileSync(marker, want);
     }
     cachedPluginDir = dest;
