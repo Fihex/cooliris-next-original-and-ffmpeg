@@ -476,9 +476,10 @@ export function VlcPlayer({
           </div>
         )}
 
-        {/* Always available so subtitles (incl. auto-loaded sidecars) and the style
-            controls are reachable for every format, even ones with no embedded subs. */}
-        {(
+        {/* Shown only when subtitles were found. Sidecars in the video's folder now
+            auto-load (any name), so this still appears for same-folder .srt files — but
+            stays hidden when nothing was found. */}
+        {subTracks.length > 0 && (
           <div className="relative">
             <button
               onClick={() => setCapsMenu((o) => !o)}
