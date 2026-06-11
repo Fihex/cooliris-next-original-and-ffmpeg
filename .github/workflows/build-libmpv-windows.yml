@@ -68,7 +68,17 @@ jobs:
 
       - name: Build native addon (mpv.node)
         working-directory: libmpv/native
-        run: npx node-gyp rebuild
+        shell: pwsh
+        run: |
+          npx node-gyp rebuild --verbose 2>&1 | Tee-Object -FilePath "$env:GITHUB_WORKSPACE\gyp-build.log"
+          exit $LASTEXITCODE
+
+      - name: Upload build log (for diagnosis)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpv-gyp-build-log
+          path: gyp-build.log
 
       - name: Bundle self-contained runtime (node.exe + libmpv-2.dll)
         shell: pwsh
