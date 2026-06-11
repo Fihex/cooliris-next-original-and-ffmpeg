@@ -87,12 +87,20 @@ export function VlcPlayer({
     setAudioTracks([]);
     setSubTracks([]);
     setActiveSid("no");
-    let done = false;
+    // VLC demuxes tracks progressively: the video track is reported first, then audio
+    // and subtitle tracks a moment later. Don't latch on the first non-zero count (that
+    // captured an empty audio/sub menu on a fast open) — keep refreshing the lists until
+    // the track count has been stable for a few ticks, or until a timeout.
+    let forcedSubsOff = false;
+    let lastCount = -1;
+    let stableTicks = 0;
+    let elapsed = 0;
+    let id = 0;
     const tick = async () => {
-      if (!alive || done) return;
+      if (!alive) return;
+      elapsed += 300;
       const count = parseInt((await vlc.vlcGet("track-list/count")) || "0", 10);
       if (count > 0) {
-        done = true;
         const a: { id: string; label: string }[] = [];
         const s: { id: string; label: string }[] = [];
         for (let i = 0; i < count; i++) {
@@ -105,16 +113,28 @@ export function VlcPlayer({
           if (type === "audio") a.push({ id: tid, label });
           else if (type === "sub") s.push({ id: tid, label });
         }
-        if (alive) {
-          setAudioTracks(a);
-          setSubTracks(s);
-          setActiveAid((await vlc.vlcGet("aid")) || "");
-          // VLC auto-enables a subtitle track on load — keep subs off until chosen.
+        if (!alive) return;
+        setAudioTracks(a);
+        setSubTracks(s);
+        setActiveAid((await vlc.vlcGet("aid")) || "");
+        // VLC auto-enables a subtitle track on load — keep subs off until chosen, but
+        // only force it once so a user's later pick isn't clobbered by a refresh.
+        if (!forcedSubsOff) {
           vlc.vlcSet("sid", "no");
+          forcedSubsOff = true;
         }
       }
+      // Stop once the track set has settled (count unchanged ~1.2s) or after ~10s.
+      if (count === lastCount) stableTicks++;
+      else {
+        lastCount = count;
+        stableTicks = 0;
+      }
+      if ((count > 0 && stableTicks >= 4) || elapsed >= 10000) {
+        window.clearInterval(id);
+      }
     };
-    const id = window.setInterval(tick, 300);
+    id = window.setInterval(tick, 300);
     return () => {
       alive = false;
       window.clearInterval(id);

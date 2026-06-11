@@ -370,7 +370,10 @@ app.whenReady().then(() => {
   });
 
   createWindow();
-  vlcWarm(); // spin up the engine in the background so the first open isn't slow
+  // Warm the engine AFTER the UI has painted (loading libVLC + plugins is heavy I/O on
+  // Windows) so first paint isn't delayed by a long blank window. Still ready well before
+  // the user opens a file.
+  win?.webContents.once("did-finish-load", () => setTimeout(vlcWarm, 1500));
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

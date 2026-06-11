@@ -84,12 +84,17 @@ export function MpvPlayer({
     setAudioTracks([]);
     setSubTracks([]);
     setActiveSid("no");
-    let done = false;
+    // Tracks are demuxed progressively (video first, then audio/subs). Don't latch on the
+    // first non-zero count — keep refreshing until the count is stable, or a timeout.
+    let lastCount = -1;
+    let stableTicks = 0;
+    let elapsed = 0;
+    let id = 0;
     const tick = async () => {
-      if (!alive || done) return;
+      if (!alive) return;
+      elapsed += 300;
       const count = parseInt((await mpv.mpvGet("track-list/count")) || "0", 10);
       if (count > 0) {
-        done = true;
         const a: { id: string; label: string }[] = [];
         const s: { id: string; label: string }[] = [];
         for (let i = 0; i < count; i++) {
@@ -102,14 +107,21 @@ export function MpvPlayer({
           if (type === "audio") a.push({ id: tid, label });
           else if (type === "sub") s.push({ id: tid, label });
         }
-        if (alive) {
-          setAudioTracks(a);
-          setSubTracks(s);
-          setActiveAid((await mpv.mpvGet("aid")) || "");
-        }
+        if (!alive) return;
+        setAudioTracks(a);
+        setSubTracks(s);
+        setActiveAid((await mpv.mpvGet("aid")) || "");
+      }
+      if (count === lastCount) stableTicks++;
+      else {
+        lastCount = count;
+        stableTicks = 0;
+      }
+      if ((count > 0 && stableTicks >= 4) || elapsed >= 10000) {
+        window.clearInterval(id);
       }
     };
-    const id = window.setInterval(tick, 300);
+    id = window.setInterval(tick, 300);
     return () => {
       alive = false;
       window.clearInterval(id);

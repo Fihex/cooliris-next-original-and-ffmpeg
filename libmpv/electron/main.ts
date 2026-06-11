@@ -368,7 +368,9 @@ app.whenReady().then(() => {
   });
 
   createWindow();
-  mpvWarm(); // spin up the engine in the background so the first open isn't slow
+  // Warm the engine AFTER the UI has painted so first paint isn't delayed by the engine
+  // init. Still ready well before the user opens a file.
+  win?.webContents.once("did-finish-load", () => setTimeout(mpvWarm, 1500));
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
