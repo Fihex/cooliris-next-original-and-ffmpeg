@@ -1,0 +1,99 @@
+# Builds the libmpv edition for Windows on a real Windows runner (the native addon
+# needs MSVC, so it cannot be cross-built from Linux/Wine). Produces the NSIS installer
+# and the unpacked folder as downloadable artifacts.
+#
+# Run it from GitHub → Actions → "build libmpv (Windows)" → Run workflow,
+# or just push a tag like `libmpv-win-1` (no Actions UI / token needed).
+name: build libmpv (Windows)
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - 'libmpv-win-*'
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Put MSVC tools (lib.exe, cl.exe) on PATH so setup-windows.ps1 can build the
+      # import library and node-gyp can compile the addon.
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Download libmpv dev package (shinchiro build via zhongfly releases)
+        shell: pwsh
+        working-directory: libmpv
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          # The dev package filename carries a date+git hash, so resolve the newest one
+          # from the latest release. Pick the baseline x86_64 build (NOT the -v3- AVX2
+          # variant) for broad CPU compatibility. It contains include\, libmpv-2.dll, mpv.def.
+          $headers = @{ "User-Agent" = "gh-actions"; "Authorization" = "Bearer $env:GH_TOKEN" }
+          $rel = Invoke-RestMethod "https://api.github.com/repos/zhongfly/mpv-winbuild/releases/latest" -Headers $headers
+          $asset = $rel.assets |
+            Where-Object { $_.name -like 'mpv-dev-x86_64-*' -and $_.name -notlike '*-v3-*' } |
+            Select-Object -First 1
+          if (-not $asset) { throw "no mpv-dev-x86_64 asset in latest release" }
+          Write-Host "Downloading $($asset.name)"
+          curl.exe -L --fail --retry 5 --retry-all-errors --connect-timeout 30 -o mpv-dev.7z $asset.browser_download_url
+          if ($LASTEXITCODE -ne 0) { throw "curl failed ($LASTEXITCODE)" }
+          $size = (Get-Item mpv-dev.7z).Length
+          Write-Host "Downloaded mpv-dev.7z = $size bytes"
+          if ($size -lt 5MB) { throw "mpv-dev.7z too small ($size)" }
+          $sevenzip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+          if (-not $sevenzip) { $sevenzip = "C:\Program Files\7-Zip\7z.exe" }
+          & $sevenzip x mpv-dev.7z -ompv-dev -y -bso0 -bsp0
+          if ($LASTEXITCODE -ne 0) { throw "7z extract failed ($LASTEXITCODE)" }
+          if (-not (Test-Path ".\mpv-dev\libmpv-2.dll")) { throw "extraction missing libmpv-2.dll" }
+          Write-Host "Extracted libmpv dev to mpv-dev\"
+
+      - name: Install dependencies
+        working-directory: libmpv
+        run: npm install
+
+      - name: Prepare libmpv dev (headers + import lib + dll)
+        shell: pwsh
+        working-directory: libmpv
+        run: pwsh scripts/setup-windows.ps1 -MpvDev (Resolve-Path .\mpv-dev)
+
+      - name: Build native addon (mpv.node)
+        working-directory: libmpv/native
+        run: npx node-gyp rebuild
+
+      - name: Bundle self-contained runtime (node.exe + libmpv-2.dll)
+        shell: pwsh
+        working-directory: libmpv
+        run: pwsh scripts/bundle-windows.ps1
+
+      - name: Build renderer + main
+        shell: pwsh
+        working-directory: libmpv
+        run: |
+          $env:ELECTRON = "1"
+          npm run build
+
+      - name: Package (NSIS installer + unpacked folder)
+        working-directory: libmpv
+        run: npx electron-builder --win nsis dir
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: cooliris-libmpv-windows-installer
+          path: libmpv/release/*.exe
+
+      - name: Upload unpacked folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: cooliris-libmpv-windows-unpacked
+          path: libmpv/release/win-unpacked/**
