@@ -70,6 +70,8 @@ export function VlcPlayer({
   const [subBg, setSubBg] = useState("#000000");
   const [subBgAlpha, setSubBgAlpha] = useState(0); // 0 = transparent … 100 = opaque
   const styleTimer = useRef<number>(0);
+  const restyleTimer = useRef<number>(0);
+  const [restyling, setRestyling] = useState(false); // brief "applying…" hint during reload
   const shownRef = useRef(false);
   const seeking = useRef(false);
   const trackRef = useRef<HTMLDivElement>(null);
@@ -144,6 +146,11 @@ export function VlcPlayer({
     setSubBgAlpha(bgAlpha);
     window.clearTimeout(styleTimer.current);
     styleTimer.current = window.setTimeout(() => {
+      // VLC 3 can't restyle live — applying recreates the player and reloads the file
+      // (~1s). Show a brief hint so the freeze reads as intentional.
+      setRestyling(true);
+      window.clearTimeout(restyleTimer.current);
+      restyleTimer.current = window.setTimeout(() => setRestyling(false), 1400);
       vlc?.vlcStyle([
         `--freetype-fontsize=${size}`,
         `--freetype-color=${parseInt(color.slice(1), 16)}`,
@@ -303,6 +310,14 @@ export function VlcPlayer({
         {!ready && (
           <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
             <div className="rounded-lg bg-black/70 px-4 py-3 text-sm text-white">Loading…</div>
+          </div>
+        )}
+
+        {ready && restyling && (
+          <div className="pointer-events-none absolute bottom-20 left-1/2 z-10 -translate-x-1/2">
+            <div className="rounded-full bg-black/70 px-3 py-1.5 text-xs text-white">
+              Applying subtitle style…
+            </div>
           </div>
         )}
       </div>

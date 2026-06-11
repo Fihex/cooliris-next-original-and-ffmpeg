@@ -48,7 +48,13 @@ if (addon) makePlayer();
 
 // Recreate the player with new style args, reloading the current file at its position.
 function applyStyle(args) {
-  styleArgs = Array.isArray(args) ? args.map(String) : [];
+  const next = Array.isArray(args) ? args.map(String) : [];
+  // No-op if the style is unchanged — avoids a needless reload/freeze when a control
+  // re-emits the same value (e.g. re-opening the menu or re-picking the same color).
+  if (next.length === styleArgs.length && next.every((a, i) => a === styleArgs[i])) {
+    return !!player;
+  }
+  styleArgs = next;
   const pos = player ? parseFloat(player.getProperty("time-pos") || "0") : 0;
   const aid = player ? player.getProperty("aid") : null;
   const sid = player ? player.getProperty("sid") : null;
