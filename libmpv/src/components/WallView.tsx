@@ -16,7 +16,6 @@ import { Lightbox } from "./Lightbox";
 import { Scrubber, type ScrubberHandle } from "./Scrubber";
 import { Toasts, type ToastMessage } from "./Toast";
 import { EMBED } from "@/embedMode";
-import { TitleBar } from "./TitleBar";
 
 export function WallView() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -292,8 +291,6 @@ export function WallView() {
 
   return (
     <div className="relative h-full w-full overflow-hidden" onPointerMove={onPointerMove}>
-      {/* Custom window chrome for the frameless embed window (drag + min/max/close). */}
-      {EMBED && <TitleBar />}
       {/* Embed mode: the window is transparent (so the mpv surface shows through while a
           video plays), so give the WALL an opaque backdrop while browsing — removed when
           a video is open so mpv shows. */}

@@ -127,7 +127,10 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
           if (wcscmp(cls, L"mpv") == 0) {
             RECT rc;
             GetClientRect((HWND)lp, &rc);
-            MoveWindow(child, 0, 0, rc.right - rc.left, rc.bottom - rc.top, TRUE);
+            // HWND_TOP raises mpv's surface above Chromium's web content so the video is
+            // visible in the opaque framed window (no transparency needed).
+            SetWindowPos(child, HWND_TOP, 0, 0, rc.right - rc.left, rc.bottom - rc.top,
+                         SWP_NOACTIVATE | SWP_SHOWWINDOW);
           }
           return TRUE;
         },

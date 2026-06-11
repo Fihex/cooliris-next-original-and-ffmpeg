@@ -296,11 +296,10 @@ function createWindow() {
   win = new BrowserWindow({
     width: 1440,
     height: 900,
-    // Embed mode: transparent + frameless so the mpv video surface underneath shows
-    // through the cleared web layer.
-    backgroundColor: EMBED_MODE ? "#00000000" : "#000000",
-    transparent: EMBED_MODE,
-    frame: !EMBED_MODE,
+    // Real OS-framed window (title bar + native min/max/close + edge resize). Embed mode
+    // renders mpv ON TOP of the web (raised in the addon's FitWindow), so no transparency
+    // is needed — the window stays a normal opaque framed window.
+    backgroundColor: "#000000",
     autoHideMenuBar: true,
     // Don't show the window until the renderer has painted its first frame (the black
     // boot splash) — otherwise Windows briefly shows an empty white window first.
