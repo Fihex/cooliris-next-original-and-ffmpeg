@@ -476,7 +476,9 @@ export function VlcPlayer({
           </div>
         )}
 
-        {subTracks.length > 0 && (
+        {/* Always available so subtitles (incl. auto-loaded sidecars) and the style
+            controls are reachable for every format, even ones with no embedded subs. */}
+        {(
           <div className="relative">
             <button
               onClick={() => setCapsMenu((o) => !o)}
