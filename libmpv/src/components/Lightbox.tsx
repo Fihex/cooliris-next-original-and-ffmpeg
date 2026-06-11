@@ -116,6 +116,18 @@ export function Lightbox({
     return () => document.removeEventListener("fullscreenchange", onFsChange);
   }, []);
 
+  // Embed mode: a windowed mpv --wid surface comes up small in the top-left, but
+  // OS-window fullscreen fills correctly — so keep a video fullscreen while it's open and
+  // restore the window on close. (The manual fullscreen toggle is hidden in embed.)
+  useEffect(() => {
+    if (!EMBED || item.type !== "video") return;
+    window.electron?.winFullscreen(true).then((on) => setIsFullscreen(!!on));
+    return () => {
+      window.electron?.winFullscreen(false);
+      setIsFullscreen(false);
+    };
+  }, [item.id, item.type]);
+
   // Track play/pause so chrome only auto-hides while a video is actually playing.
   useEffect(() => {
     if (item.type !== "video") return;
@@ -136,10 +148,10 @@ export function Lightbox({
     const isVideo = item.type === "video";
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        // Esc leaves fullscreen first; only closes the lightbox when not fullscreen.
+        // Embed: closing the lightbox restores the window from fullscreen (cleanup above),
+        // so Esc just closes. Non-embed: leave browser fullscreen first, then close.
         if (EMBED) {
-          if (isFullscreen) window.electron?.winFullscreen(false).then(() => setIsFullscreen(false));
-          else onClose();
+          onClose();
         } else if (document.fullscreenElement) {
           document.exitFullscreen();
         } else {
