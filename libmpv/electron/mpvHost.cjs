@@ -44,6 +44,7 @@ process.on("message", (m) => {
       case "size": result = player.videoSize(); break;
       case "frame": result = player.renderFrame(args[0], args[1]); break;
       case "stop": player.command(["stop"]); break;
+      case "fit": if (player.fit) player.fit(); break;
     }
   } catch {
     result = null;

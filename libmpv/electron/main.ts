@@ -8,6 +8,7 @@ import {
   mpvAvailable,
   mpvWarm,
   setEmbedWid,
+  mpvFit,
   mpvLoad,
   mpvCommand,
   mpvSet,
@@ -278,6 +279,17 @@ ipcMain.handle("win-fullscreen", (_e, on: boolean) => {
   win.setFullScreen(!!on);
   return win.isFullScreen();
 });
+// Custom title-bar controls for the frameless embed window (the transparency it needs to
+// show the mpv video forces frameless, so the chrome is drawn in HTML).
+ipcMain.handle("win-minimize", () => win?.minimize());
+ipcMain.handle("win-maximize", () => {
+  if (!win) return false;
+  if (win.isMaximized()) win.unmaximize();
+  else win.maximize();
+  return win.isMaximized();
+});
+ipcMain.handle("win-close", () => win?.close());
+ipcMain.handle("win-is-maximized", () => win?.isMaximized() ?? false);
 
 /* --------------------------------- window ----------------------------------- */
 function createWindow() {
@@ -303,6 +315,8 @@ function createWindow() {
     },
   });
   win.once("ready-to-show", () => win?.show());
+  // Embed: keep mpv's video surface filling the window as the user resizes/maximizes it.
+  if (EMBED_MODE) win.on("resize", () => mpvFit());
 
   const q = EMBED_MODE ? "?embed=1" : ""; // tells the renderer to clear backgrounds
   if (VITE_DEV_SERVER_URL) {

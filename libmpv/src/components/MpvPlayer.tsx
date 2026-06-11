@@ -322,11 +322,14 @@ export function MpvPlayer({
     mpv?.mpvSet("volume", String(value));
   };
 
-  // Keyboard: ←/→ seek ∓10s, ↑/↓ volume (mirrors the video shortcuts).
+  // Keyboard: Space pause/resume, ←/→ seek ∓10s, ↑/↓ volume (mirrors the video shortcuts).
   useEffect(() => {
     if (!mpv) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "ArrowRight") {
+      if (e.key === " " || e.code === "Space") {
+        e.preventDefault();
+        mpv.mpvCmd(["cycle", "pause"]); // toggle pause/resume
+      } else if (e.key === "ArrowRight") {
         e.preventDefault();
         mpv.mpvCmd(["seek", "10", "relative"]);
       } else if (e.key === "ArrowLeft") {
@@ -620,21 +623,17 @@ export function MpvPlayer({
           </div>
         )}
 
-        {/* In embed mode the video is always OS-window fullscreen (windowed mpv renders
-            small in the corner), so the manual toggle is hidden — Back/Esc exits. */}
-        {!EMBED && (
-          <button onClick={onFullscreen} className={btn} aria-label="Fullscreen" title="Fullscreen">
-            {fullscreen ? (
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" />
-              </svg>
-            ) : (
-              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
-              </svg>
-            )}
-          </button>
-        )}
+        <button onClick={onFullscreen} className={btn} aria-label="Fullscreen" title="Fullscreen">
+          {fullscreen ? (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5" />
+            </svg>
+          ) : (
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" />
+            </svg>
+          )}
+        </button>
       </div>
     </>
   );

@@ -10,6 +10,14 @@
 #include <cstdlib>  // strtoll (parse the window id)
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>  // embed mode: size mpv's --wid child window to fill the parent
+#include <cwchar>
+#endif
+#ifdef _WIN32
+#include <windows.h>  // embed mode: size mpv's --wid child window to fill the parent
+#include <cwchar>
+#endif
 
 class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
  public:
@@ -20,6 +28,7 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
       InstanceMethod("getProperty", &MpvPlayer::GetProperty),
       InstanceMethod("renderFrame", &MpvPlayer::RenderFrame),
       InstanceMethod("videoSize", &MpvPlayer::VideoSize),
+      InstanceMethod("fit", &MpvPlayer::Fit),
       InstanceMethod("destroy", &MpvPlayer::Destroy),
     });
     exports.Set("MpvPlayer", func);
@@ -44,6 +53,7 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
         int64_t wid = (int64_t)strtoll(widStr.c_str(), nullptr, 10);
         if (wid != 0) {
           embedded_ = true;
+          wid_ = wid;
           mpv_set_option(mpv_, "wid", MPV_FORMAT_INT64, &wid);
           mpv_set_option_string(mpv_, "vo", "gpu");
           mpv_set_option_string(mpv_, "hwdec", "auto-safe"); // HW decode, SW fallback
@@ -100,6 +110,30 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
   mpv_render_context* ctx_ = nullptr;
   std::vector<uint8_t> buf_;
   bool embedded_ = false; // true → mpv renders into a native window (no SW render context)
+  int64_t wid_ = 0;       // the parent window id (embed mode), for sizing mpv's child
+
+  // Embed mode: mpv's --wid surface is a child window that comes up at the video's native
+  // size in the corner and doesn't track the parent — size it to fill the parent's client
+  // area. Called on video-reconfig and on window resize.
+  void FitWindow() {
+#ifdef _WIN32
+    if (!embedded_ || !wid_) return;
+    HWND parent = (HWND)(intptr_t)wid_;
+    EnumChildWindows(
+        parent,
+        [](HWND child, LPARAM lp) -> BOOL {
+          wchar_t cls[64] = {0};
+          GetClassNameW(child, cls, 63);
+          if (wcscmp(cls, L"mpv") == 0) {
+            RECT rc;
+            GetClientRect((HWND)lp, &rc);
+            MoveWindow(child, 0, 0, rc.right - rc.left, rc.bottom - rc.top, TRUE);
+          }
+          return TRUE;
+        },
+        (LPARAM)parent);
+#endif
+  }
 
   // Drain mpv's event queue (it can stall the core if left unread) and surface errors.
   void DrainEvents() {
@@ -114,6 +148,9 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
         auto* e = static_cast<mpv_event_end_file*>(ev->data);
         if (e->reason == MPV_END_FILE_REASON_ERROR)
           fprintf(stderr, "[mpv] file error: %s\n", mpv_error_string(e->error));
+      } else if (ev->event_id == MPV_EVENT_VIDEO_RECONFIG) {
+        // The video output (window) was (re)created/resized — fit it to the parent.
+        FitWindow();
       }
     }
   }
@@ -206,6 +243,12 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
     // Copy (not an external buffer): Electron's V8 sandbox rejects external buffers
     // over IPC ("External buffers are not allowed").
     return Napi::Buffer<uint8_t>::Copy(env, buf_.data(), buf_.size());
+  }
+
+  // Re-fit the embedded video surface to the parent window (call on window resize).
+  Napi::Value Fit(const Napi::CallbackInfo& info) {
+    FitWindow();
+    return info.Env().Undefined();
   }
 
   Napi::Value Destroy(const Napi::CallbackInfo& info) {

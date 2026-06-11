@@ -138,6 +138,8 @@ export const mpvGet = (name: string) => call<string | null>("get", [name]);
 export const mpvVideoSize = () => call<{ w: number; h: number }>("size", []);
 export const mpvFrame = (w: number, h: number) => call<Uint8Array | null>("frame", [w, h]);
 export const mpvStop = () => call("stop", []);
+// Embed mode: re-fit mpv's --wid video surface to the (resized) window.
+export const mpvFit = () => call("fit", []);
 export function mpvDestroy(): void {
   if (child) {
     try {
