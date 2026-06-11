@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { MediaItem } from "@/feed/types";
 import { MpvPlayer } from "./MpvPlayer";
+import { EMBED } from "@/embedMode";
 
 // All videos play through libmpv (every format, no transcode). Recover the file path
 // from the coolmedia:// URL the scan produced.
@@ -263,9 +264,11 @@ export function Lightbox({
   return (
     <div
       ref={wrapRef}
-      className={`absolute inset-0 z-40 select-none touch-none overflow-hidden bg-black transition-opacity duration-200 ${
-        shown && !closing ? "opacity-100" : "opacity-0"
-      } ${closing ? "pointer-events-none" : ""} ${hideChrome ? "cursor-none" : ""}`}
+      className={`absolute inset-0 z-40 select-none touch-none overflow-hidden transition-opacity duration-200 ${
+        EMBED ? "" : "bg-black"
+      } ${shown && !closing ? "opacity-100" : "opacity-0"} ${
+        closing ? "pointer-events-none" : ""
+      } ${hideChrome ? "cursor-none" : ""}`}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}

@@ -15,6 +15,7 @@ import { SettingsDialog } from "./SettingsDialog";
 import { Lightbox } from "./Lightbox";
 import { Scrubber, type ScrubberHandle } from "./Scrubber";
 import { Toasts, type ToastMessage } from "./Toast";
+import { EMBED } from "@/embedMode";
 
 export function WallView() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -290,7 +291,13 @@ export function WallView() {
 
   return (
     <div className="relative h-full w-full overflow-hidden" onPointerMove={onPointerMove}>
-      <div ref={containerRef} className="absolute inset-0" />
+      {/* In embedded-mpv mode the wall's WebGL canvas is opaque and would cover the mpv
+          video surface underneath, so hide it while a video is open. */}
+      <div
+        ref={containerRef}
+        className="absolute inset-0"
+        style={EMBED && selected >= 0 ? { visibility: "hidden" } : undefined}
+      />
 
       {fatal && (
         <div className="absolute inset-0 z-40 flex items-center justify-center p-6">

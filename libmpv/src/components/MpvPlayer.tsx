@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { EMBED } from "@/embedMode";
 
 /**
  * libmpv-backed video player (Option C). Instead of a Chromium <video>, it pulls
@@ -370,7 +371,7 @@ export function MpvPlayer({
           />
         </div>
 
-        {!ready && (
+        {!ready && !EMBED && (
           <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
             <div className="rounded-lg bg-black/70 px-4 py-3 text-sm text-white">Loading…</div>
           </div>

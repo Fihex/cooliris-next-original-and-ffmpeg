@@ -40,6 +40,11 @@ const RENDERER_DIST = path.join(process.env.APP_ROOT, "dist");
 
 let win: BrowserWindow | null = null;
 
+// Experimental Option 1: render hardware-decoded mpv into the window (native fps). The
+// window is transparent + frameless so the mpv surface underneath shows through where the
+// web layer is cleared. Windows-only, opt-in. Off → normal canvas frame-pump.
+const EMBED_MODE = process.env.COOLIRIS_MPV_EMBED === "1" && process.platform === "win32";
+
 /* --------------------------- local-media protocol --------------------------- */
 // A privileged scheme so the renderer (http:// in dev, file:// in prod) can load
 // files from anywhere on disk *by streaming* — we never read whole files into JS.
@@ -272,7 +277,11 @@ function createWindow() {
   win = new BrowserWindow({
     width: 1440,
     height: 900,
-    backgroundColor: "#000000",
+    // Embed mode: transparent + frameless so the mpv video surface underneath shows
+    // through the cleared web layer.
+    backgroundColor: EMBED_MODE ? "#00000000" : "#000000",
+    transparent: EMBED_MODE,
+    frame: !EMBED_MODE,
     autoHideMenuBar: true,
     // Don't show the window until the renderer has painted its first frame (the black
     // boot splash) — otherwise Windows briefly shows an empty white window first.
@@ -288,11 +297,12 @@ function createWindow() {
   });
   win.once("ready-to-show", () => win?.show());
 
+  const q = EMBED_MODE ? "?embed=1" : ""; // tells the renderer to clear backgrounds
   if (VITE_DEV_SERVER_URL) {
-    win.loadURL(VITE_DEV_SERVER_URL);
+    win.loadURL(VITE_DEV_SERVER_URL + q);
     win.webContents.openDevTools({ mode: "detach" });
   } else {
-    win.loadURL("app://bundle/");
+    win.loadURL("app://bundle/" + q);
     // No menu in production → removes the default Reload/DevTools accelerators.
     Menu.setApplicationMenu(null);
     // Belt-and-suspenders: also swallow Chromium's built-in reload keys. A reload
@@ -376,7 +386,7 @@ app.whenReady().then(() => {
   // Option 1 (experimental, opt-in via COOLIRIS_MPV_EMBED=1): render hardware-decoded mpv
   // straight into this window for native fps. Must run before mpvWarm so the wid is in the
   // host's env when it spawns. Windows-only; off by default → unchanged frame-pump path.
-  if (process.env.COOLIRIS_MPV_EMBED === "1" && process.platform === "win32" && win) {
+  if (EMBED_MODE && win) {
     try {
       const handle = win.getNativeWindowHandle(); // Buffer holding the HWND pointer
       const wid = handle.readBigUInt64LE(0).toString();
