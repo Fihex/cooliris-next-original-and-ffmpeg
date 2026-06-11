@@ -61,6 +61,10 @@ class VlcPlayer : public Napi::ObjectWrap<VlcPlayer> {
     // GPU→CPU converter that vmem needs (audio plays, video stuck on Loading) — same
     // reliability call as hwdec=no in the libmpv edition. SW decode is plenty fast.
     argStore.push_back("--avcodec-hw=none");
+    // Pick up sidecar subtitle files in the video's folder even when the names don't
+    // match (fuzzy=1 = "any subtitle file in the directory"); they then show in the CC
+    // menu. Default is 3 (name-match), which missed differently-named .srt files.
+    argStore.push_back("--sub-autodetect-fuzzy=1");
     if (info.Length() > 0 && info[0].IsArray()) {
       Napi::Array arr = info[0].As<Napi::Array>();
       for (uint32_t i = 0; i < arr.Length(); i++)

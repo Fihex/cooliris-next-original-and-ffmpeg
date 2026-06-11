@@ -4,7 +4,7 @@
 // replies by id.
 import { app } from "electron";
 import { fork, execSync, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, cpSync } from "node:fs";
+import { existsSync } from "node:fs";
 import path from "node:path";
 
 // These files (host script + addon) are asarUnpacked and must be read by the EXTERNAL
@@ -45,45 +45,17 @@ function nodePath(): string {
   return "node";
 }
 
-// On Windows, libVLC rebuilds its plugin index (~30s) on every launch unless it can
-// PERSIST a cache (plugins.dat) into the plugin directory — and the bundled dir may be
-// read-only. So copy the plugins once into a writable per-user dir and point libVLC
-// there: it writes its cache on the first run and reuses it on every later launch, so
-// only the first-ever launch is slow. Linux/mac scan fast, so they use the bundled dir.
-let cachedPluginDir: string | null = null;
+// Point libVLC at the bundled plugin dir, which ships a pre-built plugins.dat (the
+// afterPack hook runs vlc-cache-gen against these exact files, and NSIS preserves their
+// timestamps on install, so the cache validates → no ~30s rescan on first open). The
+// per-user install dir is writable, so libVLC can also refresh the cache there if ever
+// needed. (Earlier we copied the tree into userData first, but that ~150MB copy froze
+// the first launch for no benefit — the bundled cache is already valid.)
 function pluginDir(): string | undefined {
   const isWin = process.platform === "win32";
   const bundled = path.join(vendorDir(), isWin ? "plugins" : "vlc-plugins");
   if (!vendorDir() || !existsSync(bundled)) return undefined;
-  if (!isWin) return bundled;
-  if (cachedPluginDir) return cachedPluginDir;
-  try {
-    const dest = path.join(app.getPath("userData"), "vlc-plugins");
-    const marker = path.join(dest, ".bundle-version");
-    const want = app.getVersion();
-    let have: string | null = null;
-    try {
-      have = readFileSync(marker, "utf8");
-    } catch {
-      /* not copied yet */
-    }
-    if (have !== want) {
-      // Fresh copy on first run or after an app update. preserveTimestamps keeps the
-      // pre-built plugins.dat (shipped in the bundle) valid for these copied files —
-      // VLC validates the cache by each plugin's mtime+size — so the first open is fast
-      // rather than a ~30s rescan. If the cache is ever invalid, libVLC just rebuilds it
-      // here once (this dir is writable) and reuses it next launch.
-      rmSync(dest, { recursive: true, force: true });
-      mkdirSync(dest, { recursive: true });
-      cpSync(bundled, dest, { recursive: true, preserveTimestamps: true });
-      writeFileSync(marker, want);
-    }
-    cachedPluginDir = dest;
-    return dest;
-  } catch (e) {
-    console.warn("[vlc] could not prepare writable plugin dir; using bundled:", e);
-    return bundled;
-  }
+  return bundled;
 }
 
 let child: ChildProcess | null = null;
