@@ -80,6 +80,18 @@ jobs:
           name: mpv-gyp-build-log
           path: gyp-build.log
 
+      - name: Surface compiler/linker errors as annotations
+        if: failure()
+        shell: pwsh
+        run: |
+          $log = "$env:GITHUB_WORKSPACE\gyp-build.log"
+          if (Test-Path $log) {
+            $hits = Get-Content $log |
+              Select-String -Pattern 'error C\d|fatal error|unresolved external|LNK\d|cannot open|: error|\.cc\(' |
+              Select-Object -Last 40
+            foreach ($h in $hits) { Write-Host ("::error::" + $h.ToString().Trim()) }
+          }
+
       - name: Bundle self-contained runtime (node.exe + libmpv-2.dll)
         shell: pwsh
         working-directory: libmpv
