@@ -69,6 +69,8 @@ export function VlcPlayer({
   const [subColor, setSubColor] = useState("#ffffff");
   const [subBg, setSubBg] = useState("#000000");
   const [subBgAlpha, setSubBgAlpha] = useState(0); // 0 = transparent … 100 = opaque
+  const [subOutline, setSubOutline] = useState(true); // text outline/border on by default
+  const [subOutlineColor, setSubOutlineColor] = useState("#000000");
   const styleTimer = useRef<number>(0);
   const restyleTimer = useRef<number>(0);
   const [restyling, setRestyling] = useState(false); // brief "applying…" hint during reload
@@ -139,11 +141,20 @@ export function VlcPlayer({
 
   // Debounced style apply: sliders fire many events, and each apply means a player
   // recreate + reload — batch them ~600ms after the last change.
-  const applyStyle = (size: number, color: string, bg: string, bgAlpha: number) => {
+  const applyStyle = (
+    size: number,
+    color: string,
+    bg: string,
+    bgAlpha: number,
+    outline: boolean,
+    outlineColor: string,
+  ) => {
     setSubSize(size);
     setSubColor(color);
     setSubBg(bg);
     setSubBgAlpha(bgAlpha);
+    setSubOutline(outline);
+    setSubOutlineColor(outlineColor);
     window.clearTimeout(styleTimer.current);
     styleTimer.current = window.setTimeout(() => {
       // VLC 3 can't restyle live — applying recreates the player and reloads the file
@@ -156,6 +167,9 @@ export function VlcPlayer({
         `--freetype-color=${parseInt(color.slice(1), 16)}`,
         `--freetype-background-color=${parseInt(bg.slice(1), 16)}`,
         `--freetype-background-opacity=${Math.round(bgAlpha * 2.55)}`,
+        // Outline/border: opacity 0 turns it off, 255 on; colour is an RGB int.
+        `--freetype-outline-color=${parseInt(outlineColor.slice(1), 16)}`,
+        `--freetype-outline-opacity=${outline ? 255 : 0}`,
       ]);
     }, 600);
   };
@@ -503,7 +517,9 @@ export function VlcPlayer({
                         min={20}
                         max={100}
                         value={subSize}
-                        onChange={(e) => applyStyle(Number(e.target.value), subColor, subBg, subBgAlpha)}
+                        onChange={(e) =>
+                          applyStyle(Number(e.target.value), subColor, subBg, subBgAlpha, subOutline, subOutlineColor)
+                        }
                         className="w-28 accent-white"
                       />
                     </label>
@@ -512,7 +528,9 @@ export function VlcPlayer({
                       <input
                         type="color"
                         value={subColor}
-                        onChange={(e) => applyStyle(subSize, e.target.value, subBg, subBgAlpha)}
+                        onChange={(e) =>
+                          applyStyle(subSize, e.target.value, subBg, subBgAlpha, subOutline, subOutlineColor)
+                        }
                         className="h-6 w-10 cursor-pointer rounded bg-transparent"
                       />
                     </label>
@@ -521,7 +539,9 @@ export function VlcPlayer({
                       <input
                         type="color"
                         value={subBg}
-                        onChange={(e) => applyStyle(subSize, subColor, e.target.value, subBgAlpha)}
+                        onChange={(e) =>
+                          applyStyle(subSize, subColor, e.target.value, subBgAlpha, subOutline, subOutlineColor)
+                        }
                         className="h-6 w-10 cursor-pointer rounded bg-transparent"
                       />
                     </label>
@@ -532,9 +552,33 @@ export function VlcPlayer({
                         min={0}
                         max={100}
                         value={subBgAlpha}
-                        onChange={(e) => applyStyle(subSize, subColor, subBg, Number(e.target.value))}
+                        onChange={(e) =>
+                          applyStyle(subSize, subColor, subBg, Number(e.target.value), subOutline, subOutlineColor)
+                        }
                         className="w-28 accent-white"
                       />
+                    </label>
+                    <label className="flex items-center justify-between gap-2">
+                      <span>Outline</span>
+                      <span className="flex items-center gap-2">
+                        <input
+                          type="color"
+                          value={subOutlineColor}
+                          disabled={!subOutline}
+                          onChange={(e) =>
+                            applyStyle(subSize, subColor, subBg, subBgAlpha, subOutline, e.target.value)
+                          }
+                          className="h-6 w-10 cursor-pointer rounded bg-transparent disabled:opacity-40"
+                        />
+                        <input
+                          type="checkbox"
+                          checked={subOutline}
+                          onChange={(e) =>
+                            applyStyle(subSize, subColor, subBg, subBgAlpha, e.target.checked, subOutlineColor)
+                          }
+                          className="h-4 w-4 cursor-pointer accent-white"
+                        />
+                      </span>
                     </label>
                     <div className="pt-1 text-[11px] leading-snug text-white/40">
                       Applies with a quick reload (VLC sets style at startup).

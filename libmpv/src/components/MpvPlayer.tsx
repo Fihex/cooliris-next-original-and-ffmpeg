@@ -69,6 +69,8 @@ export function MpvPlayer({
   const [subColor, setSubColor] = useState("#ffffff");
   const [subBg, setSubBg] = useState("#000000");
   const [subBgAlpha, setSubBgAlpha] = useState(0); // 0 = transparent … 100 = opaque
+  const [subOutline, setSubOutline] = useState(true); // text outline/border on by default
+  const [subOutlineColor, setSubOutlineColor] = useState("#000000");
   const shownRef = useRef(false);
   const seeking = useRef(false);
   const trackRef = useRef<HTMLDivElement>(null);
@@ -158,6 +160,13 @@ export function MpvPlayer({
       mpv?.mpvSet("sub-border-style", "outline-and-shadow");
       mpv?.mpvSet("sub-shadow-offset", "0");
     }
+  };
+  // Text outline (border): on/off via border size (0 = off), plus its colour. Live.
+  const applySubOutline = (on: boolean, color: string) => {
+    setSubOutline(on);
+    setSubOutlineColor(color);
+    mpv?.mpvSet("sub-border-size", on ? "3" : "0");
+    mpv?.mpvSet("sub-border-color", color);
   };
 
   // Load the file and pump frames into the canvas while this item is shown.
@@ -525,6 +534,24 @@ export function MpvPlayer({
                         onChange={(e) => applySubBg(subBg, Number(e.target.value))}
                         className="w-28 accent-white"
                       />
+                    </label>
+                    <label className="flex items-center justify-between gap-2">
+                      <span>Outline</span>
+                      <span className="flex items-center gap-2">
+                        <input
+                          type="color"
+                          value={subOutlineColor}
+                          disabled={!subOutline}
+                          onChange={(e) => applySubOutline(subOutline, e.target.value)}
+                          className="h-6 w-10 cursor-pointer rounded bg-transparent disabled:opacity-40"
+                        />
+                        <input
+                          type="checkbox"
+                          checked={subOutline}
+                          onChange={(e) => applySubOutline(e.target.checked, subOutlineColor)}
+                          className="h-4 w-4 cursor-pointer accent-white"
+                        />
+                      </span>
                     </label>
                   </div>
                 )}
