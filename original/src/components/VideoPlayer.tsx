@@ -298,7 +298,8 @@ function VideoControls({
     v.muted = value === 0;
   };
 
-  const btn = "rounded p-1.5 text-white/85 transition hover:bg-white/15 hover:text-white";
+  const btn =
+    "inline-flex items-center justify-center rounded p-1.5 text-white/85 transition hover:bg-white/15 hover:text-white";
 
   return (
     <div

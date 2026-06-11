@@ -1,13 +1,59 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" style="background: #000">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="description" content="Cooliris Next — a modern, Flash-free 3D media wall." />
     <title>Cooliris Next — 3D Media Wall</title>
+    <style>
+      /* Inline so the very first paint is BLACK with text — before the app's Tailwind
+         stylesheet has loaded the browser would otherwise show a white default
+         background (noticeable on slower Windows startups). #boot lives inside #root,
+         so React replaces it the moment the app mounts. */
+      html,
+      body {
+        margin: 0;
+        background: #000;
+      }
+      #boot {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        background: #000;
+        color: #fff;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      }
+      #boot .spin {
+        width: 28px;
+        height: 28px;
+        border-radius: 50%;
+        border: 3px solid rgba(255, 255, 255, 0.22);
+        border-top-color: #fff;
+        animation: bootspin 0.8s linear infinite;
+      }
+      #boot .t {
+        font-size: 14px;
+        letter-spacing: 0.02em;
+        opacity: 0.85;
+      }
+      @keyframes bootspin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
   </head>
   <body class="bg-black">
-    <div id="root"></div>
+    <div id="root">
+      <div id="boot">
+        <div class="spin"></div>
+        <div class="t">Starting Cooliris Next…</div>
+      </div>
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
