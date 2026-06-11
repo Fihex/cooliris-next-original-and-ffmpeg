@@ -6,6 +6,7 @@ import path from "node:path";
 import { extractCoverArt } from "./coverArt";
 import {
   vlcAvailable,
+  vlcWarm,
   vlcLoad,
   vlcCommand,
   vlcSet,
@@ -369,6 +370,7 @@ app.whenReady().then(() => {
   });
 
   createWindow();
+  vlcWarm(); // spin up the engine in the background so the first open isn't slow
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

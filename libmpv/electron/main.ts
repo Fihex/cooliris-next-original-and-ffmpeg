@@ -6,6 +6,7 @@ import path from "node:path";
 import { extractCoverArt } from "./coverArt";
 import {
   mpvAvailable,
+  mpvWarm,
   mpvLoad,
   mpvCommand,
   mpvSet,
@@ -367,6 +368,7 @@ app.whenReady().then(() => {
   });
 
   createWindow();
+  mpvWarm(); // spin up the engine in the background so the first open isn't slow
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();

@@ -115,6 +115,18 @@ function call<T = unknown>(fn: string, args: unknown[]): Promise<T> {
 export function vlcAvailable(): boolean {
   return existsSync(addonFile()) && existsSync(hostScript());
 }
+// Pre-warm: fork the host process now so libVLC initialises and scans its plugin tree
+// ahead of the first open. Without this, the first video pays that one-time cost and
+// shows "Loading…" longer; afterwards opens reuse the running player. Best-effort —
+// if it fails the lazy fork on first load still works.
+export function vlcWarm(): void {
+  if (!vlcAvailable()) return;
+  try {
+    ensureChild();
+  } catch {
+    /* ignore — first real call will spawn it */
+  }
+}
 export const vlcLoad = (abs: string) => call("load", [abs]);
 export const vlcCommand = (args: string[]) => call<boolean>("cmd", [args]);
 export const vlcSet = (name: string, value: string) => call<boolean>("set", [name, value]);

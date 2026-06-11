@@ -111,6 +111,17 @@ function call<T = unknown>(fn: string, args: unknown[]): Promise<T> {
 export function mpvAvailable(): boolean {
   return existsSync(addonFile()) && existsSync(hostScript());
 }
+// Pre-warm: fork the host process now so libmpv initialises ahead of the first open.
+// Without this, the first video pays the one-time engine-init cost and shows "Loading…"
+// longer; afterwards opens reuse the running player. Best-effort.
+export function mpvWarm(): void {
+  if (!mpvAvailable()) return;
+  try {
+    ensureChild();
+  } catch {
+    /* ignore — first real call will spawn it */
+  }
+}
 export const mpvLoad = (abs: string) => call("load", [abs]);
 export const mpvCommand = (args: string[]) => call<boolean>("cmd", [args]);
 export const mpvSet = (name: string, value: string) => call<boolean>("set", [name, value]);
