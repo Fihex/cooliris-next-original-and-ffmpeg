@@ -51,6 +51,7 @@ export function VlcPlayer({
   onPlayingChange,
 }: VlcPlayerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const paintRef = useRef<Worker | null>(null); // off-main-thread WebGL paint (OffscreenCanvas)
   const [playing, setPlaying] = useState(true);
   const [cur, setCur] = useState(0);
   const [dur, setDur] = useState(0);
@@ -186,6 +187,27 @@ export function VlcPlayer({
     }, 600);
   };
 
+  // Hand the canvas to a worker that paints frames with WebGL (off the main thread). Done
+  // once — transferControlToOffscreen can only be called a single time per canvas. If it
+  // fails, paintRef stays null and the pump falls back to main-thread putImageData.
+  useEffect(() => {
+    const cv = canvasRef.current;
+    if (!cv || paintRef.current) return;
+    let worker: Worker | null = null;
+    try {
+      const offscreen = cv.transferControlToOffscreen();
+      worker = new Worker(new URL("../video/paintWorker.ts", import.meta.url), { type: "module" });
+      worker.postMessage({ canvas: offscreen }, [offscreen]);
+      paintRef.current = worker;
+    } catch {
+      paintRef.current = null;
+    }
+    return () => {
+      paintRef.current = null;
+      worker?.terminate();
+    };
+  }, []);
+
   // Load the file and pump frames into the canvas while this item is shown.
   useEffect(() => {
     if (!vlc) return;
@@ -204,7 +226,8 @@ export function VlcPlayer({
     vlc.vlcSet("render-width", String(targetW));
     vlc.vlcLoad(abs);
 
-    const ctx = canvasRef.current?.getContext("2d") ?? null;
+    // 2D context only when the WebGL worker isn't available (it owns the canvas otherwise).
+    const ctx = paintRef.current ? null : (canvasRef.current?.getContext("2d") ?? null);
     // The render size is fixed once playback starts, so resolve it once and re-check
     // only ~1×/s — NOT every frame. The per-frame size query was a second IPC round-trip
     // on top of the frame fetch, and on Windows (slower pipes) that doubled per-frame
@@ -223,16 +246,28 @@ export function VlcPlayer({
             if (sz && sz.w > 0 && (sz.w !== rw || sz.h !== rh)) {
               rw = sz.w;
               rh = sz.h;
-              if (canvasRef.current) {
+              // The worker sizes its OffscreenCanvas itself; only size here in 2D fallback.
+              if (ctx && canvasRef.current) {
                 canvasRef.current.width = rw;
                 canvasRef.current.height = rh;
               }
             }
           }
-          if (rw > 0 && ctx && canvasRef.current) {
+          if (rw > 0) {
             const buf = await vlc.vlcFrame(rw, rh);
             if (!cancelled && buf && buf.length === rw * rh * 4) {
-              ctx.putImageData(new ImageData(new Uint8ClampedArray(buf), rw, rh), 0, 0);
+              const worker = paintRef.current;
+              if (worker) {
+                // Hand the frame to the paint worker zero-copy (transfer its ArrayBuffer).
+                const u8 = buf as Uint8Array;
+                const ab =
+                  u8.byteOffset === 0 && u8.byteLength === u8.buffer.byteLength
+                    ? u8.buffer
+                    : u8.slice().buffer;
+                worker.postMessage({ buffer: ab, w: rw, h: rh }, [ab]);
+              } else if (ctx) {
+                ctx.putImageData(new ImageData(new Uint8ClampedArray(buf), rw, rh), 0, 0);
+              }
               if (!shownRef.current) {
                 shownRef.current = true;
                 setReady(true);
