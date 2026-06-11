@@ -388,6 +388,9 @@ app.whenReady().then(() => {
   // host's env when it spawns. Windows-only; off by default → unchanged frame-pump path.
   if (EMBED_MODE && win) {
     try {
+      // Maximize before mpv attaches so its --wid child fills the screen → fullscreen
+      // video from the first open (otherwise it filled the default 1440x900 window).
+      win.maximize();
       const handle = win.getNativeWindowHandle(); // Buffer holding the HWND pointer
       const wid = handle.readBigUInt64LE(0).toString();
       setEmbedWid(wid);
