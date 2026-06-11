@@ -38,7 +38,7 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
     mpv_set_option_string(mpv_, "terminal", "no");
     mpv_set_option_string(mpv_, "idle", "yes");
     mpv_set_option_string(mpv_, "sid", "no");          // off by default (but still selectable)
-    mpv_set_option_string(mpv_, "sub-auto", "exact");  // load sidecar .srt so it's in the menu
+    mpv_set_option_string(mpv_, "sub-auto", "fuzzy");  // load sidecar subs (incl. movie.en.srt) into the menu
     mpv_set_option_string(mpv_, "sub-back-color", "#00000000"); // transparent background box
     mpv_set_option_string(mpv_, "sub-border-size", "3");        // keep an outline for readability
     mpv_set_option_string(mpv_, "sub-font-size", "44");
