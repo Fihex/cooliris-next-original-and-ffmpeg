@@ -432,7 +432,7 @@ function Arrow({
         side === "left" ? "left-4" : "right-4"
       } ${hidden ? "pointer-events-none opacity-0" : "opacity-100"}`}
     >
-      {side === "left" ? "‹" : "›"}
+      <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d={side === "left" ? "M15 18l-6-6 6-6" : "M9 18l6-6-6-6"} /></svg>
     </button>
   );
 }
