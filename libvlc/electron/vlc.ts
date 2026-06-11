@@ -4,7 +4,7 @@
 // replies by id.
 import { app } from "electron";
 import { fork, execSync, type ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync, readFileSync, rmSync, cpSync } from "node:fs";
 import path from "node:path";
 
 // These files (host script + addon) are asarUnpacked and must be read by the EXTERNAL
@@ -45,6 +45,44 @@ function nodePath(): string {
   return "node";
 }
 
+// On Windows, libVLC rebuilds its plugin index (~30s) on every launch unless it can
+// PERSIST a cache (plugins.dat) into the plugin directory — and the bundled dir may be
+// read-only. So copy the plugins once into a writable per-user dir and point libVLC
+// there: it writes its cache on the first run and reuses it on every later launch, so
+// only the first-ever launch is slow. Linux/mac scan fast, so they use the bundled dir.
+let cachedPluginDir: string | null = null;
+function pluginDir(): string | undefined {
+  const isWin = process.platform === "win32";
+  const bundled = path.join(vendorDir(), isWin ? "plugins" : "vlc-plugins");
+  if (!vendorDir() || !existsSync(bundled)) return undefined;
+  if (!isWin) return bundled;
+  if (cachedPluginDir) return cachedPluginDir;
+  try {
+    const dest = path.join(app.getPath("userData"), "vlc-plugins");
+    const marker = path.join(dest, ".bundle-version");
+    const want = app.getVersion();
+    let have: string | null = null;
+    try {
+      have = readFileSync(marker, "utf8");
+    } catch {
+      /* not copied yet */
+    }
+    if (have !== want) {
+      // Fresh copy on first run or after an app update (so new plugins replace old, and
+      // any stale plugins.dat is dropped → libVLC rebuilds it once against these files).
+      rmSync(dest, { recursive: true, force: true });
+      mkdirSync(dest, { recursive: true });
+      cpSync(bundled, dest, { recursive: true });
+      writeFileSync(marker, want);
+    }
+    cachedPluginDir = dest;
+    return dest;
+  } catch (e) {
+    console.warn("[vlc] could not prepare writable plugin dir; using bundled:", e);
+    return bundled;
+  }
+}
+
 let child: ChildProcess | null = null;
 let nextId = 1;
 const pending = new Map<number, (v: unknown) => void>();
@@ -63,8 +101,8 @@ function ensureChild(): ChildProcess {
     const v = isWin ? "PATH" : "LD_LIBRARY_PATH";
     const sep = isWin ? ";" : ":";
     env[v] = libDir + sep + (env[v] ?? "");
-    const plugins = path.join(vendorDir(), isWin ? "plugins" : "vlc-plugins");
-    if (existsSync(plugins)) env.VLC_PLUGIN_PATH = plugins;
+    const plugins = pluginDir();
+    if (plugins) env.VLC_PLUGIN_PATH = plugins;
   }
   console.log("[vlc] starting host under node:", nodePath());
   child = fork(hostScript(), [], {
