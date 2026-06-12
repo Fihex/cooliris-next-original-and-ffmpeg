@@ -73,10 +73,12 @@ const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
 const INSTANCE_ATTRS: [wgpu::VertexAttribute; 4] =
     wgpu::vertex_attr_array![2 => Float32x2, 3 => Float32x2, 4 => Uint32, 5 => Float32x2];
 
-/// Where a tile's pixels come from — a file, or a generated placeholder when no folder is given.
+/// Where a tile's pixels come from — an image file, a video file (shown as a play tile, played on
+/// focus), or a generated placeholder when no folder is given.
 #[derive(Clone)]
 enum Source {
     File(PathBuf),
+    Video(PathBuf),
     Placeholder(usize),
 }
 
@@ -118,6 +120,7 @@ pub struct State {
 
     camera_buf: wgpu::Buffer,
     camera_bg: wgpu::BindGroup,
+    camera_bgl: wgpu::BindGroupLayout,
     tex_bg: wgpu::BindGroup,
     tex: wgpu::Texture,
 
@@ -140,6 +143,8 @@ pub struct State {
     scroll_max: f32,
     focus: Option<usize>, // currently-focused tile
     focus_t: f32,         // 0 = wall, 1 = focused (animated)
+    video: Option<crate::video::Player>, // playing the focused video tile, if any
+    video_for: Option<usize>,            // which tile self.video belongs to
     last_frame: Instant,
     frame: u64,
 }
@@ -379,7 +384,7 @@ impl State {
             cache: None,
         });
 
-        let state = State {
+        let mut state = State {
             window,
             surface,
             device,
@@ -393,6 +398,7 @@ impl State {
             num_instances: 0,
             camera_buf,
             camera_bg,
+            camera_bgl,
             tex_bg,
             tex,
             sources,
@@ -409,10 +415,21 @@ impl State {
             scroll_max,
             focus: None,
             focus_t: 0.0,
+            video: None,
+            video_for: None,
             last_frame: Instant::now(),
             frame: 0,
         };
         state.upload_camera();
+        // Test hook: auto-focus a tile on startup (e.g. COOLIRIS_FOCUS=0 to play a video tile).
+        if let Some(i) = std::env::var("COOLIRIS_FOCUS")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            if i < state.total {
+                state.focus = Some(i);
+            }
+        }
         state
     }
 
@@ -550,6 +567,26 @@ impl State {
 
         self.rebuild_instances();
         self.upload_camera();
+
+        // --- focused-video playback: start mpv when a video tile is focused, stop on change ---
+        if self.focus != self.video_for {
+            self.video = None; // dropping the player stops mpv
+            self.video_for = self.focus;
+            if let Some(idx) = self.focus {
+                if let Source::Video(path) = self.sources[idx].clone() {
+                    self.video = Some(crate::video::Player::start(
+                        &self.device,
+                        &self.queue,
+                        &self.camera_bgl,
+                        self.config.format,
+                        &path,
+                    ));
+                }
+            }
+        }
+        if let Some(v) = &mut self.video {
+            v.update(&self.device, &self.queue);
+        }
 
         // Opt-in streaming readout: RUST_LOG=cooliris_rs=debug
         self.frame = self.frame.wrapping_add(1);
@@ -764,6 +801,11 @@ impl State {
                 rp.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
                 rp.draw_indexed(0..INDICES.len() as u32, 0, 0..self.num_instances);
             }
+            // Playing video draws over its (focused) tile.
+            if let (Some(v), Some(idx)) = (&self.video, self.focus) {
+                let (cx, cy) = self.tile_center(idx);
+                v.draw(&mut rp, &self.camera_bg, [cx, cy], [1.6, 0.9], &self.queue);
+            }
         }
         self.queue.submit(std::iter::once(enc.finish()));
         frame.present();
@@ -788,8 +830,31 @@ fn decode(source: &Source) -> (Vec<u8>, u32, u32) {
                 (Vec::new(), 0, 0)
             }
         },
+        Source::Video(_) => (video_placeholder(), TILE_PX, TILE_PX),
         Source::Placeholder(i) => (placeholder(*i), TILE_PX, TILE_PX),
     }
+}
+
+/// A dark tile with a play triangle — the grid thumbnail for a video (it plays on focus).
+fn video_placeholder() -> Vec<u8> {
+    let mut buf = vec![0u8; (TILE_PX * TILE_PX * 4) as usize];
+    for y in 0..TILE_PX {
+        let fy = y as f32 / TILE_PX as f32;
+        for x in 0..TILE_PX {
+            let i = ((y * TILE_PX + x) * 4) as usize;
+            buf[i] = 20;
+            buf[i + 1] = 22;
+            buf[i + 2] = 28;
+            buf[i + 3] = 255;
+            let fx = x as f32 / TILE_PX as f32;
+            if fx > 0.40 && fx < 0.60 && (fy - 0.5).abs() < (0.60 - fx) * 0.9 {
+                buf[i] = 235;
+                buf[i + 1] = 235;
+                buf[i + 2] = 240;
+            }
+        }
+    }
+    buf
 }
 
 /// Build the tile library from the first CLI arg (a folder of images), or placeholders.
@@ -803,22 +868,34 @@ fn gather_sources() -> Vec<Source> {
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| {
-            matches!(
-                p.extension()
-                    .and_then(|s| s.to_str())
-                    .map(|s| s.to_ascii_lowercase())
-                    .as_deref(),
-                Some("jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp")
-            )
-        })
+        .filter(|p| classify(p).is_some())
         .collect();
     paths.sort();
     if paths.is_empty() {
-        log::info!("no images in {dir:?} — showing placeholders");
+        log::info!("no media in {dir:?} — showing placeholders");
         return (0..24).map(Source::Placeholder).collect();
     }
-    paths.into_iter().map(Source::File).collect()
+    paths
+        .into_iter()
+        .map(|p| match classify(&p) {
+            Some(true) => Source::Video(p),
+            _ => Source::File(p),
+        })
+        .collect()
+}
+
+/// `Some(true)` = video, `Some(false)` = image, `None` = ignore.
+fn classify(p: &std::path::Path) -> Option<bool> {
+    match p
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v") => Some(true),
+        Some("jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp") => Some(false),
+        _ => None,
+    }
 }
 
 /// A simple gradient keyed by index, so the wall is visible without any images.

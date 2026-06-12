@@ -27,7 +27,8 @@ so **GPU/CPU stay flat no matter how large the library** (verified: 120 tiles �
 at the ~99-tile window, layers recycled, never exhausted, zero panics). Next up is a touch more
 polish (full-res focus, reflections) and the libmpv video layer.
 
-Controls: **mouse wheel / ←→** scroll · **left-click** focus a tile · **Esc** back / quit.
+Controls: **mouse wheel / ←→** scroll · **left-click** focus a tile (video tiles play in place
+with `--features video`) · **Esc** back / quit.
 
 ## Roadmap (each step is a runnable milestone)
 
@@ -45,11 +46,11 @@ Controls: **mouse wheel / ←→** scroll · **left-click** focus a tile · **Es
    center on it; Esc / click returns. _(Full-resolution swap on focus is the next refinement —
    it currently shows the streamed thumbnail.)_
 9. **Reflections, labels, scrubber** — the visual polish from the WebGL wall.
-10. **✅ Video (proof)** — libmpv's **software render API** → a wgpu texture on a fullscreen quad.
-    mpv decodes (HW-accelerated internally) and we composite it; **no second window, no GL/Vulkan
-    interop** — the exact thing that was painful in the Electron embed. Verified frames flowing.
-    Opt-in: `cargo run --features video --bin video -- clip.mp4`. Next: composite onto video
-    tiles in the wall.
+10. **✅ Video, integrated** — video files appear as play tiles; **focus one and libmpv plays it
+    in place** over the tile (software render API → wgpu texture → a quad via the wall camera).
+    **No second window, no GL/Vulkan interop** — the exact thing that was painful in the Electron
+    embed. Opt-in behind `--features video`; the wall builds with no libmpv dependency otherwise.
+    Standalone proof too: `cargo run --features video --bin video -- clip.mp4`.
 11. **Packaging** — `cargo-bundle` / per-OS installers; folder picker (`rfd`).
 
 ## Architecture (as it grows)

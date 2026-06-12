@@ -9,6 +9,7 @@
 // Controls: mouse wheel or ←/→ to scroll the wall.
 
 mod state;
+mod video;
 
 use std::sync::Arc;
 
