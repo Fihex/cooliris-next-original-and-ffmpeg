@@ -1,7 +1,8 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, net, protocol } from "electron";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { promises as fs, createReadStream } from "node:fs";
+import { promises as fs, createReadStream, type Stats } from "node:fs";
 import { Readable } from "node:stream";
+import { createHash } from "node:crypto";
 import v8 from "node:v8";
 import { runInNewContext } from "node:vm";
 import path from "node:path";
@@ -341,6 +342,32 @@ function makeGc(): (() => void) | null {
 const forceGc = makeGc();
 let imageServeCount = 0; // nudge a collect every N served images (see coolmedia handler)
 
+// On-disk thumbnail cache. The wall pulls hundreds of tiles; serving the multi-MB originals
+// through the main process is what kept the browser working set high (Electron retains a chunk
+// of every served body, beyond GC's reach) AND made loads slow. Instead we decode+downscale
+// once with nativeImage, cache a small JPEG to disk, and serve that (~40KB) — so the wall moves
+// ~100x less data through main and re-visits are an instant tiny read. Full-res (focus) and
+// formats nativeImage can't decode fall back to the original.
+let THUMB_DIR = "";
+async function makeThumb(abs: string, st: Stats, w: number): Promise<Buffer | null> {
+  const key = createHash("sha1").update(`${abs}|${st.mtimeMs}|${st.size}|${w}`).digest("hex");
+  const cacheFile = path.join(THUMB_DIR, `${key}.jpg`);
+  try {
+    return await fs.readFile(cacheFile); // hit — tiny read, no decode
+  } catch {
+    /* miss → generate below */
+  }
+  try {
+    const img = nativeImage.createFromPath(abs);
+    if (img.isEmpty()) return null; // unsupported format (HEIC/RAW/…) → caller serves original
+    const jpeg = img.resize({ width: w, quality: "good" }).toJPEG(72);
+    if (jpeg.length) fs.writeFile(cacheFile, jpeg).catch(() => {}); // fire-and-forget cache write
+    return jpeg.length ? jpeg : null;
+  } catch {
+    return null;
+  }
+}
+
 let memTimer: ReturnType<typeof setInterval> | null = null;
 function startMemLog(): void {
   if (memTimer) return;
@@ -489,14 +516,19 @@ function positionVideoWin() {
 app.commandLine.appendSwitch("js-flags", "--expose-gc");
 
 app.whenReady().then(() => {
+  THUMB_DIR = path.join(app.getPath("userData"), "thumb-cache");
+  fs.mkdir(THUMB_DIR, { recursive: true }).catch(() => {});
+
   protocol.handle("coolmedia", async (request) => {
-    const abs = decodeURIComponent(new URL(request.url).pathname.replace(/^\//, ""));
-    let size: number;
+    const reqUrl = new URL(request.url);
+    const abs = decodeURIComponent(reqUrl.pathname.replace(/^\//, ""));
+    let st: Stats;
     try {
-      size = (await fs.stat(abs)).size;
+      st = await fs.stat(abs);
     } catch {
       return new Response(null, { status: 404 });
     }
+    const size = st.size;
     // ACAO so the app://bundle renderer can use these as WebGL textures / canvas
     // posters; Accept-Ranges so <video>/<audio> can seek. Streamed (never read whole
     // files into JS); the read stream closes when the response is consumed/cancelled.
@@ -520,12 +552,25 @@ app.whenReady().then(() => {
 
     const m = /bytes=(\d*)-(\d*)/.exec(request.headers.get("Range") ?? "");
 
-    // Images are fetched whole (the renderer decodes them) and are never range-requested, so
-    // serve them as one Buffer: fs.readFile opens, reads and closes the fd in a single call,
-    // leaving nothing behind. A createReadStream instead keeps a ~64KB native read buffer + an
-    // open fd alive until it's torn down — and across the thousands of thumbnail requests a big
-    // wall generates, those piled up in the browser process (~50-64KB each, matching the climb)
-    // as native memory the GC can't reclaim. Large media keeps streaming (never read whole).
+    // Wall thumbnail: the wall requests images with ?w=N. Serve a small cached JPEG instead of
+    // the original so the main process never moves multi-MB bodies for the hundreds of tiles a
+    // wall loads (that was the browser-process memory floor) and tiles load fast. Falls through
+    // to the original on failure (unsupported format) or for full-res focus loads (no ?w).
+    const w = Number(reqUrl.searchParams.get("w"));
+    if (!m && w > 0 && mime.startsWith("image/")) {
+      const thumb = await makeThumb(abs, st, w);
+      if (thumb) {
+        if (forceGc && ++imageServeCount % 48 === 0) setImmediate(forceGc);
+        return new Response(new Uint8Array(thumb), {
+          status: 200,
+          headers: { ...base, "Content-Type": "image/jpeg", "Content-Length": String(thumb.length) },
+        });
+      }
+    }
+
+    // Full-res image (focus) or a format we couldn't thumbnail: serve the original whole.
+    // fs.readFile opens, reads and closes the fd in a single call, leaving nothing behind.
+    // Large media keeps streaming below (never read a whole video into memory).
     if (!m && mime.startsWith("image/")) {
       try {
         const buf = await fs.readFile(abs);

@@ -119,7 +119,10 @@ async function feedFromScan(res: ScanResult, onProgress?: ProgressFn): Promise<F
         id: `el-${eid++}`,
         type: "image",
         animated: /\.gif$/i.test(f.name) || undefined,
-        thumb: url,
+        // Wall tiles pull a small main-process-generated thumbnail (?w=512) so we don't move
+        // multi-MB originals for every tile; full-res is swapped in on focus. GIFs serve the
+        // original (the animator needs the whole file anyway, and a static JPEG can't animate).
+        thumb: /\.gif$/i.test(f.name) ? url : `${url}?w=512`,
         full: url,
         title,
         path: f.rel,
