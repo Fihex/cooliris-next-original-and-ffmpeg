@@ -322,6 +322,9 @@ ipcMain.handle("video-nav", (_e, dir: "prev" | "next") => win?.webContents.send(
 let memTimer: ReturnType<typeof setInterval> | null = null;
 function startMemLog(): void {
   if (memTimer) return;
+  console.log(
+    `[mem] main gc ${typeof (globalThis as { gc?: unknown }).gc === "function" ? "exposed" : "NOT exposed"}`,
+  );
   const mb = (kb: number) => String(Math.round(kb / 1024)).padStart(4);
   memTimer = setInterval(() => {
     // Serving thousands of coolmedia:// image requests churns short-lived objects (Response,
@@ -480,17 +483,16 @@ app.whenReady().then(() => {
     // posters; Accept-Ranges so <video>/<audio> can seek. Streamed (never read whole
     // files into JS); the read stream closes when the response is consumed/cancelled.
     const mime = mimeFor(abs);
-    // Let Chromium cache image bytes in its bounded (LRU, disk-backed) HTTP cache. The wall
-    // evicts tiles aggressively and re-decodes from scratch when they scroll back into view —
-    // and thumb→full-res on focus reuses the SAME url — so without caching every revisit
-    // re-streams the whole file through the main process. That redundant request churn was the
-    // main-process memory climb. Large media (video/audio) stays uncached so it can't fill the
-    // cache; those are watched once, not re-streamed on every scroll.
+    // Do NOT cache. Electron runs the network service IN the browser process, so its in-memory
+    // HTTP cache lives there too — caching the original image bytes (multi-MB each) made the
+    // browser process retain hundreds of MB that never dropped at idle. Re-fetching on
+    // scroll-back is cheap now that images are served by a single fs.readFile (below), so we
+    // keep nothing cached and let the working set fall back to baseline when scrolling stops.
     const base: Record<string, string> = {
       "Access-Control-Allow-Origin": "*",
       "Accept-Ranges": "bytes",
       "Content-Type": mime,
-      "Cache-Control": mime.startsWith("image/") ? "public, max-age=86400, immutable" : "no-store",
+      "Cache-Control": "no-store",
     };
     const stream = (start?: number, end?: number) => {
       const rs = createReadStream(abs, start === undefined ? {} : { start, end });
