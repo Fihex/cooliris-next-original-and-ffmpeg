@@ -324,6 +324,11 @@ function startMemLog(): void {
   if (memTimer) return;
   const mb = (kb: number) => String(Math.round(kb / 1024)).padStart(4);
   memTimer = setInterval(() => {
+    // Serving thousands of coolmedia:// image requests churns short-lived objects (Response,
+    // stream wrappers, Buffer chunks) in the MAIN process's V8 heap. Nothing here runs a
+    // render loop, so V8 almost never GCs on its own and the working set ratchets up and never
+    // comes back down. Main is idle, so a periodic collect is cheap and keeps it flat.
+    (globalThis as { gc?: () => void }).gc?.();
     try {
       const m = app.getAppMetrics();
       const sum = (type: string) =>
