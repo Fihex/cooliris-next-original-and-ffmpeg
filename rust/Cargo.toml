@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Native Rust + wgpu rebuild of the Cooliris 3D media wall"
 autobins = false
+default-run = "cooliris-rs" # so `cargo run` launches the wall (not the `video` proof bin)
 
 # The wall (default). Builds with no libmpv dependency.
 [[bin]]
