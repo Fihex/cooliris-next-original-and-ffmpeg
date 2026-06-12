@@ -38,6 +38,10 @@ const BANK_MAX: f32 = 0.5;
 const PAN_Y_MAX: f32 = 1.7; // vertical grab-pan limit
 const DRAG_GAIN: f32 = 0.6; // left-drag scroll sensitivity
 const SCRUB_ZONE_PX: f32 = 44.0; // bottom band that acts as the scrubber
+const BTN_X: f32 = 12.0; // Open button (toolbar, top-left), pixels
+const BTN_Y: f32 = 12.0;
+const BTN_W: f32 = 84.0;
+const BTN_H: f32 = 34.0;
 const ACCEL: f32 = 22.0; // arrow-key acceleration (world units / s²)
 const MAX_SPEED: f32 = 11.0;
 const DAMP: f32 = 6.0; // scroll velocity damping
@@ -168,6 +172,7 @@ pub struct State {
     num_instances: u32,
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_buf: wgpu::Buffer,
+    ui: crate::ui::Ui,
 
     camera_buf: wgpu::Buffer,
     camera_bg: wgpu::BindGroup,
@@ -181,6 +186,8 @@ pub struct State {
     total_cols: i64,
     generation: u64,
     current_folder: Option<PathBuf>,
+    loaded_count: usize, // unique tiles decoded since the last (re)load → the progress readout
+    decoded: Vec<bool>,
     resident: HashMap<usize, Tile>,
     free_layers: Vec<u32>,
     inflight: usize,
@@ -201,6 +208,7 @@ pub struct State {
     drag_last_x: f32,
     drag_last_y: f32,
     drag_moved: bool,
+    open_requested: bool, // the Open button was clicked (main opens the picker)
     focus: Option<usize>, // currently-focused tile
     focus_t: f32,         // 0 = wall, 1 = focused (animated)
     video: Option<crate::video::Player>, // playing the focused video tile, if any
@@ -495,6 +503,7 @@ impl State {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let ui = crate::ui::Ui::new(&device, &queue, config.format);
 
         let mut state = State {
             window,
@@ -510,6 +519,7 @@ impl State {
             num_instances: 0,
             overlay_pipeline,
             overlay_buf,
+            ui,
             camera_buf,
             camera_bg,
             camera_bgl,
@@ -520,6 +530,8 @@ impl State {
             total_cols,
             generation: 0,
             current_folder: folder,
+            loaded_count: 0,
+            decoded: vec![false; total],
             resident: HashMap::new(),
             free_layers,
             inflight: 0,
@@ -536,6 +548,7 @@ impl State {
             drag_last_x: 0.0,
             drag_last_y: 0.0,
             drag_moved: false,
+            open_requested: false,
             focus: None,
             focus_t: 0.0,
             video: None,
@@ -584,6 +597,12 @@ impl State {
         self.drag_last_x = x;
         self.drag_last_y = y;
         self.drag_moved = false;
+        // The Open button (top-left toolbar).
+        if button == 0 && x >= BTN_X && x <= BTN_X + BTN_W && y >= BTN_Y && y <= BTN_Y + BTN_H {
+            self.open_requested = true;
+            self.drag_mode = DragMode::None;
+            return;
+        }
         let h = self.config.height as f32;
         if self.focus.is_none() && self.scroll_max > 0.0 && y > h - SCRUB_ZONE_PX {
             self.drag_mode = DragMode::Scrub;
@@ -727,6 +746,10 @@ impl State {
                             ],
                         },
                     );
+                    if !self.decoded[res.index] {
+                        self.decoded[res.index] = true;
+                        self.loaded_count += 1;
+                    }
                 } else {
                     self.resident.remove(&res.index); // pool full (shouldn't happen) — retry later
                 }
@@ -991,6 +1014,8 @@ impl State {
         self.total = self.sources.len();
         self.total_cols = self.total.div_ceil(ROWS) as i64;
         self.scroll_max = (self.total_cols - 1).max(0) as f32 * CELL_X;
+        self.loaded_count = 0;
+        self.decoded = vec![false; self.total];
         self.resident.clear();
         self.free_layers = (0..POOL).rev().collect();
         self.inflight = 0;
@@ -1005,45 +1030,105 @@ impl State {
         log::info!("reloaded: {} tiles", self.total);
     }
 
-    /// The bottom scrubber bar: a faint track + a brighter thumb sized to the visible fraction.
-    fn scrubber_rects(&self) -> Vec<OverlayRect> {
-        if self.focus.is_some() || self.scroll_max <= 0.0 {
-            return vec![];
-        }
+    /// Whether the Open button was clicked since the last check (main opens the picker).
+    pub fn take_open_request(&mut self) -> bool {
+        std::mem::take(&mut self.open_requested)
+    }
+
+    /// Toolbar text: the Open label + a folder hint or the loaded/total readout.
+    fn ui_lines(&self) -> Vec<crate::ui::Line> {
+        let mut v = vec![crate::ui::Line {
+            text: "Open".into(),
+            x: BTN_X + 14.0,
+            y: BTN_Y + 8.0,
+            size: 17.0,
+            color: [235, 235, 240, 255],
+        }];
+        let status = if self.current_folder.is_none() {
+            "drop a folder here · click Open · press O".to_string()
+        } else if self.loaded_count >= self.total {
+            format!("{} items", self.total)
+        } else {
+            format!("{} / {} loading…", self.loaded_count, self.total)
+        };
+        v.push(crate::ui::Line {
+            text: status,
+            x: BTN_X + BTN_W + 16.0,
+            y: BTN_Y + 9.0,
+            size: 15.0,
+            color: [205, 205, 215, 235],
+        });
+        v
+    }
+
+    /// Screen-space overlay rects: the Open button background, a top loading bar, and the bottom
+    /// scrubber track + thumb.
+    fn overlay_rects(&self) -> Vec<OverlayRect> {
         let w = self.config.width.max(1) as f32;
         let h = self.config.height.max(1) as f32;
-        let pad = 16.0;
-        let nx = |px: f32| px / w * 2.0 - 1.0; // px → NDC x
-        let nw = |px: f32| px / w * 2.0; // px width → NDC
-        let nh = 6.0 / h * 2.0; // bar height
-        let ny = -1.0 + 10.0 / h * 2.0; // 10px up from the bottom
-        let track_w = w - 2.0 * pad;
-        let track = OverlayRect {
-            rect: [nx(pad), ny, nw(track_w), nh],
+        let nx = |px: f32| px / w * 2.0 - 1.0;
+        let nw = |px: f32| px / w * 2.0;
+        let ny_top = |px: f32| 1.0 - px / h * 2.0; // px from top → NDC y
+        let nhh = |px: f32| px / h * 2.0;
+        let mut rects = Vec::new();
+
+        // Open button background.
+        rects.push(OverlayRect {
+            rect: [nx(BTN_X), ny_top(BTN_Y + BTN_H), nw(BTN_W), nhh(BTN_H)],
             color: [1.0, 1.0, 1.0, 0.12],
-        };
-        let frac = (self.scroll_x / self.scroll_max).clamp(0.0, 1.0);
-        let vpw = self.viewport_h() * (w / h);
-        let content = self.total_cols.max(1) as f32 * CELL_X;
-        let thumb_frac = (vpw / content).clamp(0.08, 1.0);
-        let thumb_w = track_w * thumb_frac;
-        let thumb_x = pad + (track_w - thumb_w) * frac;
-        let thumb = OverlayRect {
-            rect: [nx(thumb_x), ny, nw(thumb_w), nh],
-            color: [1.0, 1.0, 1.0, 0.55],
-        };
-        vec![track, thumb]
+        });
+
+        // Top loading bar (left → right, fraction decoded).
+        if self.total > 0 && self.loaded_count < self.total {
+            let frac = self.loaded_count as f32 / self.total as f32;
+            let ph = nhh(3.0);
+            rects.push(OverlayRect {
+                rect: [-1.0, 1.0 - ph, 2.0 * frac, ph],
+                color: [0.3, 0.6, 1.0, 0.9],
+            });
+        }
+
+        // Bottom scrubber (only when scrollable and not focused).
+        if self.focus.is_none() && self.scroll_max > 0.0 {
+            let pad = 16.0;
+            let bh = nhh(6.0);
+            let by = -1.0 + nhh(10.0);
+            let track_w = w - 2.0 * pad;
+            rects.push(OverlayRect {
+                rect: [nx(pad), by, nw(track_w), bh],
+                color: [1.0, 1.0, 1.0, 0.12],
+            });
+            let frac = (self.scroll_x / self.scroll_max).clamp(0.0, 1.0);
+            let vpw = self.viewport_h() * (w / h);
+            let content = self.total_cols.max(1) as f32 * CELL_X;
+            let thumb_frac = (vpw / content).clamp(0.08, 1.0);
+            let thumb_w = track_w * thumb_frac;
+            let thumb_x = pad + (track_w - thumb_w) * frac;
+            rects.push(OverlayRect {
+                rect: [nx(thumb_x), by, nw(thumb_w), bh],
+                color: [1.0, 1.0, 1.0, 0.55],
+            });
+        }
+        rects
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&Default::default());
 
-        let overlay = self.scrubber_rects();
+        let overlay = self.overlay_rects();
         if !overlay.is_empty() {
             self.queue
                 .write_buffer(&self.overlay_buf, 0, bytemuck::cast_slice(&overlay));
         }
+        let lines = self.ui_lines();
+        self.ui.prepare(
+            &self.device,
+            &self.queue,
+            self.config.width,
+            self.config.height,
+            &lines,
+        );
 
         let mut enc = self
             .device
@@ -1084,12 +1169,13 @@ impl State {
                 let (cx, cy) = self.tile_center(idx);
                 v.draw(&mut rp, &self.camera_bg, [cx, cy], [1.6, 0.9], &self.queue);
             }
-            // Bottom scrubber bar (2D overlay, on top of everything).
+            // Toolbar + scrubber overlay (2D, on top of everything).
             if !overlay.is_empty() {
                 rp.set_pipeline(&self.overlay_pipeline);
                 rp.set_vertex_buffer(0, self.overlay_buf.slice(..));
                 rp.draw(0..6, 0..overlay.len() as u32);
             }
+            self.ui.render(&mut rp);
         }
         self.queue.submit(std::iter::once(enc.finish()));
         frame.present();

@@ -41,6 +41,8 @@ env_logger = "0.11"
 # Native folder picker, so the app runs without a CLI path. xdg-portal backend on Linux avoids a
 # GTK build dependency; Windows/macOS use their native dialogs.
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+# GPU text (the Open button label + the loaded/total readout). Matches wgpu 22.
+glyphon = "0.6"
 
 [build-dependencies]
 # Finds + links libmpv when the `video` feature is on.

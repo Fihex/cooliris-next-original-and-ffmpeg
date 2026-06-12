@@ -9,6 +9,7 @@
 // Controls: mouse wheel or ←/→ to scroll the wall.
 
 mod state;
+mod ui;
 mod video;
 
 use std::path::PathBuf;
@@ -97,6 +98,14 @@ impl ApplicationHandler for App {
                 let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 if btn_state == ElementState::Pressed {
                     state.pointer_down(code, cx, cy);
+                    if state.take_open_request() {
+                        if let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Open a folder")
+                            .pick_folder()
+                        {
+                            state.reload(Some(dir));
+                        }
+                    }
                 } else {
                     state.pointer_up(code);
                 }
