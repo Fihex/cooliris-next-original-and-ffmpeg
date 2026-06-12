@@ -30,6 +30,9 @@ interface MpvPlayerProps {
   chromeHidden: boolean;
   onFullscreen: () => void;
   onPlayingChange?: (playing: boolean) => void;
+  /** Two-window embed: the main process already issued the load (at click time, to overlap
+   *  decode with the UI mount), so don't load again here. */
+  skipLoad?: boolean;
 }
 
 function fmtTime(s: number): string {
@@ -51,6 +54,7 @@ export function MpvPlayer({
   chromeHidden,
   onFullscreen,
   onPlayingChange,
+  skipLoad,
 }: MpvPlayerProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const paintRef = useRef<Worker | null>(null); // off-main-thread WebGL paint (OffscreenCanvas)
@@ -210,7 +214,7 @@ export function MpvPlayer({
     setCur(0);
     setDur(0);
     setPlaying(true);
-    mpv.mpvLoad(abs);
+    if (!skipLoad) mpv.mpvLoad(abs); // embed: main already loaded at click time to overlap decode
 
     // Embed (two-window): mpv renders the video natively into the child window — there's no
     // canvas to paint. Skip the whole per-frame pump (and its IPC); just poll the size

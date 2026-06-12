@@ -297,9 +297,11 @@ ipcMain.handle("win-is-maximized", () => win?.isMaximized() ?? false);
 // and let the wall return.
 ipcMain.handle("play-video", (_e, abs: string) => {
   if (!win || !videoWin) return false;
-  // Load while HIDDEN (mpv decodes the first frame off-screen); the child calls
-  // "video-ready" once the frame is decoded, and only then do we reveal the window —
-  // so you never see a blank window during decode.
+  // Start decoding RIGHT NOW (at click), in parallel with the child rendering its UI, so
+  // the first frame is ready as early as possible. Load while HIDDEN — the child calls
+  // "video-ready" once the frame is decoded, and only then do we reveal the window (no
+  // blank window during decode).
+  mpvLoad(abs);
   videoWin.webContents.send("video-play", abs);
   return true;
 });
@@ -348,6 +350,12 @@ function createWindow() {
     win.on("move", positionVideoWin);
     win.on("maximize", positionVideoWin);
     win.on("unmaximize", positionVideoWin);
+    const reFit = () => {
+      positionVideoWin();
+      mpvFit();
+    };
+    win.on("enter-full-screen", reFit);
+    win.on("leave-full-screen", reFit);
   }
 
   // Two-window: the main window is a normal framed wall; videos play in a child window.
