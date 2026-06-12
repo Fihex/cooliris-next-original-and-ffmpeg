@@ -69,6 +69,25 @@ export function VideoChildView() {
     let zoom = 0;
     let panx = 0;
     let pany = 0;
+
+    // pointermove/wheel fire 100+×/sec, and each mpvSet is an IPC round-trip
+    // (renderer→main→forked host→mpv). Writing on every event backs that channel up so the
+    // picture lags the cursor and only catches up when you stop. Coalesce to one write per
+    // animation frame: the handlers just accumulate state (cheap JS), the rAF flushes the
+    // latest value — so we never queue more than a single frame of work.
+    let dirty = 0; // bit 1 = zoom, 2 = pan-x, 4 = pan-y
+    let raf = 0;
+    const flush = () => {
+      raf = 0;
+      if (dirty & 1) e?.mpvSet("video-zoom", zoom.toFixed(4));
+      if (dirty & 2) e?.mpvSet("video-pan-x", panx.toFixed(4));
+      if (dirty & 4) e?.mpvSet("video-pan-y", pany.toFixed(4));
+      dirty = 0;
+    };
+    const schedule = (bits: number) => {
+      dirty |= bits;
+      if (!raf) raf = requestAnimationFrame(flush);
+    };
     e?.mpvSet("video-zoom", "0");
     e?.mpvSet("video-pan-x", "0");
     e?.mpvSet("video-pan-y", "0");
@@ -78,10 +97,10 @@ export function VideoChildView() {
       zoom = clamp(zoom + (ev.deltaY < 0 ? 0.15 : -0.15), 0, 3);
       if (zoom === 0) {
         panx = pany = 0;
-        e?.mpvSet("video-pan-x", "0");
-        e?.mpvSet("video-pan-y", "0");
+        schedule(1 | 2 | 4);
+      } else {
+        schedule(1);
       }
-      e?.mpvSet("video-zoom", zoom.toFixed(3));
     };
 
     // Drag to pan (only when zoomed in). Swallow the click that follows a real drag so it
@@ -106,8 +125,7 @@ export function VideoChildView() {
       pany = clamp(pany + dy / window.innerHeight, -1.5, 1.5);
       lx = ev.clientX;
       ly = ev.clientY;
-      e?.mpvSet("video-pan-x", panx.toFixed(3));
-      e?.mpvSet("video-pan-y", pany.toFixed(3));
+      schedule(2 | 4);
     };
     const up = () => {
       if (dragging && moved) {
@@ -126,6 +144,7 @@ export function VideoChildView() {
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
     return () => {
+      if (raf) cancelAnimationFrame(raf);
       window.removeEventListener("wheel", onWheel);
       window.removeEventListener("pointerdown", down);
       window.removeEventListener("pointermove", move);

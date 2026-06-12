@@ -226,10 +226,12 @@ export function MpvPlayer({
       const id = window.setInterval(() => {
         if (!cancelled) mpv.mpvSize();
       }, 700);
+      // No mpvStop here: in two-window mode the MAIN process owns load/stop (it loads the
+      // new file at click for prev/next, and stops on close). Calling stop on this effect's
+      // cleanup would kill the file the main JUST loaded → prev/next wouldn't play.
       return () => {
         cancelled = true;
         window.clearInterval(id);
-        mpv.mpvStop();
       };
     }
 
