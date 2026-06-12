@@ -39,6 +39,7 @@ interface ElectronBridge {
   mpvLoad(abs: string): Promise<unknown>;
   mpvCmd(args: string[]): Promise<boolean>;
   mpvSet(name: string, value: string): Promise<boolean>;
+  mpvSetFast(props: Record<string, string>): void;
   mpvGet(name: string): Promise<string | null>;
   mpvSize(): Promise<{ w: number; h: number }>;
   mpvFrame(w: number, h: number): Promise<Uint8Array | null>;

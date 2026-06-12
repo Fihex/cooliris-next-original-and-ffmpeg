@@ -40,6 +40,11 @@ process.on("message", (m) => {
       case "load": player.command(["loadfile", args[0]]); break;
       case "cmd": result = player.command(args[0]); break;
       case "set": result = player.setProperty(args[0], String(args[1])); break;
+      case "setmany": { // fire-and-forget batch (zoom/pan hot path) — no reply expected
+        const props = args[0] || {};
+        for (const k in props) player.setProperty(k, String(props[k]));
+        return;
+      }
       case "get": result = player.getProperty(args[0]); break;
       case "size": result = player.videoSize(); break;
       case "frame": result = player.renderFrame(args[0], args[1]); break;

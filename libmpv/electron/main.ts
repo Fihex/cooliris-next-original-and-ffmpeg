@@ -12,6 +12,7 @@ import {
   mpvLoad,
   mpvCommand,
   mpvSet,
+  mpvSetFast,
   mpvGet,
   mpvVideoSize,
   mpvFrame,
@@ -270,6 +271,8 @@ ipcMain.handle("mpv-available", () => mpvAvailable());
 ipcMain.handle("mpv-load", (_e, abs: string) => mpvLoad(abs));
 ipcMain.handle("mpv-cmd", (_e, args: string[]) => mpvCommand(args));
 ipcMain.handle("mpv-set", (_e, name: string, value: string) => mpvSet(name, value));
+// Fire-and-forget (no reply): hot-path batched property set for zoom/pan.
+ipcMain.on("mpv-set-fast", (_e, props: Record<string, string>) => mpvSetFast(props));
 ipcMain.handle("mpv-get", (_e, name: string) => mpvGet(name));
 ipcMain.handle("mpv-size", () => mpvVideoSize());
 ipcMain.handle("mpv-frame", (_e, w: number, h: number) => mpvFrame(w, h));
@@ -426,6 +429,11 @@ function positionVideoWin() {
     /* ignore */
   }
 }
+
+// Expose globalThis.gc() in the renderer so the wall can hand the JS heap back to the OS when
+// it goes idle after a large tile-eviction burst (see WallScene.scheduleGc). Must be set before
+// the app is ready. Harmless if unused.
+app.commandLine.appendSwitch("js-flags", "--expose-gc");
 
 app.whenReady().then(() => {
   protocol.handle("coolmedia", async (request) => {

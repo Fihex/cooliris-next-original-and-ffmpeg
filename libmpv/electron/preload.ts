@@ -21,6 +21,8 @@ contextBridge.exposeInMainWorld("electron", {
   mpvLoad: (abs: string) => ipcRenderer.invoke("mpv-load", abs),
   mpvCmd: (args: string[]) => ipcRenderer.invoke("mpv-cmd", args),
   mpvSet: (name: string, value: string) => ipcRenderer.invoke("mpv-set", name, value),
+  // Fire-and-forget batched set (zoom/pan): no invoke/await, so no round-trip latency.
+  mpvSetFast: (props: Record<string, string>) => ipcRenderer.send("mpv-set-fast", props),
   mpvGet: (name: string) => ipcRenderer.invoke("mpv-get", name),
   mpvSize: () => ipcRenderer.invoke("mpv-size"),
   mpvFrame: (w: number, h: number) => ipcRenderer.invoke("mpv-frame", w, h),

@@ -319,6 +319,10 @@ function createWindow() {
   });
 }
 
+// Expose globalThis.gc() in the renderer so the wall can hand the JS heap back after a large
+// tile-eviction burst (see WallScene.scheduleGc). Must precede app ready; harmless if unused.
+app.commandLine.appendSwitch("js-flags", "--expose-gc");
+
 app.whenReady().then(() => {
   protocol.handle("coolmedia", async (request) => {
     const abs = decodeURIComponent(new URL(request.url).pathname.replace(/^\//, ""));

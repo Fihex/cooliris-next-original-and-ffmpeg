@@ -87,6 +87,8 @@ export class WallScene {
   private visEnd = -1;
   private keepStart = 0; // textures resident outside this range are evicted
   private keepEnd = -1;
+  private destroyedSinceGc = 0; // tiles freed since the last idle GC nudge
+  private gcTimer = 0;
   private raycaster = new THREE.Raycaster();
   private pointer = new THREE.Vector2();
   private geo = new THREE.PlaneGeometry(1, 1);
@@ -251,6 +253,7 @@ export class WallScene {
     if (this.selectedIndex === -1) return;
     // Leave the wall centered on the item you were last viewing (not where you
     // opened from), then reveal it.
+    const prev = this.selectedIndex;
     const baseX = Math.floor(this.selectedIndex / ROWS) * CELL_W;
     this.scrollX = clamp(baseX, this.scrollMin, this.scrollMax);
     this.camX = 0;
@@ -258,6 +261,23 @@ export class WallScene {
     this.selectedIndex = -1;
     this.focusTarget = 0;
     this.emit("deselect", -1);
+
+    // Drop the full-res texture we swapped in on focus (loadFull → up to 2048px, ~10-20MB)
+    // instead of carrying it until the tile scrolls out — reload the small thumb in its
+    // place so closing a photo frees that memory right away.
+    const tile = this.tiles[prev];
+    if (tile && tile.fullLoaded && tile.state === "loaded") {
+      tile.fullLoaded = false;
+      const item = this.items[tile.index];
+      if (item?.thumb) {
+        this.acquireTexture(item.thumb)
+          .then((tex) => {
+            if (this.tiles[prev] === tile && this.selectedIndex !== prev) this.applyTexture(tile, tex);
+            else disposeTexture(tex); // re-selected or evicted mid-decode
+          })
+          .catch(() => {});
+      }
+    }
   }
 
   next(): void {
@@ -378,6 +398,7 @@ export class WallScene {
 
   dispose(): void {
     this.running = false;
+    clearTimeout(this.gcTimer);
     this.resizeObserver.disconnect();
     const el = this.renderer.domElement;
     el.removeEventListener("wheel", this.onWheel);
@@ -642,6 +663,28 @@ export class WallScene {
       this.strip.remove(tile.label);
     }
     this.tiles[i] = undefined;
+    this.destroyedSinceGc++;
+    this.scheduleGc();
+  }
+
+  /**
+   * dispose()/close() free GPU textures and decoded bitmaps immediately, but the JS heap that
+   * held the THREE.Mesh/Material/Texture wrappers stays at its high-water mark until V8 runs a
+   * GC — so after scrolling far the process keeps the old footprint even though nothing is
+   * referenced. When the wall goes idle after a real eviction burst, nudge V8 to collect and
+   * hand pages back. Requires the renderer launched with --expose-gc (no-op otherwise), and is
+   * debounced + gated so it never runs mid-scroll (a GC pause would stutter scrolling).
+   */
+  private scheduleGc(): void {
+    const gc = (globalThis as { gc?: () => void }).gc;
+    if (!gc) return;
+    clearTimeout(this.gcTimer);
+    this.gcTimer = window.setTimeout(() => {
+      if (this.destroyedSinceGc >= 24 && Math.abs(this.velocity) < 0.05) {
+        this.destroyedSinceGc = 0;
+        gc();
+      }
+    }, 700);
   }
 
   /** Swap in a higher-resolution image when a tile is focused. */

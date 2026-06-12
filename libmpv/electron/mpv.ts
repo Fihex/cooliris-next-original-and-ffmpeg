@@ -134,6 +134,16 @@ export function mpvWarm(): void {
 export const mpvLoad = (abs: string) => call("load", [abs]);
 export const mpvCommand = (args: string[]) => call<boolean>("cmd", [args]);
 export const mpvSet = (name: string, value: string) => call<boolean>("set", [name, value]);
+// Fire-and-forget batched set for hot paths (zoom/pan). Unlike call(), it registers NO pending
+// callback and awaits NO reply — so there's zero round-trip latency. The renderer pushes the
+// latest values once per frame; dropping the ack is fine because only the newest value matters.
+export function mpvSetFast(props: Record<string, string>): void {
+  try {
+    ensureChild().send({ fn: "setmany", args: [props] });
+  } catch {
+    /* host down / EPIPE — ignore */
+  }
+}
 export const mpvGet = (name: string) => call<string | null>("get", [name]);
 export const mpvVideoSize = () => call<{ w: number; h: number }>("size", []);
 export const mpvFrame = (w: number, h: number) => call<Uint8Array | null>("frame", [w, h]);

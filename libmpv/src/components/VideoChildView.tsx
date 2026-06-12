@@ -79,10 +79,12 @@ export function VideoChildView() {
     let raf = 0;
     const flush = () => {
       raf = 0;
-      if (dirty & 1) e?.mpvSet("video-zoom", zoom.toFixed(4));
-      if (dirty & 2) e?.mpvSet("video-pan-x", panx.toFixed(4));
-      if (dirty & 4) e?.mpvSet("video-pan-y", pany.toFixed(4));
+      const props: Record<string, string> = {};
+      if (dirty & 1) props["video-zoom"] = zoom.toFixed(4);
+      if (dirty & 2) props["video-pan-x"] = panx.toFixed(4);
+      if (dirty & 4) props["video-pan-y"] = pany.toFixed(4);
       dirty = 0;
+      e?.mpvSetFast(props); // one batched, non-awaited message per frame
     };
     const schedule = (bits: number) => {
       dirty |= bits;
