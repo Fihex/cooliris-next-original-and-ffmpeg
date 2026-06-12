@@ -45,8 +45,11 @@ Controls: **mouse wheel / ←→** scroll · **left-click** focus a tile · **Es
    center on it; Esc / click returns. _(Full-resolution swap on focus is the next refinement —
    it currently shows the streamed thumbnail.)_
 9. **Reflections, labels, scrubber** — the visual polish from the WebGL wall.
-10. **Video** — embed libmpv (`libmpv2` crate) rendering into a GPU texture via its render API,
-    composited into the scene. (No separate window needed, unlike the Electron embed.)
+10. **✅ Video (proof)** — libmpv's **software render API** → a wgpu texture on a fullscreen quad.
+    mpv decodes (HW-accelerated internally) and we composite it; **no second window, no GL/Vulkan
+    interop** — the exact thing that was painful in the Electron embed. Verified frames flowing.
+    Opt-in: `cargo run --features video --bin video -- clip.mp4`. Next: composite onto video
+    tiles in the wall.
 11. **Packaging** — `cargo-bundle` / per-OS installers; folder picker (`rfd`).
 
 ## Architecture (as it grows)
@@ -67,12 +70,13 @@ src/
 
 ```sh
 cd rust
-cargo run            # debug
-cargo run --release  # smooth/fast
+cargo run --release -- /path/to/photos          # the wall (no libmpv needed)
+cargo run --features video --bin video -- a.mp4  # video proof (needs libmpv installed)
 ```
 
 Cross-platform: Windows (DX12/Vulkan), macOS (Metal), Linux (Vulkan). First build compiles wgpu
-(~2–3 min); afterwards it's incremental.
+(~2–3 min); afterwards it's incremental. The `video` feature links libmpv (via pkg-config); the
+default wall build has no such dependency.
 
 Logging: `RUST_LOG=cooliris_rs=info cargo run` (the wgpu backends are chatty at `info`; the
 default filter keeps just our logs).

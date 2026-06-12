@@ -387,6 +387,7 @@ dependencies = [
  "glam",
  "image",
  "log",
+ "pkg-config",
  "pollster",
  "wgpu",
  "winit",

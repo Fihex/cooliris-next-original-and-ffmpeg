@@ -3,6 +3,22 @@ name = "cooliris-rs"
 version = "0.1.0"
 edition = "2021"
 description = "Native Rust + wgpu rebuild of the Cooliris 3D media wall"
+autobins = false
+
+# The wall (default). Builds with no libmpv dependency.
+[[bin]]
+name = "cooliris-rs"
+path = "src/main.rs"
+
+# libmpv → wgpu video proof. Opt-in: `cargo run --features video --bin video -- clip.mp4`.
+[[bin]]
+name = "video"
+path = "src/bin/video.rs"
+required-features = ["video"]
+
+[features]
+# Enables the libmpv video path (and links libmpv via build.rs).
+video = []
 
 [dependencies]
 # Cross-platform windowing + input (Win/macOS/Linux). 0.30 uses the ApplicationHandler model.
@@ -21,6 +37,10 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 crossbeam-channel = "0.5"
 log = "0.4"
 env_logger = "0.11"
+
+[build-dependencies]
+# Finds + links libmpv when the `video` feature is on.
+pkg-config = "0.3"
 
 # Faster debug builds of the heavy graphics deps without losing our own debuggability.
 [profile.dev.package."*"]
