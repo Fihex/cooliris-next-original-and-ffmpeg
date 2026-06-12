@@ -60,6 +60,79 @@ export function VideoChildView() {
     };
   }, [play]);
 
+  // Zoom (wheel) + pan (drag) the NATIVE video via mpv's own video-zoom / video-pan-x/y
+  // (a CSS transform wouldn't move the native surface). Reset on each new video.
+  useEffect(() => {
+    if (!play) return;
+    const e = window.electron;
+    const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
+    let zoom = 0;
+    let panx = 0;
+    let pany = 0;
+    e?.mpvSet("video-zoom", "0");
+    e?.mpvSet("video-pan-x", "0");
+    e?.mpvSet("video-pan-y", "0");
+
+    const onWheel = (ev: WheelEvent) => {
+      ev.preventDefault();
+      zoom = clamp(zoom + (ev.deltaY < 0 ? 0.15 : -0.15), 0, 3);
+      if (zoom === 0) {
+        panx = pany = 0;
+        e?.mpvSet("video-pan-x", "0");
+        e?.mpvSet("video-pan-y", "0");
+      }
+      e?.mpvSet("video-zoom", zoom.toFixed(3));
+    };
+
+    // Drag to pan (only when zoomed in). Swallow the click that follows a real drag so it
+    // doesn't toggle pause.
+    let dragging = false;
+    let moved = false;
+    let lx = 0;
+    let ly = 0;
+    const down = (ev: PointerEvent) => {
+      if (zoom <= 0) return;
+      dragging = true;
+      moved = false;
+      lx = ev.clientX;
+      ly = ev.clientY;
+    };
+    const move = (ev: PointerEvent) => {
+      if (!dragging) return;
+      const dx = ev.clientX - lx;
+      const dy = ev.clientY - ly;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) moved = true;
+      panx = clamp(panx + dx / window.innerWidth, -1.5, 1.5);
+      pany = clamp(pany + dy / window.innerHeight, -1.5, 1.5);
+      lx = ev.clientX;
+      ly = ev.clientY;
+      e?.mpvSet("video-pan-x", panx.toFixed(3));
+      e?.mpvSet("video-pan-y", pany.toFixed(3));
+    };
+    const up = () => {
+      if (dragging && moved) {
+        const swallow = (ce: MouseEvent) => {
+          ce.stopPropagation();
+          ce.preventDefault();
+          window.removeEventListener("click", swallow, true);
+        };
+        window.addEventListener("click", swallow, true);
+      }
+      dragging = false;
+    };
+
+    window.addEventListener("wheel", onWheel, { passive: false });
+    window.addEventListener("pointerdown", down);
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+    return () => {
+      window.removeEventListener("wheel", onWheel);
+      window.removeEventListener("pointerdown", down);
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+  }, [play]);
+
   const close = () => {
     setPlay(null); // unmount the player → stops mpv + frees the file while browsing
     setFullscreen(false);
@@ -107,6 +180,20 @@ export function VideoChildView() {
       >
         ‹ Back
       </button>
+      {(["prev", "next"] as const).map((dir) => (
+        <button
+          key={dir}
+          onClick={() => window.electron?.videoNav(dir)}
+          aria-label={dir === "prev" ? "Previous video" : "Next video"}
+          className={`absolute top-1/2 z-50 flex h-12 w-12 -translate-y-1/2 items-center justify-center rounded-full bg-black/40 text-white backdrop-blur transition hover:bg-black/60 ${
+            dir === "prev" ? "left-3" : "right-3"
+          } ${chromeHidden ? "pointer-events-none opacity-0" : "opacity-100"}`}
+        >
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <path d={dir === "prev" ? "M15 18l-6-6 6-6" : "M9 18l6-6-6-6"} />
+          </svg>
+        </button>
+      ))}
     </div>
   );
 }

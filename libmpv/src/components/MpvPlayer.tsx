@@ -117,8 +117,11 @@ export function MpvPlayer({
         lastSig = sig;
         setAudioTracks(a);
         setSubTracks(s);
-        setActiveAid((await mpv.mpvGet("aid")) || "");
       }
+      // Read the actual selected tracks every tick so the menus reflect mpv (incl. a
+      // subtitle it auto-selected on load). setState with the same value is a no-op.
+      setActiveAid((await mpv.mpvGet("aid")) || "");
+      setActiveSid((await mpv.mpvGet("sid")) || "no");
     };
     tick();
     const id = window.setInterval(tick, 1000);

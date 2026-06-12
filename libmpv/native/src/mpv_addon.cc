@@ -64,7 +64,9 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
           mpv_set_option_string(mpv_, "force-window", "yes");
           mpv_set_option_string(mpv_, "terminal", "no");
           mpv_set_option_string(mpv_, "idle", "yes");
-          mpv_set_option_string(mpv_, "sid", "no");
+          // Subtitles auto-show when the video has them (mpv's default sid=auto), in sync
+          // from the first frame — no manual enable, no "appears a bit later". sub-auto=all
+          // also pulls in sidecar .srt files. (Off only when there are none.)
           mpv_set_option_string(mpv_, "sub-auto", "all");
           mpv_set_option_string(mpv_, "sub-font-size", "44");
           mpv_set_option_string(mpv_, "keep-open", "yes"); // don't close the window at EOF

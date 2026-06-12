@@ -53,6 +53,8 @@ interface ElectronBridge {
   closeVideo(): Promise<void>;
   onVideoPlay(cb: (abs: string) => void): () => void;
   onVideoClosed(cb: () => void): () => void;
+  videoNav(dir: "prev" | "next"): Promise<void>;
+  onVideoNav(cb: (dir: "prev" | "next") => void): () => void;
 }
 
 declare global {

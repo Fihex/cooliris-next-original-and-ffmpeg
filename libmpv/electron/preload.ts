@@ -49,4 +49,12 @@ contextBridge.exposeInMainWorld("electron", {
     ipcRenderer.on("video-closed", h);
     return () => ipcRenderer.removeListener("video-closed", h);
   },
+  // Prev/next from inside the player: the child asks, main relays to the wall window which
+  // finds the adjacent video and plays it.
+  videoNav: (dir: "prev" | "next") => ipcRenderer.invoke("video-nav", dir),
+  onVideoNav: (cb: (dir: "prev" | "next") => void) => {
+    const h = (_e: unknown, dir: "prev" | "next") => cb(dir);
+    ipcRenderer.on("video-nav-main", h);
+    return () => ipcRenderer.removeListener("video-nav-main", h);
+  },
 });

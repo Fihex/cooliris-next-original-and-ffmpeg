@@ -319,6 +319,9 @@ ipcMain.handle("close-video", () => {
   mpvStop(); // free the file/decoder while browsing
   win?.webContents.send("video-closed");
 });
+// Prev/next: the child player asks; the wall window (which has the feed) picks the
+// adjacent video and calls play-video.
+ipcMain.handle("video-nav", (_e, dir: "prev" | "next") => win?.webContents.send("video-nav-main", dir));
 
 /* --------------------------------- window ----------------------------------- */
 function createWindow() {

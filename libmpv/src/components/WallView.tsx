@@ -33,6 +33,7 @@ export function WallView() {
   const hoverLabelRef = useRef<HTMLDivElement>(null);
   const masterRef = useRef<MediaItem[]>([]); // full feed, pre-filter
   const itemsRef = useRef<MediaItem[]>([]); // displayed (post-filter)
+  const playingIndexRef = useRef(-1); // two-window: index of the video playing in the child
   const searchRef = useRef("");
   const fromRef = useRef(""); // yyyy-mm-dd
   const toRef = useRef("");
@@ -174,6 +175,7 @@ export function WallView() {
       // Two-window embed: videos play in the native child window, not the in-page
       // lightbox. Images/audio still use the lightbox.
       if (TWO_WIN && item && item.type === "video") {
+        playingIndexRef.current = index; // remember it for prev/next from the player
         window.electron?.playVideo(decodeAbs(item.full));
         scene.deselect();
         return;
@@ -219,6 +221,22 @@ export function WallView() {
   useEffect(() => {
     runFeedTask(() => loadJsonFeedFromUrl("/sample-feed.json")).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Two-window: prev/next from the player → play the adjacent VIDEO in the feed.
+  useEffect(() => {
+    if (!TWO_WIN) return;
+    return window.electron?.onVideoNav((dir) => {
+      const items = itemsRef.current;
+      const step = dir === "next" ? 1 : -1;
+      for (let n = playingIndexRef.current + step; n >= 0 && n < items.length; n += step) {
+        if (items[n].type === "video") {
+          playingIndexRef.current = n;
+          window.electron?.playVideo(decodeAbs(items[n].full));
+          return;
+        }
+      }
+    });
   }, []);
 
   /* ------------------- sync scrubber thumb after a feed loads ------------------- */
