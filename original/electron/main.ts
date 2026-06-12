@@ -2,6 +2,8 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol } from "electr
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promises as fs, createReadStream } from "node:fs";
 import { Readable } from "node:stream";
+import v8 from "node:v8";
+import { runInNewContext } from "node:vm";
 import path from "node:path";
 import { extractCoverArt } from "./coverArt";
 
@@ -243,6 +245,44 @@ ipcMain.handle("fetch-text", async (_e, url: string) => {
 });
 
 /* --------------------------------- window ----------------------------------- */
+// Always-on memory readout: every 2s print each process's current working set (resident RAM).
+// Electron's main-process V8 has already booted by the time app.commandLine runs, so
+// appendSwitch("js-flags","--expose-gc") only reaches renderer processes — global.gc stays
+// undefined in main, leaving the main process with no manual GC. Grab a real collect handle at
+// runtime instead (standard setFlagsFromString trick) so main can actually reclaim its churn.
+function makeGc(): (() => void) | null {
+  try {
+    v8.setFlagsFromString("--expose-gc");
+    const fn = runInNewContext("gc") as unknown;
+    v8.setFlagsFromString("--no-expose-gc"); // leave the flag as we found it
+    return typeof fn === "function" ? (fn as () => void) : null;
+  } catch {
+    return null;
+  }
+}
+const forceGc = makeGc();
+let imageServeCount = 0; // nudge a collect every N served images (see coolmedia handler)
+
+let memTimer: ReturnType<typeof setInterval> | null = null;
+function startMemLog(): void {
+  if (memTimer) return;
+  console.log(`[mem] main gc ${forceGc ? "active" : "unavailable"}`);
+  const mb = (kb: number) => String(Math.round(kb / 1024)).padStart(4);
+  memTimer = setInterval(() => {
+    forceGc?.(); // main is idle (no render loop); a periodic collect keeps the working set flat
+    try {
+      const m = app.getAppMetrics();
+      const sum = (type: string) =>
+        m.filter((x) => x.type === type).reduce((s, x) => s + x.memory.workingSetSize, 0);
+      console.log(
+        `[mem] browser ${mb(sum("Browser"))}MB · renderer ${mb(sum("Tab"))}MB · gpu ${mb(sum("GPU"))}MB`,
+      );
+    } catch {
+      /* ignore */
+    }
+  }, 2000);
+}
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1440,
@@ -262,6 +302,11 @@ function createWindow() {
     },
   });
   win.once("ready-to-show", () => win?.show());
+  // Surface the wall's [wall mem] diagnostics (load/scroll/gc) in the terminal too.
+  win.webContents.on("console-message", (e) => {
+    if (e.message.startsWith("[wall")) console.log(e.message);
+  });
+  startMemLog();
 
   if (VITE_DEV_SERVER_URL) {
     win.loadURL(VITE_DEV_SERVER_URL);
@@ -306,13 +351,16 @@ app.whenReady().then(() => {
     } catch {
       return new Response(null, { status: 404 });
     }
-    // ACAO so the app://bundle renderer can use these as WebGL textures / canvas
-    // posters; Accept-Ranges so <video>/<audio> can seek. Streamed (never read whole
-    // files into JS); the read stream closes when the response is consumed/cancelled.
+    // ACAO so the app://bundle renderer can use these as WebGL textures / canvas posters;
+    // Accept-Ranges so <video>/<audio> can seek. No-store: the wall reads image bytes directly
+    // in the renderer (preload readFileBytes) and never hits this protocol, and Electron's HTTP
+    // cache lives in the browser process where it would only inflate the working set.
+    const mime = mimeFor(abs);
     const base: Record<string, string> = {
       "Access-Control-Allow-Origin": "*",
       "Accept-Ranges": "bytes",
-      "Content-Type": mimeFor(abs),
+      "Content-Type": mime,
+      "Cache-Control": "no-store",
     };
     const stream = (start?: number, end?: number) => {
       const rs = createReadStream(abs, start === undefined ? {} : { start, end });
@@ -321,6 +369,24 @@ app.whenReady().then(() => {
     };
 
     const m = /bytes=(\d*)-(\d*)/.exec(request.headers.get("Range") ?? "");
+
+    // Image fallback path. The wall normally reads image bytes directly in the renderer (preload
+    // readFileBytes → decode worker), so they never enter the browser process here. Anything that
+    // still lands here (GIF animator, <img> fallback, web build) is served whole via fs.readFile:
+    // open/read/close in one call, nothing left behind. Media streams below.
+    if (!m && mime.startsWith("image/")) {
+      try {
+        const buf = await fs.readFile(abs);
+        const res = new Response(new Uint8Array(buf), {
+          status: 200,
+          headers: { ...base, "Content-Length": String(buf.length) },
+        });
+        if (forceGc && ++imageServeCount % 48 === 0) setImmediate(forceGc);
+        return res;
+      } catch {
+        return new Response(null, { status: 404 });
+      }
+    }
     if (m) {
       let start = m[1] ? parseInt(m[1], 10) : 0;
       let end = m[2] ? parseInt(m[2], 10) : size - 1;
