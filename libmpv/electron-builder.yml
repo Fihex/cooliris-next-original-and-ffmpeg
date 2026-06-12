@@ -22,6 +22,11 @@ linux:
   category: Graphics
 win:
   target: nsis
+  # Ship start.bat NEXT TO the exe (extraFiles → app root; extraResources would bury it under
+  # resources\). Double-clicking it launches with COOLIRIS_MPV_EMBED=1 (native two-window video).
+  extraFiles:
+    - from: start.bat
+      to: start.bat
 mac:
   target: dmg
   category: public.app-category.graphics-design
