@@ -58,6 +58,21 @@ export interface ScrollInfo {
   atEnd: boolean;
 }
 
+/**
+ * Free a texture's GPU handle AND its CPU-side decoded source. THREE.Texture.dispose() only
+ * releases the WebGL handle; when the source is an ImageBitmap (our worker / createImageBitmap
+ * decode path) the decoded pixels live on until the bitmap is explicitly .close()d — the GC
+ * reclaims them far too lazily. Scrolling a large wall evicts thousands of tiles, so skipping
+ * the .close() leaks the decoded bitmaps into gigabytes. Routing every photo-texture disposal
+ * through here keeps memory bounded to the resident window.
+ */
+function disposeTexture(tex: THREE.Texture | null | undefined): void {
+  if (!tex) return;
+  const img = tex.image as { close?: () => void } | undefined;
+  tex.dispose();
+  img?.close?.(); // ImageBitmap → frees the decode; HTMLImageElement/Canvas have no close()
+}
+
 export class WallScene {
   private container: HTMLElement;
   private renderer: THREE.WebGLRenderer;
@@ -490,7 +505,7 @@ export class WallScene {
     tile.h = h;
     tile.baseY = tile.baseline + h / 2; // keep the photo's bottom on the row baseline
     const mat = tile.mesh.material;
-    mat.map?.dispose();
+    disposeTexture(mat.map);
     mat.map = texture;
     mat.color.set(0xffffff);
     mat.needsUpdate = true;
@@ -517,7 +532,7 @@ export class WallScene {
     this.acquireTexture(item.thumb)
       .then((texture) => {
         if (gen !== this.generation || tile.state !== "loading") {
-          texture.dispose(); // feed changed or tile evicted mid-load — discard
+          disposeTexture(texture); // feed changed or tile evicted mid-load — discard
           return;
         }
         this.applyTexture(tile, texture);
@@ -614,7 +629,7 @@ export class WallScene {
     tile.state = "error"; // makes any in-flight load discard its result
     this.gifs.disposeTile(tile);
     const mat = tile.mesh.material;
-    mat.map?.dispose();
+    disposeTexture(mat.map);
     mat.dispose();
     this.strip.remove(tile.mesh);
     if (tile.reflection) {
@@ -639,7 +654,7 @@ export class WallScene {
     tile.fullLoaded = true;
     this.acquireTexture(item.full, 2048).then((tex) => {
       if (this.selectedIndex === tile.index) this.applyTexture(tile, tex);
-      else tex.dispose();
+      else disposeTexture(tex);
     });
   }
 
@@ -650,7 +665,7 @@ export class WallScene {
       if (!tile) continue;
       this.gifs.disposeTile(tile);
       const mat = tile.mesh.material;
-      mat.map?.dispose();
+      disposeTexture(mat.map);
       mat.dispose();
       if (tile.reflection) tile.reflection.material.dispose(); // map shared, alphaMap kept
       if (tile.label) {
