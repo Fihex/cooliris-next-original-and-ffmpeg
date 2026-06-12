@@ -15,6 +15,8 @@ pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 # Math (camera / transforms) for the 3D wall.
 glam = "0.29"
+# Image decode + downscale (the decode pipeline; threaded streaming comes next).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
 log = "0.4"
 env_logger = "0.11"
 
