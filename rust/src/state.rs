@@ -1,12 +1,18 @@
-// GPU state + wall: builds a texture_2d_array of thumbnails, an instanced quad per tile in the
-// 3-row Cooliris layout, a perspective camera that pans along the wall, and the frame render.
-// Image loading is synchronous at startup for now (threaded streaming is the next milestone).
+// GPU state + virtualized, streamed wall.
+//
+// This is the bounded-memory core. We never hold the whole library on the GPU: a fixed pool of
+// texture-array layers is recycled as tiles scroll in and out of a window around the camera.
+// Decoding runs on a worker thread pool (files read directly — no IPC, no protocol), and the
+// main thread only assigns a free layer + uploads when pixels come back. Scroll a 16k-photo
+// library and GPU/CPU stay flat — by construction, not by fighting a garbage collector.
 
+use std::collections::HashMap;
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use crossbeam_channel::{Receiver, Sender};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
@@ -14,14 +20,18 @@ use winit::window::Window;
 
 const TILE_PX: u32 = 512; // texture-array layer size (square thumbnails for now)
 const ROWS: usize = 3;
-const TILE: f32 = 1.0; // world size of a tile
+const TILE: f32 = 1.0;
 const GAP_X: f32 = 0.16;
 const GAP_Y: f32 = 0.16;
 const CELL_X: f32 = TILE + GAP_X;
 const CELL_Y: f32 = TILE + GAP_Y;
 const CAM_DIST: f32 = 6.0;
-const FOV_Y: f32 = 0.9; // radians (~51°)
-const LOAD_CAP: usize = 120; // synchronous startup load cap (async streaming replaces this)
+const FOV_Y: f32 = 0.9;
+
+const POOL: u32 = 128; // resident texture-array layers (fixed VRAM ceiling: POOL * 1MB)
+const KEEP_COLS: i64 = 16; // columns kept resident on each side of the camera
+const MAX_INFLIGHT: usize = 8; // concurrent decodes (throttle, like the JS MAX_INFLIGHT)
+const WORKERS: usize = 4; // decode threads
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -44,7 +54,6 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
 
-// A unit quad (0..1) with uv flipped on Y so image top maps to world top.
 const QUAD: [Vertex; 4] = [
     Vertex { pos: [0.0, 0.0], uv: [0.0, 1.0] },
     Vertex { pos: [1.0, 0.0], uv: [1.0, 1.0] },
@@ -57,6 +66,29 @@ const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
 const INSTANCE_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![2 => Float32x2, 3 => Float32x2, 4 => Uint32];
+
+/// Where a tile's pixels come from — a file, or a generated placeholder when no folder is given.
+#[derive(Clone)]
+enum Source {
+    File(PathBuf),
+    Placeholder(usize),
+}
+
+struct Job {
+    index: usize,
+    source: Source,
+}
+struct Loaded {
+    index: usize,
+    rgba: Vec<u8>, // empty == decode failed
+}
+
+/// Per-resident-tile status.
+enum Tile {
+    Loading,
+    Ready(u32), // assigned texture-array layer
+    Failed,
+}
 
 pub struct State {
     pub window: Arc<Window>,
@@ -75,12 +107,27 @@ pub struct State {
     camera_buf: wgpu::Buffer,
     camera_bg: wgpu::BindGroup,
     tex_bg: wgpu::BindGroup,
+    tex: wgpu::Texture,
 
+    // wall library + residency
+    sources: Arc<Vec<Source>>,
+    total: usize,
+    total_cols: i64,
+    resident: HashMap<usize, Tile>,
+    free_layers: Vec<u32>,
+    inflight: usize,
+
+    // decode worker pool
+    job_tx: Sender<Job>,
+    result_rx: Receiver<Loaded>,
+
+    // camera / scroll
     scroll_x: f32,
     velocity: f32,
     input_dir: f32,
     scroll_max: f32,
     last_frame: Instant,
+    frame: u64,
 }
 
 impl State {
@@ -132,17 +179,36 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        // --- thumbnails → texture array layers ---
-        let layers = load_layers();
-        let n = layers.len() as u32;
-        log::info!("loaded {n} tiles");
+        // --- library (paths only — cheap, even for 16k) ---
+        let sources = Arc::new(gather_sources());
+        let total = sources.len();
+        let total_cols = (total.div_ceil(ROWS)) as i64;
+        let scroll_max = (total_cols - 1).max(0) as f32 * CELL_X;
+        log::info!("library: {total} tiles ({total_cols} columns)");
 
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("tiles"),
+        // --- decode worker pool ---
+        let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
+        let (result_tx, result_rx) = crossbeam_channel::unbounded::<Loaded>();
+        for _ in 0..WORKERS {
+            let job_rx = job_rx.clone();
+            let result_tx = result_tx.clone();
+            std::thread::spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let rgba = decode(&job.source);
+                    if result_tx.send(Loaded { index: job.index, rgba }).is_err() {
+                        break; // main gone
+                    }
+                }
+            });
+        }
+
+        // --- texture-array pool (fixed VRAM) ---
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("tile-pool"),
             size: wgpu::Extent3d {
                 width: TILE_PX,
                 height: TILE_PX,
-                depth_or_array_layers: n,
+                depth_or_array_layers: POOL,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -151,28 +217,7 @@ impl State {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        for (l, bytes) in layers.iter().enumerate() {
-            queue.write_texture(
-                wgpu::ImageCopyTexture {
-                    texture: &texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d { x: 0, y: 0, z: l as u32 },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                bytes,
-                wgpu::ImageDataLayout {
-                    offset: 0,
-                    bytes_per_row: Some(4 * TILE_PX),
-                    rows_per_image: Some(TILE_PX),
-                },
-                wgpu::Extent3d {
-                    width: TILE_PX,
-                    height: TILE_PX,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
-        let tex_view = texture.create_view(&wgpu::TextureViewDescriptor {
+        let tex_view = tex.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
@@ -182,6 +227,7 @@ impl State {
             mipmap_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let free_layers: Vec<u32> = (0..POOL).rev().collect();
 
         let tex_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("tex-bgl"),
@@ -248,20 +294,7 @@ impl State {
             }],
         });
 
-        // --- tile instances (3-row column-major layout) ---
-        let mut instances = Vec::with_capacity(n as usize);
-        for i in 0..n as usize {
-            let col = (i / ROWS) as f32;
-            let row = (i % ROWS) as f32;
-            instances.push(Instance {
-                offset: [col * CELL_X, (row - 1.0) * CELL_Y],
-                size: [TILE, TILE],
-                layer: i as u32,
-            });
-        }
-        let cols = (n as usize).div_ceil(ROWS);
-        let scroll_max = (cols.saturating_sub(1)) as f32 * CELL_X;
-
+        // --- geometry + dynamic instance buffer (POOL capacity) ---
         let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("quad-vb"),
             contents: bytemuck::cast_slice(&QUAD),
@@ -272,10 +305,11 @@ impl State {
             contents: bytemuck::cast_slice(&INDICES),
             usage: wgpu::BufferUsages::INDEX,
         });
-        let instance_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instances"),
-            contents: bytemuck::cast_slice(&instances),
-            usage: wgpu::BufferUsages::VERTEX,
+            size: POOL as u64 * size_of::<Instance>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         // --- pipeline ---
@@ -339,15 +373,25 @@ impl State {
             vertex_buf,
             index_buf,
             instance_buf,
-            num_instances: n,
+            num_instances: 0,
             camera_buf,
             camera_bg,
             tex_bg,
+            tex,
+            sources,
+            total,
+            total_cols,
+            resident: HashMap::new(),
+            free_layers,
+            inflight: 0,
+            job_tx,
+            result_rx,
             scroll_x: 0.0,
             velocity: 0.0,
             input_dir: 0.0,
             scroll_max,
             last_frame: Instant::now(),
+            frame: 0,
         };
         state.upload_camera();
         state
@@ -363,27 +407,26 @@ impl State {
         }
     }
 
-    /// Mouse-wheel: pan immediately along the wall.
     pub fn scroll(&mut self, delta: f32) {
         self.scroll_x = (self.scroll_x - delta).clamp(0.0, self.scroll_max.max(0.0));
         self.velocity = 0.0;
     }
 
-    /// Arrow keys: -1 left, +1 right, 0 released.
     pub fn set_dir(&mut self, dir: f32) {
         self.input_dir = dir;
     }
 
     pub fn update(&mut self) {
+        // --- scroll physics ---
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
-
         const ACCEL: f32 = 14.0;
         const MAX_SPEED: f32 = 9.0;
         const DAMP: f32 = 6.0;
         if self.input_dir != 0.0 {
-            self.velocity = (self.velocity + self.input_dir * ACCEL * dt).clamp(-MAX_SPEED, MAX_SPEED);
+            self.velocity =
+                (self.velocity + self.input_dir * ACCEL * dt).clamp(-MAX_SPEED, MAX_SPEED);
         } else {
             self.velocity *= (1.0 - DAMP * dt).max(0.0);
             if self.velocity.abs() < 0.001 {
@@ -395,7 +438,145 @@ impl State {
         if self.scroll_x <= 0.0 || self.scroll_x >= max {
             self.velocity = 0.0;
         }
+
+        // --- drain finished decodes: assign a layer + upload, or drop if no longer wanted ---
+        while let Ok(res) = self.result_rx.try_recv() {
+            self.inflight = self.inflight.saturating_sub(1);
+            if !matches!(self.resident.get(&res.index), Some(Tile::Loading)) {
+                continue; // evicted while in flight
+            }
+            if res.rgba.is_empty() {
+                self.resident.insert(res.index, Tile::Failed);
+            } else if self.in_window(res.index) {
+                if let Some(layer) = self.free_layers.pop() {
+                    self.upload_layer(layer, &res.rgba);
+                    self.resident.insert(res.index, Tile::Ready(layer));
+                } else {
+                    self.resident.remove(&res.index); // pool full (shouldn't happen) — retry later
+                }
+            } else {
+                self.resident.remove(&res.index); // scrolled away mid-decode
+            }
+        }
+
+        // --- evict resident tiles outside the window (free their layers) ---
+        let (first, last) = self.window_cols();
+        let evict: Vec<usize> = self
+            .resident
+            .iter()
+            .filter(|(i, t)| {
+                let col = (**i / ROWS) as i64;
+                (col < first || col > last) && !matches!(t, Tile::Loading)
+            })
+            .map(|(i, _)| *i)
+            .collect();
+        for i in evict {
+            if let Some(Tile::Ready(layer)) = self.resident.remove(&i) {
+                self.free_layers.push(layer);
+            }
+        }
+
+        // --- dispatch new loads, nearest column first, throttled ---
+        let center = (self.scroll_x / CELL_X).round() as i64;
+        'outer: for d in 0..=KEEP_COLS {
+            for side in 0..2 {
+                if d == 0 && side == 1 {
+                    break;
+                }
+                let col = if side == 0 { center - d } else { center + d };
+                if col < first || col > last {
+                    continue;
+                }
+                for row in 0..ROWS {
+                    if self.inflight >= MAX_INFLIGHT {
+                        break 'outer;
+                    }
+                    let idx = col as usize * ROWS + row;
+                    if idx >= self.total || self.resident.contains_key(&idx) {
+                        continue;
+                    }
+                    self.resident.insert(idx, Tile::Loading);
+                    self.inflight += 1;
+                    let _ = self.job_tx.send(Job {
+                        index: idx,
+                        source: self.sources[idx].clone(),
+                    });
+                }
+            }
+        }
+
+        self.rebuild_instances();
         self.upload_camera();
+
+        // Opt-in streaming readout: RUST_LOG=cooliris_rs=debug
+        self.frame = self.frame.wrapping_add(1);
+        if log::log_enabled!(log::Level::Debug) && self.frame % 120 == 0 {
+            log::debug!(
+                "scroll {:.1} | resident {} (drawn {}) | inflight {} | free layers {}/{}",
+                self.scroll_x,
+                self.resident.len(),
+                self.num_instances,
+                self.inflight,
+                self.free_layers.len(),
+                POOL,
+            );
+        }
+    }
+
+    fn window_cols(&self) -> (i64, i64) {
+        let center = (self.scroll_x / CELL_X).round() as i64;
+        (
+            (center - KEEP_COLS).max(0),
+            (center + KEEP_COLS).min(self.total_cols - 1),
+        )
+    }
+
+    fn in_window(&self, idx: usize) -> bool {
+        let (f, l) = self.window_cols();
+        let col = (idx / ROWS) as i64;
+        col >= f && col <= l
+    }
+
+    fn upload_layer(&self, layer: u32, rgba: &[u8]) {
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * TILE_PX),
+                rows_per_image: Some(TILE_PX),
+            },
+            wgpu::Extent3d {
+                width: TILE_PX,
+                height: TILE_PX,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    fn rebuild_instances(&mut self) {
+        let mut inst: Vec<Instance> = Vec::with_capacity(self.resident.len());
+        for (&i, t) in &self.resident {
+            if let Tile::Ready(layer) = *t {
+                let col = (i / ROWS) as f32;
+                let row = (i % ROWS) as f32;
+                inst.push(Instance {
+                    offset: [col * CELL_X, (row - 1.0) * CELL_Y],
+                    size: [TILE, TILE],
+                    layer,
+                });
+            }
+        }
+        self.num_instances = inst.len() as u32;
+        if !inst.is_empty() {
+            self.queue
+                .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&inst));
+        }
     }
 
     fn upload_camera(&self) {
@@ -439,13 +620,15 @@ impl State {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            rp.set_pipeline(&self.pipeline);
-            rp.set_bind_group(0, &self.camera_bg, &[]);
-            rp.set_bind_group(1, &self.tex_bg, &[]);
-            rp.set_vertex_buffer(0, self.vertex_buf.slice(..));
-            rp.set_vertex_buffer(1, self.instance_buf.slice(..));
-            rp.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
-            rp.draw_indexed(0..INDICES.len() as u32, 0, 0..self.num_instances);
+            if self.num_instances > 0 {
+                rp.set_pipeline(&self.pipeline);
+                rp.set_bind_group(0, &self.camera_bg, &[]);
+                rp.set_bind_group(1, &self.tex_bg, &[]);
+                rp.set_vertex_buffer(0, self.vertex_buf.slice(..));
+                rp.set_vertex_buffer(1, self.instance_buf.slice(..));
+                rp.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+                rp.draw_indexed(0..INDICES.len() as u32, 0, 0..self.num_instances);
+            }
         }
         self.queue.submit(std::iter::once(enc.finish()));
         frame.present();
@@ -453,38 +636,28 @@ impl State {
     }
 }
 
-/// Decode + downscale up to LOAD_CAP images from a folder passed as the first CLI arg into
-/// TILE_PX-square RGBA layers. With no folder (or no images) it returns generated placeholder
-/// tiles so the wall always shows something.
-fn load_layers() -> Vec<Vec<u8>> {
-    let paths = gather_images();
-    if paths.is_empty() {
-        log::info!("no images to load (pass a folder of images as the first argument) — showing placeholders");
-        return (0..24).map(placeholder).collect();
-    }
-    let layers: Vec<Vec<u8>> = paths
-        .iter()
-        .filter_map(|p| match image::open(p) {
-            Ok(img) => Some(
-                img.resize_exact(TILE_PX, TILE_PX, image::imageops::FilterType::Triangle)
-                    .to_rgba8()
-                    .into_raw(),
-            ),
+/// Decode + downscale one tile's pixels (runs on a worker thread). Empty Vec == failure.
+fn decode(source: &Source) -> Vec<u8> {
+    match source {
+        Source::File(p) => match image::open(p) {
+            Ok(img) => img
+                .resize_exact(TILE_PX, TILE_PX, image::imageops::FilterType::Triangle)
+                .to_rgba8()
+                .into_raw(),
             Err(e) => {
                 log::warn!("skip {p:?}: {e}");
-                None
+                Vec::new()
             }
-        })
-        .collect();
-    if layers.is_empty() {
-        return (0..24).map(placeholder).collect();
+        },
+        Source::Placeholder(i) => placeholder(*i),
     }
-    layers
 }
 
-fn gather_images() -> Vec<PathBuf> {
+/// Build the tile library from the first CLI arg (a folder of images), or placeholders.
+fn gather_sources() -> Vec<Source> {
     let Some(dir) = std::env::args().nth(1) else {
-        return vec![];
+        log::info!("no folder given (pass one as the first argument) — showing placeholders");
+        return (0..24).map(Source::Placeholder).collect();
     };
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
         .into_iter()
@@ -502,14 +675,17 @@ fn gather_images() -> Vec<PathBuf> {
         })
         .collect();
     paths.sort();
-    paths.truncate(LOAD_CAP);
-    paths
+    if paths.is_empty() {
+        log::info!("no images in {dir:?} — showing placeholders");
+        return (0..24).map(Source::Placeholder).collect();
+    }
+    paths.into_iter().map(Source::File).collect()
 }
 
-/// A simple two-tone gradient keyed by index, so the grid is visible without any images.
+/// A simple gradient keyed by index, so the wall is visible without any images.
 fn placeholder(i: usize) -> Vec<u8> {
     let hue = (i as f32 * 0.61803398875).fract();
-    let (r, g, b) = hsv(hue, 0.5, 0.8);
+    let (r, g, b) = hsv(hue, 0.5, 0.85);
     let mut buf = vec![0u8; (TILE_PX * TILE_PX * 4) as usize];
     for y in 0..TILE_PX {
         let t = y as f32 / TILE_PX as f32;

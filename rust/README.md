@@ -19,27 +19,30 @@ A native GPU app removes all of that:
 
 ## Status
 
-Foundation only: a window + a configured wgpu surface clearing to the wall's near-black,
-verified rendering on a real GPU (Vulkan/Metal/DX12 via wgpu). Everything below is the plan.
+A **working, virtualized, streamed wall**: point it at a folder and it scrolls a 3-row grid of
+your photos with a perspective camera. Tiles decode on a worker-thread pool and stream in around
+the camera; a fixed pool of texture-array layers is recycled as you scroll, so **GPU/CPU stay
+flat no matter how large the library** (verified: 120 tiles → residency capped at the ~99-tile
+window, layers recycled, never exhausted, zero panics). Next up is visual polish (aspect-correct
+tiles, focus, reflections) and the libmpv video layer.
 
 ## Roadmap (each step is a runnable milestone)
 
-1. **✅ Window + GPU surface** — winit 0.30 + wgpu, sRGB swapchain, resize handling. _(done)_
-2. **Textured quad** — one image on a quad: vertex/index buffers, a sampler+texture bind group,
-   a WGSL shader. Proves the tile-draw path.
-3. **Instanced tile grid** — draw N quads in one call from a per-tile instance buffer
-   (position/size/uv). The 3-row column-major Cooliris layout.
-4. **Camera + scroll** — an ortho/perspective camera that pans horizontally; wheel/drag/keys with
-   inertia and the signature bank-on-scroll.
-5. **Virtualization** — only build/keep tiles in a window around the view; evict + free textures
-   outside it (the bounded-memory guarantee, by construction).
-6. **Async image streaming** — a thread-pool reads files directly (no IPC), decodes + downscales
-   (`image` crate), and uploads to a GPU texture atlas/array; throttled like the JS `MAX_INFLIGHT`.
-7. **Focus / lightbox** — select a tile, animate the camera in, swap in the full-resolution image.
-8. **Reflections, labels, scrubber** — the visual polish from the WebGL wall.
-9. **Video** — embed libmpv (`libmpv2` crate) rendering into a GPU texture via its render API,
-   composited into the scene. (No separate window needed, unlike the Electron embed.)
-10. **Packaging** — `cargo-bundle` / per-OS installers; folder picker (`rfd`).
+1. **✅ Window + GPU surface** — winit 0.30 + wgpu, sRGB swapchain, resize handling.
+2. **✅ Textured quad / tile shader** — texture + sampler + WGSL.
+3. **✅ Instanced tile grid** — one draw call, per-tile instance buffer, 3-row column-major layout.
+4. **✅ Camera + scroll** — perspective camera panning the wall; wheel + ←/→ with accel/damp/inertia.
+5. **✅ Virtualization + eviction** — only tiles in a window around the view are resident; layers
+   freed + recycled on scroll-out. The bounded-memory guarantee, by construction.
+6. **✅ Threaded streaming** — a worker pool reads files directly (no IPC), decodes + downscales,
+   and uploads to free layers; throttled like the JS `MAX_INFLIGHT`. Handles 16k+ libraries.
+7. **Aspect-correct tiles** — size each quad to its image, sample the used sub-rect (drop the
+   square-thumbnail simplification).
+8. **Focus / lightbox** — select a tile, animate the camera in, swap in the full-resolution image.
+9. **Reflections, labels, scrubber** — the visual polish from the WebGL wall.
+10. **Video** — embed libmpv (`libmpv2` crate) rendering into a GPU texture via its render API,
+    composited into the scene. (No separate window needed, unlike the Electron embed.)
+11. **Packaging** — `cargo-bundle` / per-OS installers; folder picker (`rfd`).
 
 ## Architecture (as it grows)
 

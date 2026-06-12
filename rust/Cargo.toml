@@ -15,8 +15,10 @@ pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
 # Math (camera / transforms) for the 3D wall.
 glam = "0.29"
-# Image decode + downscale (the decode pipeline; threaded streaming comes next).
+# Image decode + downscale, run on the streaming worker pool.
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "gif", "bmp"] }
+# Multi-producer/multi-consumer channels for the decode worker pool (jobs out, pixels back).
+crossbeam-channel = "0.5"
 log = "0.4"
 env_logger = "0.11"
 
