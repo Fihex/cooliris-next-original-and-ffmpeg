@@ -83,6 +83,33 @@ const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
 const INSTANCE_ATTRS: [wgpu::VertexAttribute; 4] =
     wgpu::vertex_attr_array![2 => Float32x2, 3 => Float32x2, 4 => Uint32, 5 => Float32x2];
 
+/// A screen-space coloured rectangle (NDC). Used for the bottom scrubber bar overlay.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct OverlayRect {
+    rect: [f32; 4], // x, y (NDC bottom-left) + w, h (NDC)
+    color: [f32; 4],
+}
+const OVERLAY_ATTRS: [wgpu::VertexAttribute; 2] =
+    wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+const OVERLAY_CAP: u64 = 8;
+const OVERLAY_SHADER: &str = r#"
+struct In { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32> };
+struct V { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> };
+@vertex
+fn vs(@builtin(vertex_index) vi: u32, in: In) -> V {
+    var c = array<vec2<f32>, 6>(
+        vec2(0.,0.), vec2(1.,0.), vec2(0.,1.), vec2(0.,1.), vec2(1.,0.), vec2(1.,1.));
+    let p = in.rect.xy + c[vi] * in.rect.zw;
+    var out: V;
+    out.clip = vec4(p, 0.0, 1.0);
+    out.color = in.color;
+    return out;
+}
+@fragment
+fn fs(in: V) -> @location(0) vec4<f32> { return in.color; }
+"#;
+
 /// Where a tile's pixels come from — an image file, a video file (shown as a play tile, played on
 /// focus), or a generated placeholder when no folder is given.
 #[derive(Clone)]
@@ -95,12 +122,14 @@ enum Source {
 struct Job {
     index: usize,
     source: Source,
+    gen: u64, // library generation — results from an old library are dropped
 }
 struct Loaded {
     index: usize,
     rgba: Vec<u8>, // empty == decode failed
     w: u32,        // resized dims (≤ TILE_PX), preserving aspect
     h: u32,
+    gen: u64,
 }
 
 /// Per-resident-tile status.
@@ -137,6 +166,8 @@ pub struct State {
     index_buf: wgpu::Buffer,
     instance_buf: wgpu::Buffer,
     num_instances: u32,
+    overlay_pipeline: wgpu::RenderPipeline,
+    overlay_buf: wgpu::Buffer,
 
     camera_buf: wgpu::Buffer,
     camera_bg: wgpu::BindGroup,
@@ -148,6 +179,8 @@ pub struct State {
     sources: Arc<Vec<Source>>,
     total: usize,
     total_cols: i64,
+    generation: u64,
+    current_folder: Option<PathBuf>,
     resident: HashMap<usize, Tile>,
     free_layers: Vec<u32>,
     inflight: usize,
@@ -226,7 +259,7 @@ impl State {
         surface.configure(&device, &config);
 
         // --- library (paths only — cheap, even for 16k) ---
-        let sources = Arc::new(gather_sources(folder));
+        let sources = Arc::new(gather_sources(folder.clone()));
         let total = sources.len();
         let total_cols = (total.div_ceil(ROWS)) as i64;
         let scroll_max = (total_cols - 1).max(0) as f32 * CELL_X;
@@ -242,7 +275,13 @@ impl State {
                 while let Ok(job) = job_rx.recv() {
                     let (rgba, w, h) = decode(&job.source);
                     if result_tx
-                        .send(Loaded { index: job.index, rgba, w, h })
+                        .send(Loaded {
+                            index: job.index,
+                            rgba,
+                            w,
+                            h,
+                            gen: job.gen,
+                        })
                         .is_err()
                     {
                         break; // main gone
@@ -411,6 +450,52 @@ impl State {
             cache: None,
         });
 
+        // --- overlay (2D screen-space rects: the scrubber bar) ---
+        let overlay_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("overlay-shader"),
+            source: wgpu::ShaderSource::Wgsl(OVERLAY_SHADER.into()),
+        });
+        let overlay_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("overlay-pl"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+        let overlay_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("overlay-pipeline"),
+            layout: Some(&overlay_layout),
+            vertex: wgpu::VertexState {
+                module: &overlay_shader,
+                entry_point: "vs",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: size_of::<OverlayRect>() as u64,
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &OVERLAY_ATTRS,
+                }],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &overlay_shader,
+                entry_point: "fs",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let overlay_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("overlay"),
+            size: OVERLAY_CAP * size_of::<OverlayRect>() as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let mut state = State {
             window,
             surface,
@@ -423,6 +508,8 @@ impl State {
             index_buf,
             instance_buf,
             num_instances: 0,
+            overlay_pipeline,
+            overlay_buf,
             camera_buf,
             camera_bg,
             camera_bgl,
@@ -431,6 +518,8 @@ impl State {
             sources,
             total,
             total_cols,
+            generation: 0,
+            current_folder: folder,
             resident: HashMap::new(),
             free_layers,
             inflight: 0,
@@ -616,6 +705,9 @@ impl State {
         // --- drain finished decodes: assign a layer + upload, or drop if no longer wanted ---
         while let Ok(res) = self.result_rx.try_recv() {
             self.inflight = self.inflight.saturating_sub(1);
+            if res.gen != self.generation {
+                continue; // result from a previous library (folder was swapped)
+            }
             if !matches!(self.resident.get(&res.index), Some(Tile::Loading)) {
                 continue; // evicted while in flight
             }
@@ -684,6 +776,7 @@ impl State {
                     let _ = self.job_tx.send(Job {
                         index: idx,
                         source: self.sources[idx].clone(),
+                        gen: self.generation,
                     });
                 }
             }
@@ -884,9 +977,74 @@ impl State {
         self.focus.is_some()
     }
 
+    pub fn current_folder(&self) -> Option<&std::path::Path> {
+        self.current_folder.as_deref()
+    }
+
+    /// Swap the library to a new folder at runtime (folder-open / drag-and-drop). The generation
+    /// bump makes in-flight decodes from the old library drop on arrival; the texture pool, the
+    /// pipelines and the worker threads are all reused.
+    pub fn reload(&mut self, folder: Option<PathBuf>) {
+        self.generation += 1;
+        self.sources = Arc::new(gather_sources(folder.clone()));
+        self.current_folder = folder;
+        self.total = self.sources.len();
+        self.total_cols = self.total.div_ceil(ROWS) as i64;
+        self.scroll_max = (self.total_cols - 1).max(0) as f32 * CELL_X;
+        self.resident.clear();
+        self.free_layers = (0..POOL).rev().collect();
+        self.inflight = 0;
+        self.scroll_x = 0.0;
+        self.velocity = 0.0;
+        self.pan_y = 0.0;
+        self.cam_dist_target = BASE_DIST;
+        self.focus = None;
+        self.video = None;
+        self.video_for = None;
+        self.num_instances = 0;
+        log::info!("reloaded: {} tiles", self.total);
+    }
+
+    /// The bottom scrubber bar: a faint track + a brighter thumb sized to the visible fraction.
+    fn scrubber_rects(&self) -> Vec<OverlayRect> {
+        if self.focus.is_some() || self.scroll_max <= 0.0 {
+            return vec![];
+        }
+        let w = self.config.width.max(1) as f32;
+        let h = self.config.height.max(1) as f32;
+        let pad = 16.0;
+        let nx = |px: f32| px / w * 2.0 - 1.0; // px → NDC x
+        let nw = |px: f32| px / w * 2.0; // px width → NDC
+        let nh = 6.0 / h * 2.0; // bar height
+        let ny = -1.0 + 10.0 / h * 2.0; // 10px up from the bottom
+        let track_w = w - 2.0 * pad;
+        let track = OverlayRect {
+            rect: [nx(pad), ny, nw(track_w), nh],
+            color: [1.0, 1.0, 1.0, 0.12],
+        };
+        let frac = (self.scroll_x / self.scroll_max).clamp(0.0, 1.0);
+        let vpw = self.viewport_h() * (w / h);
+        let content = self.total_cols.max(1) as f32 * CELL_X;
+        let thumb_frac = (vpw / content).clamp(0.08, 1.0);
+        let thumb_w = track_w * thumb_frac;
+        let thumb_x = pad + (track_w - thumb_w) * frac;
+        let thumb = OverlayRect {
+            rect: [nx(thumb_x), ny, nw(thumb_w), nh],
+            color: [1.0, 1.0, 1.0, 0.55],
+        };
+        vec![track, thumb]
+    }
+
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&Default::default());
+
+        let overlay = self.scrubber_rects();
+        if !overlay.is_empty() {
+            self.queue
+                .write_buffer(&self.overlay_buf, 0, bytemuck::cast_slice(&overlay));
+        }
+
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -925,6 +1083,12 @@ impl State {
             if let (Some(v), Some(idx)) = (&self.video, self.focus) {
                 let (cx, cy) = self.tile_center(idx);
                 v.draw(&mut rp, &self.camera_bg, [cx, cy], [1.6, 0.9], &self.queue);
+            }
+            // Bottom scrubber bar (2D overlay, on top of everything).
+            if !overlay.is_empty() {
+                rp.set_pipeline(&self.overlay_pipeline);
+                rp.set_vertex_buffer(0, self.overlay_buf.slice(..));
+                rp.draw(0..6, 0..overlay.len() as u32);
             }
         }
         self.queue.submit(std::iter::once(enc.finish()));

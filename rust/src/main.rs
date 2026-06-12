@@ -57,6 +57,19 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size),
+            // Drag a folder (or a file) onto the window to load it.
+            WindowEvent::DroppedFile(path) => {
+                let folder = if path.is_dir() {
+                    Some(path)
+                } else {
+                    path.parent().map(|p| p.to_path_buf())
+                };
+                if let Some(f) = folder {
+                    if state.current_folder() != Some(f.as_path()) {
+                        state.reload(Some(f));
+                    }
+                }
+            }
             WindowEvent::MouseWheel { delta, .. } => {
                 // web: deltaY positive (scroll down) zooms out; winit y is positive up → negate.
                 // Scale line deltas up to roughly match pixel deltas.
@@ -96,6 +109,14 @@ impl ApplicationHandler for App {
                     }
                     PhysicalKey::Code(KeyCode::ArrowLeft) => {
                         state.set_dir(if pressed { -1.0 } else { 0.0 })
+                    }
+                    // O opens a folder picker at runtime.
+                    PhysicalKey::Code(KeyCode::KeyO) if pressed => {
+                        if let Some(dir) =
+                            rfd::FileDialog::new().set_title("Open a folder").pick_folder()
+                        {
+                            state.reload(Some(dir));
+                        }
                     }
                     // Esc returns from focus, then (if already on the wall) quits.
                     PhysicalKey::Code(KeyCode::Escape) if pressed => {

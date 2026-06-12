@@ -27,8 +27,9 @@ so **GPU/CPU stay flat no matter how large the library** (verified: 120 tiles �
 at the ~99-tile window, layers recycled, never exhausted, zero panics). Next up is a touch more
 polish (full-res focus, reflections) and the libmpv video layer.
 
-Controls: **mouse wheel / ←→** scroll · **left-click** focus a tile (video tiles play in place
-with `--features video`) · **Esc** back / quit.
+Controls: **wheel** zoom · **left-drag** scroll (click a tile to focus — video tiles play in
+place with `--features video`) · **right/middle-drag** pan · **bottom bar** scrub · **←→**
+scroll · **O** open a folder · **drag-and-drop** a folder onto the window · **Esc** back / quit.
 
 ## Roadmap (each step is a runnable milestone)
 
