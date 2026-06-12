@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
@@ -27,9 +27,11 @@ const GAP_Y: f32 = 0.16;
 const CELL_X: f32 = MAX_W + GAP_X; // column pitch — wide enough for the widest tile
 const CELL_Y: f32 = TILE + GAP_Y;
 const CAM_DIST: f32 = 6.0;
+const FOCUS_DIST: f32 = 2.0; // camera distance when a tile is focused (zoomed in)
 const FOV_Y: f32 = 0.9;
 const BANK_GAIN: f32 = 0.05; // the wall swings while scrolling (radians per world-unit/s)
 const BANK_MAX: f32 = 0.4;
+const ANIM_SPEED: f32 = 4.0; // focus in/out transition speed (1 / seconds)
 
 const POOL: u32 = 128; // resident texture-array layers (fixed VRAM ceiling: POOL * 1MB)
 const KEEP_COLS: i64 = 16; // columns kept resident on each side of the camera
@@ -136,6 +138,8 @@ pub struct State {
     velocity: f32,
     input_dir: f32,
     scroll_max: f32,
+    focus: Option<usize>, // currently-focused tile
+    focus_t: f32,         // 0 = wall, 1 = focused (animated)
     last_frame: Instant,
     frame: u64,
 }
@@ -403,6 +407,8 @@ impl State {
             velocity: 0.0,
             input_dir: 0.0,
             scroll_max,
+            focus: None,
+            focus_t: 0.0,
             last_frame: Instant::now(),
             frame: 0,
         };
@@ -430,27 +436,41 @@ impl State {
     }
 
     pub fn update(&mut self) {
-        // --- scroll physics ---
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
-        const ACCEL: f32 = 14.0;
-        const MAX_SPEED: f32 = 9.0;
-        const DAMP: f32 = 6.0;
-        if self.input_dir != 0.0 {
-            self.velocity =
-                (self.velocity + self.input_dir * ACCEL * dt).clamp(-MAX_SPEED, MAX_SPEED);
-        } else {
-            self.velocity *= (1.0 - DAMP * dt).max(0.0);
-            if self.velocity.abs() < 0.001 {
+
+        // --- scroll physics (frozen while a tile is focused) ---
+        if self.focus.is_none() {
+            const ACCEL: f32 = 14.0;
+            const MAX_SPEED: f32 = 9.0;
+            const DAMP: f32 = 6.0;
+            if self.input_dir != 0.0 {
+                self.velocity =
+                    (self.velocity + self.input_dir * ACCEL * dt).clamp(-MAX_SPEED, MAX_SPEED);
+            } else {
+                self.velocity *= (1.0 - DAMP * dt).max(0.0);
+                if self.velocity.abs() < 0.001 {
+                    self.velocity = 0.0;
+                }
+            }
+            let max = self.scroll_max.max(0.0);
+            self.scroll_x = (self.scroll_x + self.velocity * dt).clamp(0.0, max);
+            if self.scroll_x <= 0.0 || self.scroll_x >= max {
                 self.velocity = 0.0;
             }
-        }
-        let max = self.scroll_max.max(0.0);
-        self.scroll_x = (self.scroll_x + self.velocity * dt).clamp(0.0, max);
-        if self.scroll_x <= 0.0 || self.scroll_x >= max {
+        } else {
             self.velocity = 0.0;
         }
+
+        // --- focus in/out transition ---
+        let target_t = if self.focus.is_some() { 1.0 } else { 0.0 };
+        let step = ANIM_SPEED * dt;
+        self.focus_t = if self.focus_t < target_t {
+            (self.focus_t + step).min(target_t)
+        } else {
+            (self.focus_t - step).max(target_t)
+        };
 
         // --- drain finished decodes: assign a layer + upload, or drop if no longer wanted ---
         while let Ok(res) = self.result_rx.try_recv() {
@@ -613,26 +633,98 @@ impl State {
         }
     }
 
+    fn tile_center(&self, i: usize) -> (f32, f32) {
+        let col = (i / ROWS) as f32;
+        let row = (i % ROWS) as f32;
+        (col * CELL_X, (row - 1.0) * CELL_Y)
+    }
+
     fn upload_camera(&self) {
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-        let eye = Vec3::new(self.scroll_x, 0.0, CAM_DIST);
-        let target = Vec3::new(self.scroll_x, 0.0, 0.0);
-        let view = Mat4::look_at_rh(eye, target, Vec3::Y);
         let proj = Mat4::perspective_rh(FOV_Y, aspect, 0.1, 100.0);
 
-        // Bank: swing the wall around a vertical axis through the camera's focus as you scroll —
-        // the signature Cooliris motion. Faster scroll → more tilt, clamped.
-        let bank = (self.velocity * BANK_GAIN).clamp(-BANK_MAX, BANK_MAX);
-        let focus = Vec3::new(self.scroll_x, 0.0, 0.0);
-        let model = Mat4::from_translation(focus)
+        // Blend the wall view and the focused-tile view by the (smoothstepped) transition.
+        let s = {
+            let t = self.focus_t.clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        };
+        let (fx, fy) = self
+            .focus
+            .map(|i| self.tile_center(i))
+            .unwrap_or((self.scroll_x, 0.0));
+        let wall_eye = Vec3::new(self.scroll_x, 0.0, CAM_DIST);
+        let wall_tgt = Vec3::new(self.scroll_x, 0.0, 0.0);
+        let foc_eye = Vec3::new(fx, fy, FOCUS_DIST);
+        let foc_tgt = Vec3::new(fx, fy, 0.0);
+        let eye = wall_eye.lerp(foc_eye, s);
+        let tgt = wall_tgt.lerp(foc_tgt, s);
+        let view = Mat4::look_at_rh(eye, tgt, Vec3::Y);
+
+        // Bank: swing the wall as you scroll — faded out as we focus.
+        let bank = (self.velocity * BANK_GAIN).clamp(-BANK_MAX, BANK_MAX) * (1.0 - s);
+        let pivot = Vec3::new(eye.x, 0.0, 0.0);
+        let model = Mat4::from_translation(pivot)
             * Mat4::from_rotation_y(bank)
-            * Mat4::from_translation(-focus);
+            * Mat4::from_translation(-pivot);
 
         let u = CameraUniform {
             view_proj: (proj * view * model).to_cols_array_2d(),
         };
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::cast_slice(&[u]));
+    }
+
+    /// Ray-pick the tile under a screen-space click (against the z=0 wall plane).
+    fn pick(&self, cx: f32, cy: f32) -> Option<usize> {
+        let w = self.config.width as f32;
+        let h = self.config.height.max(1) as f32;
+        let aspect = w / h;
+        let eye = Vec3::new(self.scroll_x, 0.0, CAM_DIST);
+        let view = Mat4::look_at_rh(eye, Vec3::new(self.scroll_x, 0.0, 0.0), Vec3::Y);
+        let proj = Mat4::perspective_rh(FOV_Y, aspect, 0.1, 100.0);
+        let inv = (proj * view).inverse();
+
+        let ndc_x = 2.0 * cx / w - 1.0;
+        let ndc_y = 1.0 - 2.0 * cy / h;
+        let near = inv * Vec4::new(ndc_x, ndc_y, 0.0, 1.0); // wgpu NDC near z = 0
+        let far = inv * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
+        let near = near.truncate() / near.w;
+        let far = far.truncate() / far.w;
+        let dir = far - near;
+        if dir.z.abs() < 1e-6 {
+            return None;
+        }
+        let t = -near.z / dir.z;
+        if t < 0.0 {
+            return None;
+        }
+        let hit = near + dir * t; // world point on the wall plane
+
+        let col = (hit.x / CELL_X).round();
+        let row = (hit.y / CELL_Y).round() + 1.0;
+        if col < 0.0 || row < 0.0 || row >= ROWS as f32 {
+            return None;
+        }
+        let idx = col as usize * ROWS + row as usize;
+        (idx < self.total).then_some(idx)
+    }
+
+    /// Left click: focus the tile under the cursor, or return to the wall if already focused.
+    pub fn click(&mut self, x: f32, y: f32) {
+        if self.focus.is_some() {
+            self.focus = None;
+        } else if let Some(idx) = self.pick(x, y) {
+            self.focus = Some(idx);
+        }
+    }
+
+    /// Esc / back: return to the wall.
+    pub fn back(&mut self) {
+        self.focus = None;
+    }
+
+    pub fn is_focused(&self) -> bool {
+        self.focus.is_some()
     }
 
     pub fn render(&mut self) -> Result<(), wgpu::SurfaceError> {

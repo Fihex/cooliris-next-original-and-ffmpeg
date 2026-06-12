@@ -15,7 +15,7 @@ use std::sync::Arc;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::{ElementState, MouseScrollDelta, WindowEvent},
+    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
     window::{Window, WindowId},
@@ -26,6 +26,7 @@ use state::State;
 #[derive(Default)]
 struct App {
     state: Option<State>,
+    cursor: (f64, f64),
 }
 
 impl ApplicationHandler for App {
@@ -60,6 +61,14 @@ impl ApplicationHandler for App {
                 };
                 state.scroll(d);
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x, position.y);
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => state.click(self.cursor.0 as f32, self.cursor.1 as f32),
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
                 match event.physical_key {
@@ -69,7 +78,14 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::ArrowLeft) => {
                         state.set_dir(if pressed { -1.0 } else { 0.0 })
                     }
-                    PhysicalKey::Code(KeyCode::Escape) if pressed => event_loop.exit(),
+                    // Esc returns from focus, then (if already on the wall) quits.
+                    PhysicalKey::Code(KeyCode::Escape) if pressed => {
+                        if state.is_focused() {
+                            state.back();
+                        } else {
+                            event_loop.exit();
+                        }
+                    }
                     _ => {}
                 }
             }

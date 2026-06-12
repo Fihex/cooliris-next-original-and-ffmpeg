@@ -20,11 +20,14 @@ A native GPU app removes all of that:
 ## Status
 
 A **working, virtualized, streamed wall**: point it at a folder and it scrolls a 3-row grid of
-your photos with a perspective camera. Tiles decode on a worker-thread pool and stream in around
-the camera; a fixed pool of texture-array layers is recycled as you scroll, so **GPU/CPU stay
-flat no matter how large the library** (verified: 120 tiles → residency capped at the ~99-tile
-window, layers recycled, never exhausted, zero panics). Next up is visual polish (aspect-correct
-tiles, focus, reflections) and the libmpv video layer.
+your photos at their true aspect ratio with a perspective camera that banks as you scroll;
+left-click a tile to fly in and focus it, Esc to return. Tiles decode on a worker-thread pool
+and stream in around the camera; a fixed pool of texture-array layers is recycled as you scroll,
+so **GPU/CPU stay flat no matter how large the library** (verified: 120 tiles → residency capped
+at the ~99-tile window, layers recycled, never exhausted, zero panics). Next up is a touch more
+polish (full-res focus, reflections) and the libmpv video layer.
+
+Controls: **mouse wheel / ←→** scroll · **left-click** focus a tile · **Esc** back / quit.
 
 ## Roadmap (each step is a runnable milestone)
 
@@ -36,9 +39,11 @@ tiles, focus, reflections) and the libmpv video layer.
    freed + recycled on scroll-out. The bounded-memory guarantee, by construction.
 6. **✅ Threaded streaming** — a worker pool reads files directly (no IPC), decodes + downscales,
    and uploads to free layers; throttled like the JS `MAX_INFLIGHT`. Handles 16k+ libraries.
-7. **Aspect-correct tiles** — size each quad to its image, sample the used sub-rect (drop the
-   square-thumbnail simplification).
-8. **Focus / lightbox** — select a tile, animate the camera in, swap in the full-resolution image.
+7. **✅ Aspect-correct tiles** — each quad sized to its image, sampling the used sub-rect; the
+   wall banks as you scroll.
+8. **✅ Focus / lightbox (camera)** — left-click ray-picks a tile and the camera animates in to
+   center on it; Esc / click returns. _(Full-resolution swap on focus is the next refinement —
+   it currently shows the streamed thumbnail.)_
 9. **Reflections, labels, scrubber** — the visual polish from the WebGL wall.
 10. **Video** — embed libmpv (`libmpv2` crate) rendering into a GPU texture via its render API,
     composited into the scene. (No separate window needed, unlike the Electron embed.)
