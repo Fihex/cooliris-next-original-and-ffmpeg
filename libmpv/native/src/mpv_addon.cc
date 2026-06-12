@@ -57,6 +57,11 @@ class MpvPlayer : public Napi::ObjectWrap<MpvPlayer> {
           mpv_set_option(mpv_, "wid", MPV_FORMAT_INT64, &wid);
           mpv_set_option_string(mpv_, "vo", "gpu");
           mpv_set_option_string(mpv_, "hwdec", "auto-safe"); // HW decode, SW fallback
+          // Fast start: don't buffer packets in the demuxer before the first frame, and
+          // create the GPU window/context up front (idle) so the first open doesn't pay to
+          // build the swapchain. (gpu-context auto-picks d3d11 on Windows.)
+          mpv_set_option_string(mpv_, "demuxer-lavf-o", "fflags=+nobuffer");
+          mpv_set_option_string(mpv_, "force-window", "yes");
           mpv_set_option_string(mpv_, "terminal", "no");
           mpv_set_option_string(mpv_, "idle", "yes");
           mpv_set_option_string(mpv_, "sid", "no");

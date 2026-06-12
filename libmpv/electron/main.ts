@@ -41,6 +41,7 @@ const RENDERER_DIST = path.join(process.env.APP_ROOT, "dist");
 
 let win: BrowserWindow | null = null;
 let videoWin: BrowserWindow | null = null; // two-window embed: child window mpv renders into
+let openT0 = 0; // timing: when a video open was requested (→ "[open]" log on first frame)
 
 // Experimental Option 1: render hardware-decoded mpv into the window (native fps). The
 // window is transparent + frameless so the mpv surface underneath shows through where the
@@ -301,12 +302,14 @@ ipcMain.handle("play-video", (_e, abs: string) => {
   // the first frame is ready as early as possible. Load while HIDDEN — the child calls
   // "video-ready" once the frame is decoded, and only then do we reveal the window (no
   // blank window during decode).
+  openT0 = Date.now();
   mpvLoad(abs);
   videoWin.webContents.send("video-play", abs);
   return true;
 });
 ipcMain.handle("video-ready", () => {
   if (!win || !videoWin) return;
+  if (openT0) console.log(`[open] click → first frame ready: ${Date.now() - openT0} ms`);
   videoWin.setBounds(win.getContentBounds());
   videoWin.show();
   videoWin.focus(); // so Space / arrows / Esc reach the player
