@@ -299,6 +299,7 @@ ipcMain.handle("play-video", (_e, abs: string) => {
   if (!win || !videoWin) return false;
   videoWin.setBounds(win.getContentBounds());
   videoWin.show();
+  videoWin.focus(); // so Space / arrows / Esc reach the player
   videoWin.webContents.send("video-play", abs);
   return true;
 });
