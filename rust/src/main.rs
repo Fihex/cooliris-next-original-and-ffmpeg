@@ -58,20 +58,36 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size),
             WindowEvent::MouseWheel { delta, .. } => {
-                let d = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x + y) * 0.5,
-                    MouseScrollDelta::PixelDelta(p) => (p.x + p.y) as f32 * 0.01,
+                // web: deltaY positive (scroll down) zooms out; winit y is positive up → negate.
+                // Scale line deltas up to roughly match pixel deltas.
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (x * 100.0, -y * 100.0),
+                    MouseScrollDelta::PixelDelta(p) => (p.x as f32, -p.y as f32),
                 };
-                state.scroll(d);
+                state.wheel(dx, dy);
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor = (position.x, position.y);
+                state.pointer_move(position.x as f32, position.y as f32);
             }
             WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
+                state: btn_state,
+                button,
                 ..
-            } => state.click(self.cursor.0 as f32, self.cursor.1 as f32),
+            } => {
+                let code = match button {
+                    MouseButton::Left => 0u8,
+                    MouseButton::Middle => 1,
+                    MouseButton::Right => 2,
+                    _ => return,
+                };
+                let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
+                if btn_state == ElementState::Pressed {
+                    state.pointer_down(code, cx, cy);
+                } else {
+                    state.pointer_up(code);
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
                 match event.physical_key {

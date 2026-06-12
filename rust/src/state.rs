@@ -18,19 +18,29 @@ use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+// Layout + motion tuned to match the web wall (libmpv/src/wall/WallScene.ts).
 const TILE_PX: u32 = 512; // texture-array layer size (images resized to fit, preserving aspect)
 const ROWS: usize = 3;
 const TILE: f32 = 1.0; // row height (ROW_H)
-const MAX_W: f32 = 1.5; // widest a landscape tile may get (keeps tiles inside their column)
+const MAX_W: f32 = 1.55; // widest a landscape tile may get
 const GAP_X: f32 = 0.16;
 const GAP_Y: f32 = 0.16;
-const CELL_X: f32 = MAX_W + GAP_X; // column pitch — wide enough for the widest tile
+const CELL_X: f32 = MAX_W + GAP_X; // column pitch (1.71)
 const CELL_Y: f32 = TILE + GAP_Y;
-const CAM_DIST: f32 = 6.0;
-const FOCUS_DIST: f32 = 2.0; // camera distance when a tile is focused (zoomed in)
-const FOV_Y: f32 = 0.9;
-const BANK_GAIN: f32 = 0.05; // the wall swings while scrolling (radians per world-unit/s)
-const BANK_MAX: f32 = 0.4;
+const FOV_Y: f32 = 45.0 * std::f32::consts::PI / 180.0; // 45°, like the web camera
+const BASE_DIST: f32 = 7.2; // default camera distance (wheel zooms between MIN..MAX)
+const MIN_DIST: f32 = 4.5;
+const MAX_DIST: f32 = 13.0;
+const FOCUS_DIST: f32 = 5.6; // distance when a tile is focused
+const CAM_Y: f32 = 0.3; // slight downward camera offset
+const BANK_GAIN: f32 = 0.22; // sqrt(|vel|) → bank radians
+const BANK_MAX: f32 = 0.5;
+const PAN_Y_MAX: f32 = 1.7; // vertical grab-pan limit
+const DRAG_GAIN: f32 = 0.6; // left-drag scroll sensitivity
+const SCRUB_ZONE_PX: f32 = 44.0; // bottom band that acts as the scrubber
+const ACCEL: f32 = 22.0; // arrow-key acceleration (world units / s²)
+const MAX_SPEED: f32 = 11.0;
+const DAMP: f32 = 6.0; // scroll velocity damping
 const ANIM_SPEED: f32 = 4.0; // focus in/out transition speed (1 / seconds)
 
 const POOL: u32 = 128; // resident texture-array layers (fixed VRAM ceiling: POOL * 1MB)
@@ -104,6 +114,16 @@ enum Tile {
     Failed,
 }
 
+/// What a held pointer is doing — matches the web wall: left-drag scrolls, right/middle-drag
+/// grab-pans, the bottom band scrubs.
+#[derive(Clone, Copy, PartialEq)]
+enum DragMode {
+    None,
+    Scroll,
+    Pan,
+    Scrub,
+}
+
 pub struct State {
     pub window: Arc<Window>,
     surface: wgpu::Surface<'static>,
@@ -141,6 +161,13 @@ pub struct State {
     velocity: f32,
     input_dir: f32,
     scroll_max: f32,
+    cam_dist: f32,        // current (smoothed) camera distance
+    cam_dist_target: f32, // wheel-driven zoom target
+    pan_y: f32,           // vertical grab-pan
+    drag_mode: DragMode,
+    drag_last_x: f32,
+    drag_last_y: f32,
+    drag_moved: bool,
     focus: Option<usize>, // currently-focused tile
     focus_t: f32,         // 0 = wall, 1 = focused (animated)
     video: Option<crate::video::Player>, // playing the focused video tile, if any
@@ -413,6 +440,13 @@ impl State {
             velocity: 0.0,
             input_dir: 0.0,
             scroll_max,
+            cam_dist: BASE_DIST,
+            cam_dist_target: BASE_DIST,
+            pan_y: 0.0,
+            drag_mode: DragMode::None,
+            drag_last_x: 0.0,
+            drag_last_y: 0.0,
+            drag_moved: false,
             focus: None,
             focus_t: 0.0,
             video: None,
@@ -443,11 +477,96 @@ impl State {
         }
     }
 
-    pub fn scroll(&mut self, delta: f32) {
-        self.scroll_x = (self.scroll_x - delta).clamp(0.0, self.scroll_max.max(0.0));
+    /// Mouse wheel: vertical = zoom (camera distance), horizontal (trackpad) = pan. Web feel.
+    pub fn wheel(&mut self, dx: f32, dy: f32) {
+        if self.focus.is_some() {
+            return;
+        }
+        if dx.abs() > dy.abs() {
+            self.velocity += dx * 0.03;
+        } else {
+            self.cam_dist_target = (self.cam_dist_target + dy * 0.01).clamp(MIN_DIST, MAX_DIST);
+        }
+    }
+
+    /// Pointer pressed (button: 0 left, 1 middle, 2 right). Bottom band scrubs; middle/right
+    /// grab-pan; left drags to scroll (or clicks to select).
+    pub fn pointer_down(&mut self, button: u8, x: f32, y: f32) {
+        self.drag_last_x = x;
+        self.drag_last_y = y;
+        self.drag_moved = false;
+        let h = self.config.height as f32;
+        if self.focus.is_none() && self.scroll_max > 0.0 && y > h - SCRUB_ZONE_PX {
+            self.drag_mode = DragMode::Scrub;
+            self.scrub_to(x);
+        } else if button == 1 || button == 2 {
+            self.drag_mode = DragMode::Pan;
+        } else {
+            self.drag_mode = DragMode::Scroll;
+            self.velocity = 0.0;
+        }
+    }
+
+    pub fn pointer_move(&mut self, x: f32, y: f32) {
+        if self.drag_mode == DragMode::None {
+            return;
+        }
+        let dx = x - self.drag_last_x;
+        let dy = y - self.drag_last_y;
+        self.drag_last_x = x;
+        self.drag_last_y = y;
+        let h = self.config.height.max(1) as f32;
+        let max = self.scroll_max.max(0.0);
+        match self.drag_mode {
+            DragMode::Scrub => self.scrub_to(x),
+            DragMode::Pan => {
+                let vph = self.viewport_h();
+                self.pan_y = (self.pan_y + dy / h * vph).clamp(-PAN_Y_MAX, PAN_Y_MAX);
+                if self.focus.is_none() {
+                    self.scroll_x = (self.scroll_x - dx / h * vph).clamp(0.0, max);
+                }
+            }
+            DragMode::Scroll => {
+                if dx.abs() > 2.0 {
+                    self.drag_moved = true;
+                }
+                if self.focus.is_none() {
+                    let vpw = self.viewport_h() * (self.config.width.max(1) as f32 / h);
+                    let world = dx / h * vpw * DRAG_GAIN;
+                    self.scroll_x = (self.scroll_x - world).clamp(0.0, max);
+                    self.velocity = (-world * 60.0).clamp(-MAX_SPEED, MAX_SPEED); // fling
+                }
+            }
+            DragMode::None => {}
+        }
+    }
+
+    /// Pointer released: a left press with no drag is a click → select / deselect.
+    pub fn pointer_up(&mut self, _button: u8) {
+        let mode = self.drag_mode;
+        self.drag_mode = DragMode::None;
+        if mode == DragMode::Scroll && !self.drag_moved {
+            if self.focus.is_some() {
+                self.focus = None;
+            } else if let Some(i) = self.pick(self.drag_last_x, self.drag_last_y) {
+                self.focus = Some(i);
+            }
+        }
+    }
+
+    fn scrub_to(&mut self, x: f32) {
+        let w = self.config.width.max(1) as f32;
+        let pad = 16.0;
+        let frac = ((x - pad) / (w - 2.0 * pad)).clamp(0.0, 1.0);
+        self.scroll_x = frac * self.scroll_max.max(0.0);
         self.velocity = 0.0;
     }
 
+    fn viewport_h(&self) -> f32 {
+        2.0 * (FOV_Y * 0.5).tan() * self.cam_dist
+    }
+
+    /// Arrow keys: -1 left, +1 right, 0 released.
     pub fn set_dir(&mut self, dir: f32) {
         self.input_dir = dir;
     }
@@ -459,9 +578,6 @@ impl State {
 
         // --- scroll physics (frozen while a tile is focused) ---
         if self.focus.is_none() {
-            const ACCEL: f32 = 14.0;
-            const MAX_SPEED: f32 = 9.0;
-            const DAMP: f32 = 6.0;
             if self.input_dir != 0.0 {
                 self.velocity =
                     (self.velocity + self.input_dir * ACCEL * dt).clamp(-MAX_SPEED, MAX_SPEED);
@@ -488,6 +604,14 @@ impl State {
         } else {
             (self.focus_t - step).max(target_t)
         };
+
+        // --- camera zoom smoothing (wheel target, or pull-in when focused) ---
+        let target_dist = if self.focus.is_some() {
+            FOCUS_DIST
+        } else {
+            self.cam_dist_target
+        };
+        self.cam_dist += (target_dist - self.cam_dist) * (6.0 * dt).min(1.0);
 
         // --- drain finished decodes: assign a layer + upload, or drop if no longer wanted ---
         while let Ok(res) = self.result_rx.try_recv() {
@@ -676,30 +800,34 @@ impl State {
         (col * CELL_X, (row - 1.0) * CELL_Y)
     }
 
+    /// Eye/target for the wall, blended toward the focused tile by `s` (0..1).
+    fn eye_target(&self, s: f32) -> (f32, f32) {
+        let (fx, fy) = self
+            .focus
+            .map(|i| self.tile_center(i))
+            .unwrap_or((self.scroll_x, self.pan_y));
+        let x = self.scroll_x + (fx - self.scroll_x) * s;
+        let y = CAM_Y + self.pan_y + (fy - self.pan_y) * s;
+        (x, y)
+    }
+
     fn upload_camera(&self) {
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
         let proj = Mat4::perspective_rh(FOV_Y, aspect, 0.1, 100.0);
-
-        // Blend the wall view and the focused-tile view by the (smoothstepped) transition.
         let s = {
             let t = self.focus_t.clamp(0.0, 1.0);
             t * t * (3.0 - 2.0 * t)
         };
-        let (fx, fy) = self
-            .focus
-            .map(|i| self.tile_center(i))
-            .unwrap_or((self.scroll_x, 0.0));
-        let wall_eye = Vec3::new(self.scroll_x, 0.0, CAM_DIST);
-        let wall_tgt = Vec3::new(self.scroll_x, 0.0, 0.0);
-        let foc_eye = Vec3::new(fx, fy, FOCUS_DIST);
-        let foc_tgt = Vec3::new(fx, fy, 0.0);
-        let eye = wall_eye.lerp(foc_eye, s);
-        let tgt = wall_tgt.lerp(foc_tgt, s);
+        let (ex, ey) = self.eye_target(s);
+        let eye = Vec3::new(ex, ey, self.cam_dist);
+        let tgt = Vec3::new(ex, ey, 0.0);
         let view = Mat4::look_at_rh(eye, tgt, Vec3::Y);
 
-        // Bank: swing the wall as you scroll — faded out as we focus.
-        let bank = (self.velocity * BANK_GAIN).clamp(-BANK_MAX, BANK_MAX) * (1.0 - s);
-        let pivot = Vec3::new(eye.x, 0.0, 0.0);
+        // Bank: sqrt(|velocity|) swing as you scroll (banks on slow scroll too), faded out on focus.
+        let v = self.velocity;
+        let bank =
+            (v.signum() * v.abs().sqrt() * BANK_GAIN).clamp(-BANK_MAX, BANK_MAX) * (1.0 - s);
+        let pivot = Vec3::new(ex, 0.0, 0.0);
         let model = Mat4::from_translation(pivot)
             * Mat4::from_rotation_y(bank)
             * Mat4::from_translation(-pivot);
@@ -716,8 +844,9 @@ impl State {
         let w = self.config.width as f32;
         let h = self.config.height.max(1) as f32;
         let aspect = w / h;
-        let eye = Vec3::new(self.scroll_x, 0.0, CAM_DIST);
-        let view = Mat4::look_at_rh(eye, Vec3::new(self.scroll_x, 0.0, 0.0), Vec3::Y);
+        let (ex, ey) = self.eye_target(0.0); // wall view (we only pick when not focused)
+        let eye = Vec3::new(ex, ey, self.cam_dist);
+        let view = Mat4::look_at_rh(eye, Vec3::new(ex, ey, 0.0), Vec3::Y);
         let proj = Mat4::perspective_rh(FOV_Y, aspect, 0.1, 100.0);
         let inv = (proj * view).inverse();
 
@@ -744,15 +873,6 @@ impl State {
         }
         let idx = col as usize * ROWS + row as usize;
         (idx < self.total).then_some(idx)
-    }
-
-    /// Left click: focus the tile under the cursor, or return to the wall if already focused.
-    pub fn click(&mut self, x: f32, y: f32) {
-        if self.focus.is_some() {
-            self.focus = None;
-        } else if let Some(idx) = self.pick(x, y) {
-            self.focus = Some(idx);
-        }
     }
 
     /// Esc / back: return to the wall.
