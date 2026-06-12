@@ -7,5 +7,12 @@
 // floating on top. Off → normal canvas frame-pump; nothing here applies.
 //
 // (Named embedMode to avoid the existing src/embed/ wall-engine directory.)
-export const EMBED =
-  typeof document !== "undefined" && new URLSearchParams(location.search).has("embed");
+const params = typeof location !== "undefined" ? new URLSearchParams(location.search) : new URLSearchParams();
+
+// Transparent player styling (mpv renders under the web; controls overlay). True in the
+// child video window.
+export const EMBED = params.has("embed");
+// The MAIN (wall) window in two-window mode: route video opens to the child window.
+export const TWO_WIN = params.has("twowin");
+// This renderer instance IS the child video window (renders only the player).
+export const VIDEO_CHILD = params.has("videochild");

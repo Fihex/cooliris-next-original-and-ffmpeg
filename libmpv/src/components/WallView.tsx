@@ -15,7 +15,16 @@ import { SettingsDialog } from "./SettingsDialog";
 import { Lightbox } from "./Lightbox";
 import { Scrubber, type ScrubberHandle } from "./Scrubber";
 import { Toasts, type ToastMessage } from "./Toast";
-import { EMBED } from "@/embedMode";
+import { EMBED, TWO_WIN } from "@/embedMode";
+
+// coolmedia:// URL → absolute file path (for handing videos to the native child window).
+function decodeAbs(url: string): string {
+  try {
+    return decodeURIComponent(new URL(url).pathname.replace(/^\//, ""));
+  } catch {
+    return url;
+  }
+}
 
 export function WallView() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -162,6 +171,13 @@ export function WallView() {
     sceneRef.current = scene;
 
     scene.on("select", (index: number, item: MediaItem | null) => {
+      // Two-window embed: videos play in the native child window, not the in-page
+      // lightbox. Images/audio still use the lightbox.
+      if (TWO_WIN && item && item.type === "video") {
+        window.electron?.playVideo(decodeAbs(item.full));
+        scene.deselect();
+        return;
+      }
       setSelected(index);
       embed.callbacks.select?.(index, item);
     });

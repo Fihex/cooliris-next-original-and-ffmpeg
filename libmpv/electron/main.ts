@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol, screen } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol } from "electron";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promises as fs, createReadStream } from "node:fs";
 import { Readable } from "node:stream";
@@ -40,6 +40,7 @@ const VITE_DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL;
 const RENDERER_DIST = path.join(process.env.APP_ROOT, "dist");
 
 let win: BrowserWindow | null = null;
+let videoWin: BrowserWindow | null = null; // two-window embed: child window mpv renders into
 
 // Experimental Option 1: render hardware-decoded mpv into the window (native fps). The
 // window is transparent + frameless so the mpv surface underneath shows through where the
@@ -291,6 +292,22 @@ ipcMain.handle("win-maximize", () => {
 ipcMain.handle("win-close", () => win?.close());
 ipcMain.handle("win-is-maximized", () => win?.isMaximized() ?? false);
 
+// Two-window embed: the main (wall) window asks to play a video → show + align the child
+// video window over the content area and tell it which file. Close → hide it, stop mpv,
+// and let the wall return.
+ipcMain.handle("play-video", (_e, abs: string) => {
+  if (!win || !videoWin) return false;
+  videoWin.setBounds(win.getContentBounds());
+  videoWin.show();
+  videoWin.webContents.send("video-play", abs);
+  return true;
+});
+ipcMain.handle("close-video", () => {
+  videoWin?.hide();
+  mpvStop();
+  win?.webContents.send("video-closed");
+});
+
 /* --------------------------------- window ----------------------------------- */
 function createWindow() {
   win = new BrowserWindow({
@@ -314,10 +331,20 @@ function createWindow() {
     },
   });
   win.once("ready-to-show", () => win?.show());
-  // Embed: keep mpv's video surface filling the window as the user resizes/maximizes it.
-  if (EMBED_MODE) win.on("resize", () => mpvFit());
+  // Two-window mode: keep the child video window aligned to the main window's content,
+  // and re-fit mpv inside it, as the user moves/resizes/maximizes.
+  if (EMBED_MODE) {
+    win.on("resize", () => {
+      positionVideoWin();
+      mpvFit();
+    });
+    win.on("move", positionVideoWin);
+    win.on("maximize", positionVideoWin);
+    win.on("unmaximize", positionVideoWin);
+  }
 
-  const q = EMBED_MODE ? "?embed=1" : ""; // tells the renderer to clear backgrounds
+  // Two-window: the main window is a normal framed wall; videos play in a child window.
+  const q = EMBED_MODE ? "?twowin=1" : "";
   if (VITE_DEV_SERVER_URL) {
     win.loadURL(VITE_DEV_SERVER_URL + q);
     win.webContents.openDevTools({ mode: "detach" });
@@ -346,6 +373,48 @@ function createWindow() {
   win.on("closed", () => {
     win = null;
   });
+}
+
+// Two-window embed: a transparent, frameless CHILD window stacked on the main window. mpv
+// renders hardware-decoded video into THIS window (under its web layer, with the controls
+// overlaid — the proven embed layering), giving native fps while the MAIN window stays a
+// normal framed wall. Child windows always sit above their parent, so there's no z-order
+// fight. It's hidden until a video plays, and tracks the main window's content area.
+function createVideoWindow() {
+  if (!win) return;
+  videoWin = new BrowserWindow({
+    parent: win,
+    transparent: true,
+    frame: false,
+    show: false,
+    resizable: false,
+    skipTaskbar: true,
+    hasShadow: false,
+    backgroundColor: "#00000000",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.cjs"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      backgroundThrottling: false,
+    },
+  });
+  const u = "?videochild=1&embed=1"; // slim player view + embed (transparent) styling
+  if (VITE_DEV_SERVER_URL) videoWin.loadURL(VITE_DEV_SERVER_URL + u);
+  else videoWin.loadURL("app://bundle/" + u);
+  videoWin.on("closed", () => {
+    videoWin = null;
+  });
+}
+
+// Align the child video window exactly over the main window's content area (screen coords).
+function positionVideoWin() {
+  if (!win || !videoWin || !videoWin.isVisible()) return;
+  try {
+    videoWin.setBounds(win.getContentBounds());
+  } catch {
+    /* ignore */
+  }
 }
 
 app.whenReady().then(() => {
@@ -403,40 +472,25 @@ app.whenReady().then(() => {
   });
 
   createWindow();
-  // Option 1 (experimental, opt-in via COOLIRIS_MPV_EMBED=1): render hardware-decoded mpv
-  // straight into this window for native fps. Must run before mpvWarm so the wid is in the
-  // host's env when it spawns. Windows-only; off by default → unchanged frame-pump path.
+  // Two-window embed (opt-in COOLIRIS_MPV_EMBED=1, Windows): create the child video window,
+  // attach mpv to ITS handle, then warm. The child stays hidden until a video plays.
   if (EMBED_MODE && win) {
-    try {
-      win.maximize();
-      const handle = win.getNativeWindowHandle(); // Buffer holding the HWND pointer
-      const wid = handle.readBigUInt64LE(0).toString();
-      setEmbedWid(wid);
-      console.log("[mpv] embed mode ON, wid =", wid);
-    } catch (e) {
-      console.error("[mpv] getNativeWindowHandle failed; embed disabled:", e);
-    }
-    // Attach mpv only AFTER the window is shown + maximized. mpv's --wid surface takes its
-    // size from the window's client rect at creation and (cross-process) doesn't track
-    // later resizes — so if it attaches while the window is still hidden/1440x900, the
-    // video comes up small in the top-left (only a reload re-fit it). Warming here, once
-    // the window is realized full-size, makes the FIRST open fullscreen.
-    win.webContents.once("did-finish-load", () => {
-      win?.maximize();
-      // Belt-and-suspenders: force the window to the display work area in case maximize()
-      // is a no-op on a frameless+transparent window (then the mpv surface fills it).
+    createVideoWindow();
+    const attachAndWarm = () => {
       try {
-        const { workArea } = screen.getPrimaryDisplay();
-        win?.setBounds(workArea);
-      } catch {
-        /* ignore */
+        const handle = videoWin!.getNativeWindowHandle();
+        const wid = handle.readBigUInt64LE(0).toString();
+        setEmbedWid(wid);
+        console.log("[mpv] two-window embed ON, video-window wid =", wid);
+      } catch (e) {
+        console.error("[mpv] getNativeWindowHandle (video window) failed:", e);
       }
-      win?.show();
       mpvWarm();
-    });
+    };
+    if (videoWin) videoWin.webContents.once("did-finish-load", attachAndWarm);
+    else mpvWarm();
   } else {
-    // Non-embed: warm immediately (fork is non-blocking, runs in a child process) for the
-    // fastest first open.
+    // Non-embed: warm immediately (fork is non-blocking, runs in a child process).
     mpvWarm();
   }
 

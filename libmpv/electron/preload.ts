@@ -34,4 +34,18 @@ contextBridge.exposeInMainWorld("electron", {
   winMaximize: () => ipcRenderer.invoke("win-maximize"),
   winClose: () => ipcRenderer.invoke("win-close"),
   winIsMaximized: () => ipcRenderer.invoke("win-is-maximized"),
+  // Two-window embed: main wall asks to play a video in the child window; the child
+  // listens for the path; either side can close.
+  playVideo: (abs: string) => ipcRenderer.invoke("play-video", abs),
+  closeVideo: () => ipcRenderer.invoke("close-video"),
+  onVideoPlay: (cb: (abs: string) => void) => {
+    const h = (_e: unknown, abs: string) => cb(abs);
+    ipcRenderer.on("video-play", h);
+    return () => ipcRenderer.removeListener("video-play", h);
+  },
+  onVideoClosed: (cb: () => void) => {
+    const h = () => cb();
+    ipcRenderer.on("video-closed", h);
+    return () => ipcRenderer.removeListener("video-closed", h);
+  },
 });
