@@ -1,0 +1,51 @@
+# Builds the "original" edition (Chromium <video> playback — no native addon) for Windows.
+# Far simpler than the libmpv/libvlc builds: no MSVC, no native compile, no runtime bundling —
+# just install, build the renderer + main, and package. Produces the NSIS installer and the
+# unpacked folder as downloadable artifacts.
+#
+# Run it from GitHub → Actions → "build original (Windows)" → Run workflow,
+# or just push a tag like `original-win-1` (no Actions UI / token needed).
+name: build original (Windows)
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - 'original-win-*'
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        working-directory: original
+        run: npm install
+
+      - name: Build renderer + main
+        shell: pwsh
+        working-directory: original
+        run: |
+          $env:ELECTRON = "1"
+          npm run build
+
+      - name: Package (NSIS installer + unpacked folder)
+        working-directory: original
+        run: npx electron-builder --win nsis dir
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: cooliris-original-windows-installer
+          path: original/release/*.exe
+
+      - name: Upload unpacked folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: cooliris-original-windows-unpacked
+          path: original/release/win-unpacked/**
