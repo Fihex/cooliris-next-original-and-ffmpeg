@@ -11,6 +11,7 @@
 mod state;
 mod video;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use winit::{
@@ -28,6 +29,7 @@ use state::State;
 struct App {
     state: Option<State>,
     cursor: (f64, f64),
+    folder: Option<PathBuf>,
 }
 
 impl ApplicationHandler for App {
@@ -43,7 +45,7 @@ impl ApplicationHandler for App {
                 .create_window(attrs)
                 .expect("failed to create window"),
         );
-        let state = pollster::block_on(State::new(window));
+        let state = pollster::block_on(State::new(window, self.folder.clone()));
         state.window.request_redraw();
         self.state = Some(state);
     }
@@ -110,9 +112,20 @@ impl ApplicationHandler for App {
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // Folder of media: a CLI path if given, otherwise a native folder picker. None (cancelled or
+    // no picker available) → the wall shows placeholder tiles.
+    let folder = std::env::args().nth(1).map(PathBuf::from).or_else(|| {
+        rfd::FileDialog::new()
+            .set_title("Choose a photo / video folder")
+            .pick_folder()
+    });
+
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::default();
+    let mut app = App {
+        folder,
+        ..App::default()
+    };
     event_loop.run_app(&mut app).expect("event loop error");
 }

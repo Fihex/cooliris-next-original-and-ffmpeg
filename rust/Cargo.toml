@@ -37,6 +37,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 crossbeam-channel = "0.5"
 log = "0.4"
 env_logger = "0.11"
+# Native folder picker, so the app runs without a CLI path. xdg-portal backend on Linux avoids a
+# GTK build dependency; Windows/macOS use their native dialogs.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 
 [build-dependencies]
 # Finds + links libmpv when the `video` feature is on.

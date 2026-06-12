@@ -51,7 +51,8 @@ with `--features video`) · **Esc** back / quit.
     **No second window, no GL/Vulkan interop** — the exact thing that was painful in the Electron
     embed. Opt-in behind `--features video`; the wall builds with no libmpv dependency otherwise.
     Standalone proof too: `cargo run --features video --bin video -- clip.mp4`.
-11. **Packaging** — `cargo-bundle` / per-OS installers; folder picker (`rfd`).
+11. **✅ Folder picker** (`rfd`) — runs with no CLI path; a native dialog chooses the folder.
+    _(Per-OS installers via `cargo-bundle` are the remaining packaging step.)_
 
 ## Architecture (as it grows)
 
@@ -71,13 +72,19 @@ src/
 
 ```sh
 cd rust
-cargo run --release -- /path/to/photos          # the wall (no libmpv needed)
-cargo run --features video --bin video -- a.mp4  # video proof (needs libmpv installed)
+cargo run --release                       # opens a native folder picker
+cargo run --release -- /path/to/photos    # …or pass a folder (skips the picker)
+cargo run --release --features video -- /media   # video tiles play on focus (needs libmpv)
+
+# A shippable optimized binary:
+cargo build --release                     # → target/release/cooliris-rs
 ```
 
-Cross-platform: Windows (DX12/Vulkan), macOS (Metal), Linux (Vulkan). First build compiles wgpu
-(~2–3 min); afterwards it's incremental. The `video` feature links libmpv (via pkg-config); the
-default wall build has no such dependency.
+Run with no folder and a native picker appears (cancel → placeholder tiles). Cross-platform:
+Windows (DX12/Vulkan), macOS (Metal), Linux (Vulkan). First build compiles wgpu (~2–3 min);
+afterwards it's incremental. The `video` feature links libmpv (via pkg-config); the default wall
+build has no such dependency. (Per-OS installers via `cargo-bundle` are the remaining packaging
+step.)
 
 Logging: `RUST_LOG=cooliris_rs=info cargo run` (the wgpu backends are chatty at `info`; the
 default filter keeps just our logs).

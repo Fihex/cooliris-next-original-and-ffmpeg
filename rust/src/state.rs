@@ -150,7 +150,7 @@ pub struct State {
 }
 
 impl State {
-    pub async fn new(window: Arc<Window>) -> State {
+    pub async fn new(window: Arc<Window>, folder: Option<PathBuf>) -> State {
         let size = window.inner_size();
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -199,7 +199,7 @@ impl State {
         surface.configure(&device, &config);
 
         // --- library (paths only — cheap, even for 16k) ---
-        let sources = Arc::new(gather_sources());
+        let sources = Arc::new(gather_sources(folder));
         let total = sources.len();
         let total_cols = (total.div_ceil(ROWS)) as i64;
         let scroll_max = (total_cols - 1).max(0) as f32 * CELL_X;
@@ -858,9 +858,9 @@ fn video_placeholder() -> Vec<u8> {
 }
 
 /// Build the tile library from the first CLI arg (a folder of images), or placeholders.
-fn gather_sources() -> Vec<Source> {
-    let Some(dir) = std::env::args().nth(1) else {
-        log::info!("no folder given (pass one as the first argument) — showing placeholders");
+fn gather_sources(folder: Option<PathBuf>) -> Vec<Source> {
+    let Some(dir) = folder else {
+        log::info!("no folder chosen — showing placeholders");
         return (0..24).map(Source::Placeholder).collect();
     };
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
