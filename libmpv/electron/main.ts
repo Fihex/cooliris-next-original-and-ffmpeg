@@ -2,6 +2,8 @@ import { app, BrowserWindow, dialog, ipcMain, Menu, net, protocol } from "electr
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { promises as fs, createReadStream } from "node:fs";
 import { Readable } from "node:stream";
+import v8 from "node:v8";
+import { runInNewContext } from "node:vm";
 import path from "node:path";
 import { extractCoverArt } from "./coverArt";
 import {
@@ -319,19 +321,35 @@ ipcMain.handle("video-nav", (_e, dir: "prev" | "next") => win?.webContents.send(
 // Always-on memory readout: every 2s print each process's *current* working set (resident
 // RAM) — the headline numbers to watch climb/settle while loading and scrolling. mpv runs in a
 // forked Node child so it isn't in getAppMetrics(); "renderer" sums all windows (wall + video).
+// Electron's main-process V8 has already booted by the time app.commandLine runs, so
+// appendSwitch("js-flags","--expose-gc") only reaches renderer processes — global.gc stays
+// undefined in main. That left the main process with NO manual GC at all: serving thousands of
+// coolmedia:// image requests churns short-lived Buffers/Response/stream objects, nothing runs
+// a render loop to pressure V8, and the working set ratcheted up and never fell at idle. Grab a
+// real collect handle at runtime instead (standard setFlagsFromString trick) so main can
+// actually reclaim them. Returns null only if the V8 API is unavailable.
+function makeGc(): (() => void) | null {
+  try {
+    v8.setFlagsFromString("--expose-gc");
+    const fn = runInNewContext("gc") as unknown;
+    v8.setFlagsFromString("--no-expose-gc"); // leave the flag as we found it
+    return typeof fn === "function" ? (fn as () => void) : null;
+  } catch {
+    return null;
+  }
+}
+const forceGc = makeGc();
+let imageServeCount = 0; // nudge a collect every N served images (see coolmedia handler)
+
 let memTimer: ReturnType<typeof setInterval> | null = null;
 function startMemLog(): void {
   if (memTimer) return;
-  console.log(
-    `[mem] main gc ${typeof (globalThis as { gc?: unknown }).gc === "function" ? "exposed" : "NOT exposed"}`,
-  );
+  console.log(`[mem] main gc ${forceGc ? "active" : "unavailable"}`);
   const mb = (kb: number) => String(Math.round(kb / 1024)).padStart(4);
   memTimer = setInterval(() => {
-    // Serving thousands of coolmedia:// image requests churns short-lived objects (Response,
-    // stream wrappers, Buffer chunks) in the MAIN process's V8 heap. Nothing here runs a
-    // render loop, so V8 almost never GCs on its own and the working set ratchets up and never
-    // comes back down. Main is idle, so a periodic collect is cheap and keeps it flat.
-    (globalThis as { gc?: () => void }).gc?.();
+    // Main is idle (no render loop), so a periodic collect is cheap and keeps the working set
+    // flat instead of letting per-request image buffers pile up.
+    forceGc?.();
     try {
       const m = app.getAppMetrics();
       const sum = (type: string) =>
@@ -511,10 +529,16 @@ app.whenReady().then(() => {
     if (!m && mime.startsWith("image/")) {
       try {
         const buf = await fs.readFile(abs);
-        return new Response(new Uint8Array(buf), {
+        const res = new Response(new Uint8Array(buf), {
           status: 200,
           headers: { ...base, "Content-Length": String(buf.length) },
         });
+        // Each served image left a whole-file Buffer for V8 to reclaim. The 2s timer alone lets
+        // a fast scroll pile up a big transient peak between collects, so also nudge a collect
+        // every N images — keeps the peak down, not just the idle floor. (Deferred so it never
+        // blocks the response.) Cheap: main has no render loop.
+        if (forceGc && ++imageServeCount % 48 === 0) setImmediate(forceGc);
+        return res;
       } catch {
         return new Response(null, { status: 404 });
       }
