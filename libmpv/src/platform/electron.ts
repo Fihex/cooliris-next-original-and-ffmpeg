@@ -32,6 +32,7 @@ interface ElectronBridge {
   fetchText(url: string): Promise<string>;
   getCover(abs: string): Promise<string | null>;
   getPathForFile(file: File): string;
+  readFileBytes(abs: string): Promise<ArrayBuffer>;
   statFile(abs: string): Promise<{ mtime: number; btime: number } | null>;
   scanPaths(paths: string[]): Promise<ScanResult | null>;
   // libmpv all-format player (Option C).
@@ -119,10 +120,7 @@ async function feedFromScan(res: ScanResult, onProgress?: ProgressFn): Promise<F
         id: `el-${eid++}`,
         type: "image",
         animated: /\.gif$/i.test(f.name) || undefined,
-        // Wall tiles pull a small main-process-generated thumbnail (?w=512) so we don't move
-        // multi-MB originals for every tile; full-res is swapped in on focus. GIFs serve the
-        // original (the animator needs the whole file anyway, and a static JPEG can't animate).
-        thumb: /\.gif$/i.test(f.name) ? url : `${url}?w=512`,
+        thumb: url,
         full: url,
         title,
         path: f.rel,

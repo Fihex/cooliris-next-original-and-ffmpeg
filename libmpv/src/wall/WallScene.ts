@@ -625,7 +625,21 @@ export class WallScene {
   }
 
   /** Decode + downscale an image URL in the worker pool; resolves an ImageBitmap. */
-  private workerDecode(url: string, maxEdge: number): Promise<ImageBitmap> {
+  private async workerDecode(url: string, maxEdge: number): Promise<ImageBitmap> {
+    // Electron: read the file's bytes directly in the renderer via the preload's Node fs and
+    // hand them to the worker as a transferable. Fetching coolmedia:// instead routes every
+    // image through the BROWSER process, whose protocol layer retains a working set
+    // proportional to the bytes served — on a 16k wall that parked hundreds of MB in the main
+    // process. Direct reads keep images out of main entirely. Web build falls back to fetch.
+    let buf: ArrayBuffer | undefined;
+    const bridge = window.electron;
+    if (bridge?.readFileBytes && url.startsWith("coolmedia:")) {
+      try {
+        buf = await bridge.readFileBytes(decodeURIComponent(new URL(url).pathname.slice(1)));
+      } catch {
+        /* unreadable → let the worker try fetch */
+      }
+    }
     if (this.workers.length === 0) {
       const n = Math.max(2, Math.min(4, navigator.hardwareConcurrency || 4));
       for (let i = 0; i < n; i++) {
@@ -645,7 +659,8 @@ export class WallScene {
     this.workerNext = (this.workerNext + 1) % this.workers.length;
     return new Promise<ImageBitmap>((resolve, reject) => {
       this.workerJobs.set(id, { resolve, reject });
-      w.postMessage({ id, url, maxEdge });
+      if (buf) w.postMessage({ id, url, maxEdge, buf }, [buf]); // zero-copy transfer
+      else w.postMessage({ id, url, maxEdge });
     });
   }
 

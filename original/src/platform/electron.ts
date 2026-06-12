@@ -32,6 +32,7 @@ interface ElectronBridge {
   fetchText(url: string): Promise<string>;
   getCover(abs: string): Promise<string | null>;
   getPathForFile(file: File): string;
+  readFileBytes(abs: string): Promise<ArrayBuffer>;
   statFile(abs: string): Promise<{ mtime: number; btime: number } | null>;
   scanPaths(paths: string[]): Promise<ScanResult | null>;
 }
