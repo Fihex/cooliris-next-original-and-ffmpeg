@@ -305,7 +305,7 @@ ipcMain.handle("play-video", (_e, abs: string) => {
 });
 ipcMain.handle("close-video", () => {
   videoWin?.hide();
-  mpvStop();
+  mpvStop(); // free the file/decoder while browsing
   win?.webContents.send("video-closed");
 });
 

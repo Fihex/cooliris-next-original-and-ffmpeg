@@ -181,6 +181,7 @@ export function MpvPlayer({
   // once — transferControlToOffscreen can only be called a single time per canvas. If it
   // fails, paintRef stays null and the pump falls back to main-thread putImageData.
   useEffect(() => {
+    if (EMBED) return; // embed mode renders video natively (no canvas paint) — skip the worker
     const cv = canvasRef.current;
     if (!cv || paintRef.current) return;
     let worker: Worker | null = null;
@@ -210,6 +211,20 @@ export function MpvPlayer({
     setDur(0);
     setPlaying(true);
     mpv.mpvLoad(abs);
+
+    // Embed (two-window): mpv renders the video natively into the child window — there's no
+    // canvas to paint. Skip the whole per-frame pump (and its IPC); just poll the size
+    // occasionally so the addon drains mpv events, which re-fits the surface to the window.
+    if (EMBED) {
+      const id = window.setInterval(() => {
+        if (!cancelled) mpv.mpvSize();
+      }, 700);
+      return () => {
+        cancelled = true;
+        window.clearInterval(id);
+        mpv.mpvStop();
+      };
+    }
 
     // 2D context only when the WebGL worker isn't available (it owns the canvas otherwise).
     const ctx = paintRef.current ? null : (canvasRef.current?.getContext("2d") ?? null);

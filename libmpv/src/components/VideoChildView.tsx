@@ -17,7 +17,7 @@ export function VideoChildView() {
   );
 
   const close = () => {
-    setPlay(null); // unmount the player (stops mpv + its pump) before hiding the window
+    setPlay(null); // unmount the player → stops mpv + frees the file while browsing
     window.electron?.closeVideo();
   };
 
@@ -34,7 +34,6 @@ export function VideoChildView() {
   return (
     <div className="absolute inset-0">
       <MpvPlayer
-        key={play.nonce}
         abs={play.abs}
         itemId={`${play.abs}#${play.nonce}`}
         t={{ s: 1, x: 0, y: 0 }}
