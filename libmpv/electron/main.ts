@@ -499,6 +499,25 @@ app.whenReady().then(() => {
     };
 
     const m = /bytes=(\d*)-(\d*)/.exec(request.headers.get("Range") ?? "");
+
+    // Images are fetched whole (the renderer decodes them) and are never range-requested, so
+    // serve them as one Buffer: fs.readFile opens, reads and closes the fd in a single call,
+    // leaving nothing behind. A createReadStream instead keeps a ~64KB native read buffer + an
+    // open fd alive until it's torn down — and across the thousands of thumbnail requests a big
+    // wall generates, those piled up in the browser process (~50-64KB each, matching the climb)
+    // as native memory the GC can't reclaim. Large media keeps streaming (never read whole).
+    if (!m && mime.startsWith("image/")) {
+      try {
+        const buf = await fs.readFile(abs);
+        return new Response(new Uint8Array(buf), {
+          status: 200,
+          headers: { ...base, "Content-Length": String(buf.length) },
+        });
+      } catch {
+        return new Response(null, { status: 404 });
+      }
+    }
+
     if (m) {
       let start = m[1] ? parseInt(m[1], 10) : 0;
       let end = m[2] ? parseInt(m[2], 10) : size - 1;
