@@ -79,7 +79,7 @@ impl Ui {
                 custom_glyphs: &[],
             })
             .collect();
-        let _ = self.renderer.prepare(
+        if let Err(e) = self.renderer.prepare(
             device,
             queue,
             &mut self.font_system,
@@ -87,10 +87,14 @@ impl Ui {
             &self.viewport,
             areas,
             &mut self.swash_cache,
-        );
+        ) {
+            log::warn!("text prepare failed: {e:?}");
+        }
     }
 
     pub fn render<'a>(&'a self, rp: &mut wgpu::RenderPass<'a>) {
-        let _ = self.renderer.render(&self.atlas, &self.viewport, rp);
+        if let Err(e) = self.renderer.render(&self.atlas, &self.viewport, rp) {
+            log::warn!("text render failed: {e:?}");
+        }
     }
 }

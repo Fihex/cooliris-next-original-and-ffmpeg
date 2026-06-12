@@ -186,8 +186,6 @@ pub struct State {
     total_cols: i64,
     generation: u64,
     current_folder: Option<PathBuf>,
-    loaded_count: usize, // unique tiles decoded since the last (re)load → the progress readout
-    decoded: Vec<bool>,
     resident: HashMap<usize, Tile>,
     free_layers: Vec<u32>,
     inflight: usize,
@@ -530,8 +528,6 @@ impl State {
             total_cols,
             generation: 0,
             current_folder: folder,
-            loaded_count: 0,
-            decoded: vec![false; total],
             resident: HashMap::new(),
             free_layers,
             inflight: 0,
@@ -746,10 +742,6 @@ impl State {
                             ],
                         },
                     );
-                    if !self.decoded[res.index] {
-                        self.decoded[res.index] = true;
-                        self.loaded_count += 1;
-                    }
                 } else {
                     self.resident.remove(&res.index); // pool full (shouldn't happen) — retry later
                 }
@@ -1014,8 +1006,6 @@ impl State {
         self.total = self.sources.len();
         self.total_cols = self.total.div_ceil(ROWS) as i64;
         self.scroll_max = (self.total_cols - 1).max(0) as f32 * CELL_X;
-        self.loaded_count = 0;
-        self.decoded = vec![false; self.total];
         self.resident.clear();
         self.free_layers = (0..POOL).rev().collect();
         self.inflight = 0;
@@ -1046,10 +1036,10 @@ impl State {
         }];
         let status = if self.current_folder.is_none() {
             "drop a folder here · click Open · press O".to_string()
-        } else if self.loaded_count >= self.total {
-            format!("{} items", self.total)
+        } else if self.inflight > 0 {
+            format!("{} items · loading…", self.total)
         } else {
-            format!("{} / {} loading…", self.loaded_count, self.total)
+            format!("{} items", self.total)
         };
         v.push(crate::ui::Line {
             text: status,
@@ -1078,13 +1068,19 @@ impl State {
             color: [1.0, 1.0, 1.0, 0.12],
         });
 
-        // Top loading bar (left → right, fraction decoded).
-        if self.total > 0 && self.loaded_count < self.total {
-            let frac = self.loaded_count as f32 / self.total as f32;
+        // Top loading bar — shown while tiles are actively decoding; grows as the visible window
+        // fills in, then disappears. (A virtualized wall never loads the whole library at once.)
+        if self.inflight > 0 {
+            let ready = self
+                .resident
+                .values()
+                .filter(|t| matches!(t, Tile::Ready { .. }))
+                .count();
+            let frac = (ready as f32 / self.resident.len().max(1) as f32).max(0.05);
             let ph = nhh(3.0);
             rects.push(OverlayRect {
                 rect: [-1.0, 1.0 - ph, 2.0 * frac, ph],
-                color: [0.3, 0.6, 1.0, 0.9],
+                color: [0.3, 0.6, 1.0, 0.95],
             });
         }
 
