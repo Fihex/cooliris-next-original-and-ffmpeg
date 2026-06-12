@@ -17,6 +17,9 @@ struct VsIn {
     @location(2) offset: vec2<f32>,
     @location(3) size: vec2<f32>,
     @location(4) layer: u32,
+    // fraction of the layer the image actually occupies (it's resized to fit, preserving aspect,
+    // so a 3:2 photo only fills the top ~0.67 of a square layer).
+    @location(5) uv_extent: vec2<f32>,
 };
 
 struct VsOut {
@@ -34,7 +37,7 @@ fn vs_main(in: VsIn) -> VsOut {
 
     var out: VsOut;
     out.clip = camera.view_proj * vec4<f32>(world, 1.0);
-    out.uv = in.uv;
+    out.uv = in.uv * in.uv_extent; // sample only the used sub-rect of the layer
     out.layer = in.layer;
     return out;
 }

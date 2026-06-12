@@ -18,15 +18,18 @@ use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
-const TILE_PX: u32 = 512; // texture-array layer size (square thumbnails for now)
+const TILE_PX: u32 = 512; // texture-array layer size (images resized to fit, preserving aspect)
 const ROWS: usize = 3;
-const TILE: f32 = 1.0;
+const TILE: f32 = 1.0; // row height (ROW_H)
+const MAX_W: f32 = 1.5; // widest a landscape tile may get (keeps tiles inside their column)
 const GAP_X: f32 = 0.16;
 const GAP_Y: f32 = 0.16;
-const CELL_X: f32 = TILE + GAP_X;
+const CELL_X: f32 = MAX_W + GAP_X; // column pitch — wide enough for the widest tile
 const CELL_Y: f32 = TILE + GAP_Y;
 const CAM_DIST: f32 = 6.0;
 const FOV_Y: f32 = 0.9;
+const BANK_GAIN: f32 = 0.05; // the wall swings while scrolling (radians per world-unit/s)
+const BANK_MAX: f32 = 0.4;
 
 const POOL: u32 = 128; // resident texture-array layers (fixed VRAM ceiling: POOL * 1MB)
 const KEEP_COLS: i64 = 16; // columns kept resident on each side of the camera
@@ -46,6 +49,7 @@ struct Instance {
     offset: [f32; 2],
     size: [f32; 2],
     layer: u32,
+    uv_extent: [f32; 2],
 }
 
 #[repr(C)]
@@ -64,8 +68,8 @@ const INDICES: [u16; 6] = [0, 1, 2, 2, 1, 3];
 
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
-const INSTANCE_ATTRS: [wgpu::VertexAttribute; 3] =
-    wgpu::vertex_attr_array![2 => Float32x2, 3 => Float32x2, 4 => Uint32];
+const INSTANCE_ATTRS: [wgpu::VertexAttribute; 4] =
+    wgpu::vertex_attr_array![2 => Float32x2, 3 => Float32x2, 4 => Uint32, 5 => Float32x2];
 
 /// Where a tile's pixels come from — a file, or a generated placeholder when no folder is given.
 #[derive(Clone)]
@@ -81,12 +85,18 @@ struct Job {
 struct Loaded {
     index: usize,
     rgba: Vec<u8>, // empty == decode failed
+    w: u32,        // resized dims (≤ TILE_PX), preserving aspect
+    h: u32,
 }
 
 /// Per-resident-tile status.
 enum Tile {
     Loading,
-    Ready(u32), // assigned texture-array layer
+    Ready {
+        layer: u32,    // assigned texture-array layer
+        aspect: f32,   // image w/h → quad width
+        uv: [f32; 2],  // fraction of the layer the image fills
+    },
     Failed,
 }
 
@@ -194,8 +204,11 @@ impl State {
             let result_tx = result_tx.clone();
             std::thread::spawn(move || {
                 while let Ok(job) = job_rx.recv() {
-                    let rgba = decode(&job.source);
-                    if result_tx.send(Loaded { index: job.index, rgba }).is_err() {
+                    let (rgba, w, h) = decode(&job.source);
+                    if result_tx
+                        .send(Loaded { index: job.index, rgba, w, h })
+                        .is_err()
+                    {
                         break; // main gone
                     }
                 }
@@ -445,12 +458,22 @@ impl State {
             if !matches!(self.resident.get(&res.index), Some(Tile::Loading)) {
                 continue; // evicted while in flight
             }
-            if res.rgba.is_empty() {
+            if res.rgba.is_empty() || res.w == 0 || res.h == 0 {
                 self.resident.insert(res.index, Tile::Failed);
             } else if self.in_window(res.index) {
                 if let Some(layer) = self.free_layers.pop() {
-                    self.upload_layer(layer, &res.rgba);
-                    self.resident.insert(res.index, Tile::Ready(layer));
+                    self.upload_layer(layer, &res.rgba, res.w, res.h);
+                    self.resident.insert(
+                        res.index,
+                        Tile::Ready {
+                            layer,
+                            aspect: res.w as f32 / res.h as f32,
+                            uv: [
+                                res.w as f32 / TILE_PX as f32,
+                                res.h as f32 / TILE_PX as f32,
+                            ],
+                        },
+                    );
                 } else {
                     self.resident.remove(&res.index); // pool full (shouldn't happen) — retry later
                 }
@@ -471,7 +494,7 @@ impl State {
             .map(|(i, _)| *i)
             .collect();
         for i in evict {
-            if let Some(Tile::Ready(layer)) = self.resident.remove(&i) {
+            if let Some(Tile::Ready { layer, .. }) = self.resident.remove(&i) {
                 self.free_layers.push(layer);
             }
         }
@@ -537,7 +560,9 @@ impl State {
         col >= f && col <= l
     }
 
-    fn upload_layer(&self, layer: u32, rgba: &[u8]) {
+    /// Upload the image into the top-left w×h sub-region of its layer (the rest is unused and
+    /// never sampled, thanks to uv_extent).
+    fn upload_layer(&self, layer: u32, rgba: &[u8], w: u32, h: u32) {
         self.queue.write_texture(
             wgpu::ImageCopyTexture {
                 texture: &self.tex,
@@ -548,12 +573,12 @@ impl State {
             rgba,
             wgpu::ImageDataLayout {
                 offset: 0,
-                bytes_per_row: Some(4 * TILE_PX),
-                rows_per_image: Some(TILE_PX),
+                bytes_per_row: Some(4 * w),
+                rows_per_image: Some(h),
             },
             wgpu::Extent3d {
-                width: TILE_PX,
-                height: TILE_PX,
+                width: w,
+                height: h,
                 depth_or_array_layers: 1,
             },
         );
@@ -562,13 +587,22 @@ impl State {
     fn rebuild_instances(&mut self) {
         let mut inst: Vec<Instance> = Vec::with_capacity(self.resident.len());
         for (&i, t) in &self.resident {
-            if let Tile::Ready(layer) = *t {
+            if let Tile::Ready { layer, aspect, uv } = *t {
+                // Fixed row height; width follows the image aspect, capped so tiles stay in their
+                // column. Centered in the cell.
+                let mut w = TILE * aspect;
+                let mut h = TILE;
+                if w > MAX_W {
+                    w = MAX_W;
+                    h = MAX_W / aspect;
+                }
                 let col = (i / ROWS) as f32;
                 let row = (i % ROWS) as f32;
                 inst.push(Instance {
                     offset: [col * CELL_X, (row - 1.0) * CELL_Y],
-                    size: [TILE, TILE],
+                    size: [w, h],
                     layer,
+                    uv_extent: uv,
                 });
             }
         }
@@ -585,8 +619,17 @@ impl State {
         let target = Vec3::new(self.scroll_x, 0.0, 0.0);
         let view = Mat4::look_at_rh(eye, target, Vec3::Y);
         let proj = Mat4::perspective_rh(FOV_Y, aspect, 0.1, 100.0);
+
+        // Bank: swing the wall around a vertical axis through the camera's focus as you scroll —
+        // the signature Cooliris motion. Faster scroll → more tilt, clamped.
+        let bank = (self.velocity * BANK_GAIN).clamp(-BANK_MAX, BANK_MAX);
+        let focus = Vec3::new(self.scroll_x, 0.0, 0.0);
+        let model = Mat4::from_translation(focus)
+            * Mat4::from_rotation_y(bank)
+            * Mat4::from_translation(-focus);
+
         let u = CameraUniform {
-            view_proj: (proj * view).to_cols_array_2d(),
+            view_proj: (proj * view * model).to_cols_array_2d(),
         };
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::cast_slice(&[u]));
@@ -636,20 +679,24 @@ impl State {
     }
 }
 
-/// Decode + downscale one tile's pixels (runs on a worker thread). Empty Vec == failure.
-fn decode(source: &Source) -> Vec<u8> {
+/// Decode + downscale one tile (runs on a worker thread). Resizes to fit TILE_PX preserving
+/// aspect; returns (rgba, w, h). Empty/zero == failure.
+fn decode(source: &Source) -> (Vec<u8>, u32, u32) {
     match source {
         Source::File(p) => match image::open(p) {
-            Ok(img) => img
-                .resize_exact(TILE_PX, TILE_PX, image::imageops::FilterType::Triangle)
-                .to_rgba8()
-                .into_raw(),
+            Ok(img) => {
+                let t = img
+                    .resize(TILE_PX, TILE_PX, image::imageops::FilterType::Triangle)
+                    .to_rgba8();
+                let (w, h) = (t.width(), t.height());
+                (t.into_raw(), w, h)
+            }
             Err(e) => {
                 log::warn!("skip {p:?}: {e}");
-                Vec::new()
+                (Vec::new(), 0, 0)
             }
         },
-        Source::Placeholder(i) => placeholder(*i),
+        Source::Placeholder(i) => (placeholder(*i), TILE_PX, TILE_PX),
     }
 }
 
