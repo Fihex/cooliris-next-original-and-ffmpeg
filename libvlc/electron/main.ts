@@ -364,9 +364,12 @@ function createWindow() {
   });
 }
 
-// Expose globalThis.gc() in the renderer so the wall can hand the JS heap back after a large
-// tile-eviction burst (see WallScene.scheduleGc). Must precede app ready; harmless if unused.
-app.commandLine.appendSwitch("js-flags", "--expose-gc");
+// Renderer V8 flags — set before app ready so they reach renderer processes (main's V8 has
+// already booted). --expose-gc lets the wall hand its JS heap back on idle (WallScene.scheduleGc).
+// --max-old-space-size caps the renderer's old generation: big scroll bursts (image bytes read
+// for decode) then trigger GC earlier, so the heap peak stays lower. 256MB is well above the
+// wall's ~30MB steady / ~150MB burst heap, so it clips peaks without GC thrashing.
+app.commandLine.appendSwitch("js-flags", "--expose-gc --max-old-space-size=256");
 
 app.whenReady().then(() => {
   protocol.handle("coolmedia", async (request) => {
