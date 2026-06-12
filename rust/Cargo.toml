@@ -1,0 +1,27 @@
+[package]
+name = "cooliris-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust + wgpu rebuild of the Cooliris 3D media wall"
+
+[dependencies]
+# Cross-platform windowing + input (Win/macOS/Linux). 0.30 uses the ApplicationHandler model.
+winit = "0.30"
+# Cross-platform GPU (Vulkan / Metal / DX12 / GL) — the wall renders here, no browser involved.
+wgpu = "22"
+# Block on wgpu's async device/adapter requests from sync winit callbacks.
+pollster = "0.3"
+# Plain-old-data structs → GPU buffers without unsafe transmutes.
+bytemuck = { version = "1", features = ["derive"] }
+# Math (camera / transforms) for the 3D wall.
+glam = "0.29"
+log = "0.4"
+env_logger = "0.11"
+
+# Faster debug builds of the heavy graphics deps without losing our own debuggability.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
