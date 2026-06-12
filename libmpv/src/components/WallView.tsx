@@ -15,7 +15,7 @@ import { SettingsDialog } from "./SettingsDialog";
 import { Lightbox } from "./Lightbox";
 import { Scrubber, type ScrubberHandle } from "./Scrubber";
 import { Toasts, type ToastMessage } from "./Toast";
-import { EMBED, TWO_WIN } from "@/embedMode";
+import { TWO_WIN } from "@/embedMode";
 
 // coolmedia:// URL → absolute file path (for handing videos to the native child window).
 function decodeAbs(url: string): string {
@@ -325,22 +325,7 @@ export function WallView() {
 
   return (
     <div className="relative h-full w-full overflow-hidden" onPointerMove={onPointerMove}>
-      {/* Embed mode: the window is transparent (so the mpv surface shows through while a
-          video plays), so give the WALL an opaque backdrop while browsing — removed when
-          a video is open so mpv shows. */}
-      {EMBED && selected < 0 && (
-        <div
-          className="absolute inset-0"
-          style={{ background: "radial-gradient(ellipse at top, #0b0f17 0%, #05070c 60%, #000 100%)" }}
-        />
-      )}
-      {/* In embedded-mpv mode the wall's WebGL canvas is opaque and would cover the mpv
-          video surface underneath, so hide it while a video is open. */}
-      <div
-        ref={containerRef}
-        className="absolute inset-0"
-        style={EMBED && selected >= 0 ? { visibility: "hidden" } : undefined}
-      />
+      <div ref={containerRef} className="absolute inset-0" />
 
       {fatal && (
         <div className="absolute inset-0 z-40 flex items-center justify-center p-6">

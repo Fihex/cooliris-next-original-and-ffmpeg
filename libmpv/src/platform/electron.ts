@@ -44,10 +44,6 @@ interface ElectronBridge {
   mpvFrame(w: number, h: number): Promise<Uint8Array | null>;
   mpvStop(): Promise<unknown>;
   winFullscreen(on: boolean): Promise<boolean>;
-  winMinimize(): Promise<void>;
-  winMaximize(): Promise<boolean>;
-  winClose(): Promise<void>;
-  winIsMaximized(): Promise<boolean>;
   playVideo(abs: string): Promise<boolean>;
   videoReady(): Promise<void>;
   closeVideo(): Promise<void>;

@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { MediaItem } from "@/feed/types";
 import { MpvPlayer } from "./MpvPlayer";
-import { EMBED } from "@/embedMode";
 
 // All videos play through libmpv (every format, no transcode). Recover the file path
 // from the coolmedia:// URL the scan produced.
@@ -137,15 +136,9 @@ export function Lightbox({
     const isVideo = item.type === "video";
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        // Embed: closing the lightbox restores the window from fullscreen (cleanup above),
-        // so Esc just closes. Non-embed: leave browser fullscreen first, then close.
-        if (EMBED) {
-          onClose();
-        } else if (document.fullscreenElement) {
-          document.exitFullscreen();
-        } else {
-          onClose();
-        }
+        // Leave fullscreen first; only close the lightbox when not fullscreen.
+        if (document.fullscreenElement) document.exitFullscreen();
+        else onClose();
         return;
       }
       // Videos play through MpvPlayer, which owns the arrow keys (seek / volume) —
@@ -253,21 +246,11 @@ export function Lightbox({
 
   // Fullscreen the whole lightbox (so our custom control bar stays visible too).
   const toggleFullscreen = useCallback(() => {
-    // Embed mode: toggle the OS WINDOW fullscreen (the browser's requestFullscreen would
-    // paint over the mpv video surface, hiding it). Also re-fits the mpv --wid surface.
-    if (EMBED) {
-      const next = !isFullscreen;
-      window.electron?.winFullscreen(next).then((on) => {
-        setIsFullscreen(!!on);
-        setT({ s: 1, x: 0, y: 0 });
-      });
-      return;
-    }
     const el = wrapRef.current;
     if (!el) return;
     if (document.fullscreenElement) document.exitFullscreen();
     else el.requestFullscreen?.();
-  }, [isFullscreen]);
+  }, []);
 
   const isVideo = item.type === "video";
   const isAudio = item.type === "audio";
@@ -281,9 +264,9 @@ export function Lightbox({
   return (
     <div
       ref={wrapRef}
-      className={`absolute inset-0 z-40 select-none touch-none overflow-hidden transition-opacity duration-200 ${
-        EMBED ? "" : "bg-black"
-      } ${shown && !closing ? "opacity-100" : "opacity-0"} ${
+      className={`absolute inset-0 z-40 select-none touch-none overflow-hidden bg-black transition-opacity duration-200 ${
+        shown && !closing ? "opacity-100" : "opacity-0"
+      } ${
         closing ? "pointer-events-none" : ""
       } ${hideChrome ? "cursor-none" : ""}`}
       onPointerDown={onPointerDown}

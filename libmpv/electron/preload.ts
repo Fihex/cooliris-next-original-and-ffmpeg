@@ -29,11 +29,6 @@ contextBridge.exposeInMainWorld("electron", {
   // requestFullscreen, which would paint over the mpv video surface). Returns the
   // resulting fullscreen state.
   winFullscreen: (on: boolean) => ipcRenderer.invoke("win-fullscreen", on),
-  // Custom window chrome for the frameless embed window.
-  winMinimize: () => ipcRenderer.invoke("win-minimize"),
-  winMaximize: () => ipcRenderer.invoke("win-maximize"),
-  winClose: () => ipcRenderer.invoke("win-close"),
-  winIsMaximized: () => ipcRenderer.invoke("win-is-maximized"),
   // Two-window embed: main wall asks to play a video in the child window; the child
   // listens for the path; either side can close.
   playVideo: (abs: string) => ipcRenderer.invoke("play-video", abs),

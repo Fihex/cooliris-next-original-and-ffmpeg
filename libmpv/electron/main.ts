@@ -281,17 +281,6 @@ ipcMain.handle("win-fullscreen", (_e, on: boolean) => {
   win.setFullScreen(!!on);
   return win.isFullScreen();
 });
-// Custom title-bar controls for the frameless embed window (the transparency it needs to
-// show the mpv video forces frameless, so the chrome is drawn in HTML).
-ipcMain.handle("win-minimize", () => win?.minimize());
-ipcMain.handle("win-maximize", () => {
-  if (!win) return false;
-  if (win.isMaximized()) win.unmaximize();
-  else win.maximize();
-  return win.isMaximized();
-});
-ipcMain.handle("win-close", () => win?.close());
-ipcMain.handle("win-is-maximized", () => win?.isMaximized() ?? false);
 
 // Two-window embed: the main (wall) window asks to play a video → show + align the child
 // video window over the content area and tell it which file. Close → hide it, stop mpv,
