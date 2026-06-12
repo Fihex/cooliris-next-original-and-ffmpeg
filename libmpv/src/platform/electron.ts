@@ -49,6 +49,7 @@ interface ElectronBridge {
   winClose(): Promise<void>;
   winIsMaximized(): Promise<boolean>;
   playVideo(abs: string): Promise<boolean>;
+  videoReady(): Promise<void>;
   closeVideo(): Promise<void>;
   onVideoPlay(cb: (abs: string) => void): () => void;
   onVideoClosed(cb: () => void): () => void;

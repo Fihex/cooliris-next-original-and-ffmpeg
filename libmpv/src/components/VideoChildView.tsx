@@ -16,6 +16,29 @@ export function VideoChildView() {
     [],
   );
 
+  // Decode-then-show: the window is hidden while mpv loads/decodes this video; once the
+  // first frame is decoded (dwidth becomes known), reveal the window — so there's no blank
+  // window during decode. A ~2.5s fallback shows it anyway (audio-only / odd files).
+  useEffect(() => {
+    if (!play) return;
+    let done = false;
+    let tries = 0;
+    const check = async () => {
+      if (done) return;
+      const w = await window.electron?.mpvGet("dwidth");
+      if ((w && parseInt(w, 10) > 0) || ++tries >= 30) {
+        done = true;
+        window.electron?.videoReady();
+        return;
+      }
+      window.setTimeout(check, 80);
+    };
+    check();
+    return () => {
+      done = true;
+    };
+  }, [play]);
+
   const close = () => {
     setPlay(null); // unmount the player → stops mpv + frees the file while browsing
     window.electron?.closeVideo();

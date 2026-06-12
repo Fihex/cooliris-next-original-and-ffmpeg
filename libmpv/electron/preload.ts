@@ -37,6 +37,7 @@ contextBridge.exposeInMainWorld("electron", {
   // Two-window embed: main wall asks to play a video in the child window; the child
   // listens for the path; either side can close.
   playVideo: (abs: string) => ipcRenderer.invoke("play-video", abs),
+  videoReady: () => ipcRenderer.invoke("video-ready"),
   closeVideo: () => ipcRenderer.invoke("close-video"),
   onVideoPlay: (cb: (abs: string) => void) => {
     const h = (_e: unknown, abs: string) => cb(abs);

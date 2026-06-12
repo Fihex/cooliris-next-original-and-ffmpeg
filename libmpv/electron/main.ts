@@ -297,11 +297,17 @@ ipcMain.handle("win-is-maximized", () => win?.isMaximized() ?? false);
 // and let the wall return.
 ipcMain.handle("play-video", (_e, abs: string) => {
   if (!win || !videoWin) return false;
+  // Load while HIDDEN (mpv decodes the first frame off-screen); the child calls
+  // "video-ready" once the frame is decoded, and only then do we reveal the window —
+  // so you never see a blank window during decode.
+  videoWin.webContents.send("video-play", abs);
+  return true;
+});
+ipcMain.handle("video-ready", () => {
+  if (!win || !videoWin) return;
   videoWin.setBounds(win.getContentBounds());
   videoWin.show();
   videoWin.focus(); // so Space / arrows / Esc reach the player
-  videoWin.webContents.send("video-play", abs);
-  return true;
 });
 ipcMain.handle("close-video", () => {
   videoWin?.hide();
