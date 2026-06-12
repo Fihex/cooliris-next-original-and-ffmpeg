@@ -73,6 +73,12 @@ function disposeTexture(tex: THREE.Texture | null | undefined): void {
   img?.close?.(); // ImageBitmap → frees the decode; HTMLImageElement/Canvas have no close()
 }
 
+/** Current JS heap usage in MB (Chromium-only API; "?" elsewhere). */
+function heapMB(): string {
+  const m = (performance as unknown as { memory?: { usedJSHeapSize: number } }).memory;
+  return m ? Math.round(m.usedJSHeapSize / 1048576).toString() : "?";
+}
+
 export class WallScene {
   private container: HTMLElement;
   private renderer: THREE.WebGLRenderer;
@@ -89,6 +95,7 @@ export class WallScene {
   private keepEnd = -1;
   private destroyedSinceGc = 0; // tiles freed since the last idle GC nudge
   private gcTimer = 0;
+  private lastMemLog = 0; // throttle for the [wall mem] logs
   private raycaster = new THREE.Raycaster();
   private pointer = new THREE.Vector2();
   private geo = new THREE.PlaneGeometry(1, 1);
@@ -427,6 +434,7 @@ export class WallScene {
   }
   private emitProgress(): void {
     this.emit("progress", this.loadedCount, this.items.length, this.pendingCount);
+    this.logMem("load");
   }
   private emitScroll(): void {
     this.emit("scroll", this.getScrollInfo());
@@ -681,10 +689,36 @@ export class WallScene {
     clearTimeout(this.gcTimer);
     this.gcTimer = window.setTimeout(() => {
       if (this.destroyedSinceGc >= 24 && Math.abs(this.velocity) < 0.05) {
+        const freed = this.destroyedSinceGc;
         this.destroyedSinceGc = 0;
+        const before = heapMB();
         gc();
+        const info = this.renderer.info.memory;
+        console.log(
+          `[wall mem] gc (idle, ${freed} evicted): heap ${before}→${heapMB()}MB · ` +
+            `textures ${info.textures} · geometries ${info.geometries} · resident ${this.residentCount()} tiles`,
+        );
       }
     }, 700);
+  }
+
+  /** Count of tiles currently held in memory (mesh + texture). */
+  private residentCount(): number {
+    let n = 0;
+    for (const t of this.tiles) if (t) n++;
+    return n;
+  }
+
+  /** Throttled memory snapshot for diagnostics (loading / scrolling / eviction). */
+  private logMem(reason: string): void {
+    const now = performance.now();
+    if (now - this.lastMemLog < 1000) return;
+    this.lastMemLog = now;
+    const info = this.renderer.info.memory;
+    console.log(
+      `[wall mem] ${reason}: heap ${heapMB()}MB · textures ${info.textures} · ` +
+        `resident ${this.residentCount()} tiles · loaded ${this.loadedCount}/${this.items.length}`,
+    );
   }
 
   /** Swap in a higher-resolution image when a tile is focused. */
@@ -1111,6 +1145,7 @@ export class WallScene {
     }
     this.keepStart = keepFirst;
     this.keepEnd = keepLast;
+    if (Math.abs(this.velocity) > 0.05) this.logMem("scroll"); // throttled to 1/s inside
 
     // Hide tiles that scrolled out of the visible range (still resident).
     for (let i = this.visStart; i <= this.visEnd; i++) {

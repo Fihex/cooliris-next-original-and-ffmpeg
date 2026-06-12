@@ -316,6 +316,27 @@ ipcMain.handle("close-video", () => {
 ipcMain.handle("video-nav", (_e, dir: "prev" | "next") => win?.webContents.send("video-nav-main", dir));
 
 /* --------------------------------- window ----------------------------------- */
+// Always-on memory readout: every 2s print each process's *current* working set (resident
+// RAM) — the headline numbers to watch climb/settle while loading and scrolling. mpv runs in a
+// forked Node child so it isn't in getAppMetrics(); "renderer" sums all windows (wall + video).
+let memTimer: ReturnType<typeof setInterval> | null = null;
+function startMemLog(): void {
+  if (memTimer) return;
+  const mb = (kb: number) => String(Math.round(kb / 1024)).padStart(4);
+  memTimer = setInterval(() => {
+    try {
+      const m = app.getAppMetrics();
+      const sum = (type: string) =>
+        m.filter((x) => x.type === type).reduce((s, x) => s + x.memory.workingSetSize, 0);
+      console.log(
+        `[mem] browser ${mb(sum("Browser"))}MB · renderer ${mb(sum("Tab"))}MB · gpu ${mb(sum("GPU"))}MB`,
+      );
+    } catch {
+      /* ignore */
+    }
+  }, 2000);
+}
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1440,
@@ -338,6 +359,12 @@ function createWindow() {
     },
   });
   win.once("ready-to-show", () => win?.show());
+  // Surface the wall's [wall mem] diagnostics (load/scroll/gc) in the terminal too, not just
+  // DevTools, so they show alongside the periodic [mem] line under run-embed.bat.
+  win.webContents.on("console-message", (e) => {
+    if (e.message.startsWith("[wall")) console.log(e.message);
+  });
+  startMemLog();
   // Two-window mode: keep the child video window aligned to the main window's content,
   // and re-fit mpv inside it, as the user moves/resizes/maximizes.
   if (EMBED_MODE) {
