@@ -588,6 +588,7 @@ dependencies = [
  "pkg-config",
  "pollster 0.3.0",
  "rfd",
+ "walkdir",
  "wgpu",
  "winit",
 ]

@@ -148,7 +148,7 @@ fn fs(in: V) -> @location(0) vec4<f32> {
 /// Where a tile's pixels come from — an image file, a video file (shown as a play tile, played on
 /// focus), or a generated placeholder when no folder is given.
 #[derive(Clone)]
-enum Source {
+pub enum Source {
     File(PathBuf),
     Video(PathBuf),
     Placeholder(usize),
@@ -1126,12 +1126,12 @@ impl State {
         self.current_folder.as_deref()
     }
 
-    /// Swap the library to a new folder at runtime (folder-open / drag-and-drop). The generation
-    /// bump makes in-flight decodes from the old library drop on arrival; the texture pool, the
-    /// pipelines and the worker threads are all reused.
-    pub fn reload(&mut self, folder: Option<PathBuf>) {
+    /// Swap the library to a pre-scanned set of sources (scanning happens off the main thread so
+    /// a big/slow folder doesn't freeze the window). The generation bump drops in-flight decodes
+    /// from the old library; the texture pool, pipelines and worker threads are all reused.
+    pub fn reload_with(&mut self, folder: Option<PathBuf>, sources: Vec<Source>) {
         self.generation += 1;
-        self.sources = Arc::new(gather_sources(folder.clone()));
+        self.sources = Arc::new(sources);
         self.current_folder = folder;
         self.total = self.sources.len();
         self.total_cols = self.total.div_ceil(ROWS) as i64;
@@ -1147,7 +1147,7 @@ impl State {
         self.video = None;
         self.video_for = None;
         self.num_instances = 0;
-        log::info!("reloaded: {} tiles", self.total);
+        log::info!("loaded {} tiles", self.total);
     }
 
     /// Whether the Open button was clicked since the last check (main opens the picker).
@@ -1443,28 +1443,27 @@ fn video_placeholder() -> Vec<u8> {
     buf
 }
 
-/// Build the tile library from the first CLI arg (a folder of images), or placeholders.
-fn gather_sources(folder: Option<PathBuf>) -> Vec<Source> {
+/// Build the tile library from a folder, scanning subfolders too. Placeholders if none.
+pub fn gather_sources(folder: Option<PathBuf>) -> Vec<Source> {
     let Some(dir) = folder else {
         log::info!("no folder chosen — showing placeholders");
         return (0..24).map(Source::Placeholder).collect();
     };
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(e) => e,
-        Err(e) => {
-            log::warn!("can't read folder {dir:?}: {e} — showing placeholders");
-            return (0..24).map(Source::Placeholder).collect();
-        }
-    };
-    let mut paths: Vec<PathBuf> = entries
-        .flatten()
-        .map(|e| e.path())
+    // Recurse into subfolders to any depth — media is usually nested (a folder per product/album,
+    // and those may nest further). follow_links(false) means no symlink loops; the take() caps it.
+    let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(&dir)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
+        .map(walkdir::DirEntry::into_path)
         .filter(|p| classify(p).is_some())
+        .take(200_000)
         .collect();
     paths.sort();
-    log::info!("folder {dir:?}: {} media files", paths.len());
+    log::info!("folder {dir:?}: {} media files (incl. subfolders)", paths.len());
     if paths.is_empty() {
-        log::info!("no images/videos in {dir:?} — showing placeholders");
+        log::info!("no images/videos under {dir:?} — showing placeholders");
         return (0..24).map(Source::Placeholder).collect();
     }
     paths

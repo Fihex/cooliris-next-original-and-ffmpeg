@@ -43,6 +43,8 @@ env_logger = "0.11"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 # GPU text (the Open button label + the loaded/total readout). Matches wgpu 22.
 glyphon = "0.6"
+# Recursive directory walk (folders usually nest images in subfolders).
+walkdir = "2"
 
 [build-dependencies]
 # Finds + links libmpv when the `video` feature is on.
