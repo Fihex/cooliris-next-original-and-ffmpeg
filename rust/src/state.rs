@@ -144,7 +144,7 @@ fn vs(@builtin(vertex_index) i: u32) -> V {
     let p = lb.rect.xy + q * lb.rect.zw;
     var out: V;
     out.clip = vec4(p, 0.0, 1.0);
-    out.uv = vec2(q.x, 1.0 - q.y) * lb.uv_layer.xy;
+    out.uv = vec2(q.x, 1.0 - q.y) * (lb.uv_layer.xy - vec2(0.5 / 512.0, 0.5 / 512.0));
     return out;
 }
 @fragment
@@ -283,6 +283,7 @@ pub struct State {
     drag_last_y: f32,
     drag_moved: bool,
     open_requested: bool,   // the Open button was clicked (main opens the picker)
+    show_info: bool,        // info panel toggle (filename/path of the focused/hovered item)
     wall_scroll_held: bool, // an on-screen wall scroll arrow is held down
     scanning: bool,         // a folder is being picked/scanned on a worker thread
     focus: Option<usize>,      // currently-focused tile
@@ -744,6 +745,7 @@ impl State {
             drag_last_y: 0.0,
             drag_moved: false,
             open_requested: false,
+            show_info: false,
             wall_scroll_held: false,
             scanning: false,
             focus: None,
@@ -894,6 +896,19 @@ impl State {
             self.open_requested = true;
             self.drag_mode = DragMode::None;
             return;
+        }
+        // Top-right toolbar buttons: Fullscreen and Info (toggle).
+        if button == 0 {
+            if hit(self.fullscreen_btn(), x, y) {
+                self.fullscreen_requested = true;
+                self.drag_mode = DragMode::None;
+                return;
+            }
+            if hit(self.info_btn(), x, y) {
+                self.show_info = !self.show_info;
+                self.drag_mode = DragMode::None;
+                return;
+            }
         }
         // Video controls bar (when a video is focused + controls shown).
         if button == 0 && self.video.is_some() && self.video_controls_visible() {
@@ -1111,6 +1126,20 @@ impl State {
 
     pub fn take_fullscreen_request(&mut self) -> bool {
         std::mem::take(&mut self.fullscreen_requested)
+    }
+
+    pub fn toggle_info(&mut self) {
+        self.show_info = !self.show_info;
+    }
+
+    /// Top-right toolbar buttons (pixel rects): Fullscreen, then Info to its left.
+    fn fullscreen_btn(&self) -> [f32; 4] {
+        let w = self.config.width as f32;
+        [w - 12.0 - 96.0, BTN_Y, 96.0, BTN_H]
+    }
+    fn info_btn(&self) -> [f32; 4] {
+        let w = self.config.width as f32;
+        [w - 12.0 - 96.0 - 8.0 - 56.0, BTN_Y, 56.0, BTN_H]
     }
 
     /// Lightbox prev/next button rects (x, y, w, h, in pixels): (prev on the left, next on the
@@ -1748,6 +1777,52 @@ impl State {
             size: 17.0,
             color: [235, 235, 240, 255],
         }];
+        // Top-right toolbar labels.
+        let fsb = self.fullscreen_btn();
+        v.push(crate::ui::Line {
+            text: "Fullscreen".into(),
+            x: fsb[0] + 9.0,
+            y: fsb[1] + 9.0,
+            size: 15.0,
+            color: [235, 235, 240, 255],
+        });
+        let ib = self.info_btn();
+        v.push(crate::ui::Line {
+            text: "Info".into(),
+            x: ib[0] + 12.0,
+            y: ib[1] + 9.0,
+            size: 15.0,
+            color: [235, 235, 240, 255],
+        });
+        // Info panel: filename + parent folder of the focused (or hovered) item.
+        if self.show_info {
+            if let Some(i) = self.focus.or(self.hover_index) {
+                if let Some(Source::File(p) | Source::Video(p)) = self.sources.get(i) {
+                    let name = p
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let dir = p
+                        .parent()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    v.push(crate::ui::Line {
+                        text: name,
+                        x: BTN_X,
+                        y: BTN_Y + BTN_H + 10.0,
+                        size: 15.0,
+                        color: [235, 235, 240, 245],
+                    });
+                    v.push(crate::ui::Line {
+                        text: dir,
+                        x: BTN_X,
+                        y: BTN_Y + BTN_H + 30.0,
+                        size: 12.0,
+                        color: [180, 180, 190, 220],
+                    });
+                }
+            }
+        }
         let ready = self
             .resident
             .values()
@@ -2016,6 +2091,16 @@ impl State {
         rects.push(OverlayRect {
             rect: [nx(BTN_X), ny_top(BTN_Y + BTN_H), nw(BTN_W), nhh(BTN_H)],
             color: [1.0, 1.0, 1.0, 0.12],
+        });
+        // Top-right toolbar: Fullscreen + Info buttons (Info brightens when on).
+        let to_chip = |r: [f32; 4]| [nx(r[0]), ny_top(r[1] + r[3]), nw(r[2]), nhh(r[3])];
+        rects.push(OverlayRect {
+            rect: to_chip(self.fullscreen_btn()),
+            color: [1.0, 1.0, 1.0, 0.12],
+        });
+        rects.push(OverlayRect {
+            rect: to_chip(self.info_btn()),
+            color: [1.0, 1.0, 1.0, if self.show_info { 0.24 } else { 0.12 }],
         });
 
         // Edge arrow button backgrounds. Focused: prev/next (fade in, hidden at the ends). On the

@@ -46,12 +46,15 @@ fn vs_main(in: VsIn) -> VsOut {
     out.kind = in.kind;
     out.vy = in.pos.y;
 
+    // Pull the sampled rect in by half a texel so the bottom/right edge never bleeds into the
+    // unused (recycled, stale) part of the layer — that bleed showed as a thin line along edges.
+    let e = in.uv_extent - vec2<f32>(0.5 / 512.0, 0.5 / 512.0);
     if (in.kind == 1u) {
         // Reflection: mirror the image vertically (the top edge, which touches the photo, samples
         // the photo's bottom edge). The fade is computed per-pixel in the fragment shader.
-        out.uv = vec2<f32>(in.uv.x * in.uv_extent.x, (1.0 - in.uv.y) * in.uv_extent.y);
+        out.uv = vec2<f32>(in.uv.x * e.x, (1.0 - in.uv.y) * e.y);
     } else {
-        out.uv = in.uv * in.uv_extent; // sample only the used sub-rect of the layer
+        out.uv = in.uv * e; // sample only the used sub-rect of the layer
     }
     return out;
 }

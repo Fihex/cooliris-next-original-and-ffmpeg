@@ -183,6 +183,8 @@ impl ApplicationHandler for App {
                         state.set_scanning(true);
                         spawn_picker(&self.folder_tx);
                     }
+                    // I toggles the item info panel.
+                    PhysicalKey::Code(KeyCode::KeyI) if pressed => state.toggle_info(),
                     // F toggles borderless fullscreen (wall, lightbox, or video).
                     PhysicalKey::Code(KeyCode::KeyF) if pressed => {
                         let fs = match state.window.fullscreen() {
