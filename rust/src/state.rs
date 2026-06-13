@@ -267,7 +267,8 @@ pub struct State {
 
     // camera / scroll
     scroll_x: f32,
-    prev_scroll_x: f32, // last frame's scroll_x — measures real drag speed for banking
+    prev_scroll_x: f32,         // last frame's scroll_x — measures real drag speed for banking
+    scroll_target: Option<f32>, // eased scrub/slider target (smooth, derives the lean)
     velocity: f32,
     bank: f32, // eased wall lean (lags velocity so it flattens slowly, like the web)
     input_dir: f32,
@@ -728,6 +729,7 @@ impl State {
             result_rx,
             scroll_x: 0.0,
             prev_scroll_x: 0.0,
+            scroll_target: None,
             velocity: 0.0,
             bank: 0.0,
             input_dir: 0.0,
@@ -926,6 +928,7 @@ impl State {
                 } else {
                     self.input_dir = dir;
                     self.wall_scroll_held = true;
+                    self.scroll_target = None;
                 }
                 return;
             }
@@ -936,9 +939,11 @@ impl State {
             self.scrub_to(x);
         } else if button == 1 || button == 2 {
             self.drag_mode = DragMode::Pan;
+            self.scroll_target = None; // grab-pan owns scroll_x directly
         } else {
             self.drag_mode = DragMode::Scroll;
             self.velocity = 0.0;
+            self.scroll_target = None; // left-drag owns scroll_x directly
         }
     }
 
@@ -1038,10 +1043,10 @@ impl State {
     fn scrub_to(&mut self, x: f32) {
         let (pad, track_w, thumb_w) = self.scrubber_geom();
         let travel = (track_w - thumb_w).max(1.0);
-        // Center the thumb under the cursor so it tracks the pointer 1:1 (a real scrollbar grab).
+        // Center the thumb under the cursor; ease toward it (smooth, like the arrows) rather than
+        // snapping — update() animates scroll_x → this target and derives the lean.
         let frac = ((x - pad - thumb_w * 0.5) / travel).clamp(0.0, 1.0);
-        self.scroll_x = frac * self.scroll_max.max(0.0);
-        // velocity (→ lean) is measured from the real motion in update(), like a left-drag.
+        self.scroll_target = Some(frac * self.scroll_max.max(0.0));
     }
 
     fn viewport_h(&self) -> f32 {
@@ -1122,6 +1127,9 @@ impl State {
     /// Arrow keys: -1 left, +1 right, 0 released.
     pub fn set_dir(&mut self, dir: f32) {
         self.input_dir = dir;
+        if dir != 0.0 {
+            self.scroll_target = None; // arrows take over from an eased scrub
+        }
     }
 
     pub fn update(&mut self) {
@@ -1136,29 +1144,40 @@ impl State {
         // passed) to drive the bank; that measured speed then becomes the fling when you let go.
         if self.focus.is_none() {
             let max = self.scroll_max.max(0.0);
-            match self.drag_mode {
-                // Left-drag, scrubber and grab-pan all move scroll_x directly; measure the real
-                // speed so the wall leans into the motion (and keeps leaning through a pan instead
-                // of snapping flat the instant you press middle/right).
-                DragMode::Scroll | DragMode::Scrub | DragMode::Pan => {
-                    let measured = (self.scroll_x - self.prev_scroll_x) / dt.max(1e-4);
-                    self.velocity += (measured - self.velocity) * 0.35; // low-pass → stable bank
-                    self.velocity = self.velocity.clamp(-MAX_SPEED, MAX_SPEED);
+            if let Some(t) = self.scroll_target {
+                // Eased scrub/slider target → smooth motion (like the arrows) with a derived lean.
+                let old = self.scroll_x;
+                self.scroll_x = (self.scroll_x + (t - self.scroll_x) * (14.0 * dt).min(1.0)).clamp(0.0, max);
+                self.velocity = ((self.scroll_x - old) / dt.max(1e-4)).clamp(-MAX_SPEED, MAX_SPEED);
+                if self.drag_mode != DragMode::Scrub && (t - self.scroll_x).abs() < 0.004 {
+                    self.scroll_x = t.clamp(0.0, max);
+                    self.scroll_target = None;
+                    self.velocity = 0.0;
                 }
-                DragMode::Seek => self.velocity = 0.0,
-                DragMode::None => {
-                    if self.input_dir != 0.0 {
-                        self.velocity = (self.velocity + self.input_dir * ACCEL * dt)
-                            .clamp(-MAX_SPEED, MAX_SPEED);
-                    } else {
-                        self.velocity *= 0.045_f32.powf(dt); // momentum decay (matches web — eases out slowly)
-                        if self.velocity.abs() < 0.002 {
+            } else {
+                match self.drag_mode {
+                    // Left-drag and grab-pan move scroll_x directly; measure the real speed so the
+                    // wall leans into the motion (and keeps leaning through a pan, not snapping flat).
+                    DragMode::Scroll | DragMode::Pan => {
+                        let measured = (self.scroll_x - self.prev_scroll_x) / dt.max(1e-4);
+                        self.velocity += (measured - self.velocity) * 0.35; // low-pass → stable bank
+                        self.velocity = self.velocity.clamp(-MAX_SPEED, MAX_SPEED);
+                    }
+                    DragMode::Scrub | DragMode::Seek => self.velocity = 0.0,
+                    DragMode::None => {
+                        if self.input_dir != 0.0 {
+                            self.velocity = (self.velocity + self.input_dir * ACCEL * dt)
+                                .clamp(-MAX_SPEED, MAX_SPEED);
+                        } else {
+                            self.velocity *= 0.045_f32.powf(dt); // momentum decay (eases out slowly)
+                            if self.velocity.abs() < 0.002 {
+                                self.velocity = 0.0;
+                            }
+                        }
+                        self.scroll_x = (self.scroll_x + self.velocity * dt).clamp(0.0, max);
+                        if self.scroll_x <= 0.0 || self.scroll_x >= max {
                             self.velocity = 0.0;
                         }
-                    }
-                    self.scroll_x = (self.scroll_x + self.velocity * dt).clamp(0.0, max);
-                    if self.scroll_x <= 0.0 || self.scroll_x >= max {
-                        self.velocity = 0.0;
                     }
                 }
             }
@@ -1729,14 +1748,19 @@ impl State {
             size: 17.0,
             color: [235, 235, 240, 255],
         }];
+        let ready = self
+            .resident
+            .values()
+            .filter(|t| matches!(t, Tile::Ready { .. }))
+            .count();
         let status = if self.scanning {
             "scanning folder…".to_string()
         } else if self.current_folder.is_none() {
             "drop a folder here · click Open · press O".to_string()
         } else if self.inflight > 0 {
-            format!("{} items · loading…", self.total)
+            format!("{} items · {ready} loaded · {} loading", self.total, self.inflight)
         } else {
-            format!("{} items", self.total)
+            format!("{} items · {ready} loaded", self.total)
         };
         v.push(crate::ui::Line {
             text: status,

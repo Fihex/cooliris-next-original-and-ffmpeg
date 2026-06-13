@@ -29,7 +29,7 @@ struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) layer: u32,
-    @location(2) fade: f32, // reflection alpha at this vertex (1 = photo edge, 0 = far)
+    @location(2) vy: f32, // quad vertical coord (0 bottom … 1 top), interpolated per-pixel
     @location(3) @interpolate(flat) kind: u32, // 0 photo, 1 reflection, 2 placeholder skeleton
 };
 
@@ -44,16 +44,14 @@ fn vs_main(in: VsIn) -> VsOut {
     out.clip = camera.view_proj * vec4<f32>(world, 1.0);
     out.layer = in.layer;
     out.kind = in.kind;
+    out.vy = in.pos.y;
 
     if (in.kind == 1u) {
-        // Reflection: mirror the image vertically (top of the reflection, which touches the photo,
-        // samples the photo's bottom edge) and fade from the touching edge (pos.y = 1) downward.
+        // Reflection: mirror the image vertically (the top edge, which touches the photo, samples
+        // the photo's bottom edge). The fade is computed per-pixel in the fragment shader.
         out.uv = vec2<f32>(in.uv.x * in.uv_extent.x, (1.0 - in.uv.y) * in.uv_extent.y);
-        let edge = clamp((in.pos.y - 0.75) * 4.0, 0.0, 1.0); // visible over the top quarter (≈0.25 photo)
-        out.fade = edge * 0.28; // linear fade from the photo edge → peak opacity where they touch
     } else {
         out.uv = in.uv * in.uv_extent; // sample only the used sub-rect of the layer
-        out.fade = 1.0;
     }
     return out;
 }
@@ -64,5 +62,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(0.10, 0.11, 0.14, 1.0); // placeholder skeleton (shown until the image loads)
     }
     let c = textureSample(atlas, atlas_sampler, in.uv, i32(in.layer));
-    return vec4<f32>(c.rgb, c.a * in.fade);
+    var a = c.a;
+    if (in.kind == 1u) {
+        // Reflection visible only over the top quarter of the photo height, fading to nothing —
+        // computed per-pixel so the cutoff is sharp (vertex interpolation would smear it).
+        a = a * clamp((in.vy - 0.75) * 4.0, 0.0, 1.0) * 0.28;
+    }
+    return vec4<f32>(c.rgb, a);
 }
