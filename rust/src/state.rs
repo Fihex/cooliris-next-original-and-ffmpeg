@@ -270,6 +270,8 @@ pub struct State {
     scanning: bool,       // a folder is being picked/scanned on a worker thread
     focus: Option<usize>, // currently-focused tile
     focus_t: f32,         // 0 = wall, 1 = focused (animated)
+    lb_zoom: f32,         // lightbox zoom (1 = fit; wheel zooms the focused item)
+    lb_pan: [f32; 2],     // lightbox pan offset in NDC (drag moves a zoomed item)
     video: Option<crate::video::Player>, // playing the focused video tile, if any
     video_for: Option<usize>,            // which tile self.video belongs to
     last_frame: Instant,
@@ -718,6 +720,8 @@ impl State {
             scanning: false,
             focus: None,
             focus_t: 0.0,
+            lb_zoom: 1.0,
+            lb_pan: [0.0, 0.0],
             video: None,
             video_for: None,
             last_frame: Instant::now(),
@@ -746,9 +750,14 @@ impl State {
         }
     }
 
-    /// Mouse wheel: vertical = zoom (camera distance), horizontal (trackpad) = pan. Web feel.
+    /// Mouse wheel: in the lightbox it zooms the focused item; on the wall, vertical = camera
+    /// zoom, horizontal (trackpad) = pan. Web feel.
     pub fn wheel(&mut self, dx: f32, dy: f32) {
         if self.focus.is_some() {
+            // dy < 0 is scroll-up → zoom in. Fit (1.0) up to 6×.
+            let factor = (1.0 - dy * 0.0015).clamp(0.6, 1.6);
+            self.lb_zoom = (self.lb_zoom * factor).clamp(1.0, 6.0);
+            self.clamp_lb_pan();
             return;
         }
         if dx.abs() > dy.abs() {
@@ -756,6 +765,23 @@ impl State {
         } else {
             self.cam_dist_target = (self.cam_dist_target + dy * 0.01).clamp(MIN_DIST, MAX_DIST);
         }
+    }
+
+    /// Keep the lightbox pan within the zoomed item's bounds (no pan when fit).
+    fn clamp_lb_pan(&mut self) {
+        if self.lb_zoom <= 1.0 {
+            self.lb_pan = [0.0, 0.0];
+            return;
+        }
+        let m = (self.lb_zoom - 1.0) * 1.2;
+        self.lb_pan[0] = self.lb_pan[0].clamp(-m, m);
+        self.lb_pan[1] = self.lb_pan[1].clamp(-m, m);
+    }
+
+    /// Reset zoom/pan — called whenever the focused item changes.
+    fn reset_lb_view(&mut self) {
+        self.lb_zoom = 1.0;
+        self.lb_pan = [0.0, 0.0];
     }
 
     /// Pointer pressed (button: 0 left, 1 middle, 2 right). Bottom band scrubs; middle/right
@@ -816,7 +842,7 @@ impl State {
                 }
             }
             DragMode::Scroll => {
-                if dx.abs() > 2.0 {
+                if dx.abs() > 2.0 || dy.abs() > 2.0 {
                     self.drag_moved = true;
                 }
                 if self.focus.is_none() {
@@ -824,6 +850,13 @@ impl State {
                     let world = dx / h * vpw * DRAG_GAIN;
                     self.scroll_x = (self.scroll_x - world).clamp(0.0, max);
                     // velocity (for bank + release fling) is measured from real motion in update().
+                } else {
+                    // Lightbox: drag pans the (zoomed) focused item. NDC: +x right, +y up; screen
+                    // y grows down, so negate. A drag never closes the lightbox (only a click does).
+                    let w = self.config.width.max(1) as f32;
+                    self.lb_pan[0] += dx / w * 2.0;
+                    self.lb_pan[1] -= dy / h * 2.0;
+                    self.clamp_lb_pan();
                 }
             }
             DragMode::None => {}
@@ -840,6 +873,7 @@ impl State {
                 self.focus = None;
             } else if let Some(i) = self.pick(self.drag_last_x, self.drag_last_y) {
                 self.focus = Some(i);
+                self.reset_lb_view();
             }
         }
     }
@@ -1364,6 +1398,7 @@ impl State {
     pub fn navigate(&mut self, dir: i64) {
         if let (Some(f), true) = (self.focus, self.total > 0) {
             self.focus = Some((f as i64 + dir).clamp(0, self.total as i64 - 1) as usize);
+            self.reset_lb_view();
         }
     }
 
@@ -1540,13 +1575,20 @@ impl State {
         let h = self.config.height.max(1) as f32;
         let screen_aspect = w / h;
         let margin = 0.92; // leave a border around the fitted image
-        let (qw, qh) = if aspect > screen_aspect {
+        let (fitw, fith) = if aspect > screen_aspect {
             (2.0 * margin, 2.0 * margin * screen_aspect / aspect)
         } else {
             (2.0 * margin * aspect / screen_aspect, 2.0 * margin)
         };
+        // Apply lightbox zoom + pan (NDC).
+        let (qw, qh) = (fitw * self.lb_zoom, fith * self.lb_zoom);
         let u = LbUniform {
-            rect: [-qw / 2.0, -qh / 2.0, qw, qh],
+            rect: [
+                -qw / 2.0 + self.lb_pan[0],
+                -qh / 2.0 + self.lb_pan[1],
+                qw,
+                qh,
+            ],
             uv_layer: [uv[0], uv[1], layer, smoothstep(self.focus_t)],
         };
         self.queue
@@ -1693,10 +1735,16 @@ impl State {
                 rp.draw(0..6, 0..1);
             }
             // Playing video draws over its (focused) tile, sized to fill the focused view (16:9,
-            // the mpv render aspect) instead of the small tile, so it shows full-size like a photo.
+            // the mpv render aspect), with the same zoom/pan as a focused photo.
             if let (Some(v), Some(idx)) = (&self.video, self.focus) {
                 let (cx, cy) = self.tile_center(idx);
-                v.draw(&mut rp, &self.camera_bg, [cx, cy], self.video_fill_size(), &self.queue);
+                let [sw, sh] = self.video_fill_size();
+                let screen_aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+                let vph = 2.0 * (FOV_Y * 0.5).tan() * FOCUS_DIST;
+                let ox = cx + self.lb_pan[0] * vph * screen_aspect * 0.5;
+                let oy = cy + self.lb_pan[1] * vph * 0.5;
+                let size = [sw * self.lb_zoom, sh * self.lb_zoom];
+                v.draw(&mut rp, &self.camera_bg, [ox, oy], size, &self.queue);
             }
             // Lightbox: the focused image fitted + centered over the dimmed wall (full-res texture
             // once it's ready, otherwise the streamed thumbnail).
