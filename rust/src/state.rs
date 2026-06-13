@@ -50,7 +50,6 @@ const ARROW_H: f32 = 84.0;
 const ARROW_MARGIN: f32 = 18.0;
 const ACCEL: f32 = 22.0; // arrow-key acceleration (world units / s²)
 const MAX_SPEED: f32 = 11.0;
-const DAMP: f32 = 6.0; // scroll velocity damping
 const ANIM_SPEED: f32 = 4.0; // focus in/out transition speed (1 / seconds)
 
 const POOL: u32 = 128; // resident texture-array layers (fixed VRAM ceiling: POOL * 1MB)
@@ -258,17 +257,21 @@ pub struct State {
     scroll_x: f32,
     prev_scroll_x: f32, // last frame's scroll_x — measures real drag speed for banking
     velocity: f32,
+    bank: f32, // eased wall lean (lags velocity so it flattens slowly, like the web)
     input_dir: f32,
     scroll_max: f32,
     cam_dist: f32,        // current (smoothed) camera distance
     cam_dist_target: f32, // wheel-driven zoom target
     pan_y: f32,           // vertical grab-pan
+    pointer_ndc: [f32; 2], // last cursor position in NDC (zoom centers here)
+    last_vp: [f32; 2],     // previous frame's world viewport (w, h) — for zoom-toward-cursor
     drag_mode: DragMode,
     drag_last_x: f32,
     drag_last_y: f32,
     drag_moved: bool,
-    open_requested: bool, // the Open button was clicked (main opens the picker)
-    scanning: bool,       // a folder is being picked/scanned on a worker thread
+    open_requested: bool,   // the Open button was clicked (main opens the picker)
+    wall_scroll_held: bool, // an on-screen wall scroll arrow is held down
+    scanning: bool,         // a folder is being picked/scanned on a worker thread
     focus: Option<usize>, // currently-focused tile
     focus_t: f32,         // 0 = wall, 1 = focused (animated)
     lb_zoom: f32,         // lightbox zoom (1 = fit; wheel zooms the focused item)
@@ -710,16 +713,20 @@ impl State {
             scroll_x: 0.0,
             prev_scroll_x: 0.0,
             velocity: 0.0,
+            bank: 0.0,
             input_dir: 0.0,
             scroll_max,
             cam_dist: BASE_DIST,
             cam_dist_target: BASE_DIST,
             pan_y: 0.0,
+            pointer_ndc: [0.0, 0.0],
+            last_vp: [0.0, 0.0],
             drag_mode: DragMode::None,
             drag_last_x: 0.0,
             drag_last_y: 0.0,
             drag_moved: false,
             open_requested: false,
+            wall_scroll_held: false,
             scanning: false,
             focus: None,
             focus_t: 0.0,
@@ -759,9 +766,15 @@ impl State {
     /// zoom, horizontal (trackpad) = pan. Web feel.
     pub fn wheel(&mut self, dx: f32, dy: f32) {
         if self.focus.is_some() {
-            // dy < 0 is scroll-up → zoom in. Fit (1.0) up to 6×.
-            let factor = (1.0 - dy * 0.0015).clamp(0.6, 1.6);
-            self.lb_zoom = (self.lb_zoom * factor).clamp(1.0, 6.0);
+            // Zoom the focused item toward the cursor (dy < 0 is scroll-up → zoom in). Fit → 8×.
+            let old = self.lb_zoom;
+            let factor = (1.0 - dy * 0.0022).clamp(0.6, 1.7);
+            self.lb_zoom = (self.lb_zoom * factor).clamp(1.0, 8.0);
+            let ratio = self.lb_zoom / old;
+            // Keep the point under the cursor fixed as the image scales about it.
+            let p = self.pointer_ndc;
+            self.lb_pan[0] = p[0] - (p[0] - self.lb_pan[0]) * ratio;
+            self.lb_pan[1] = p[1] - (p[1] - self.lb_pan[1]) * ratio;
             self.clamp_lb_pan();
             return;
         }
@@ -778,7 +791,9 @@ impl State {
             self.lb_pan = [0.0, 0.0];
             return;
         }
-        let m = (self.lb_zoom - 1.0) * 1.2;
+        // The fitted image is ~0.92 of the screen half-extent; at zoom z it overflows by ~(z·0.92−1)
+        // on each side. Allow panning that far so you can reach every edge (but not into the void).
+        let m = (self.lb_zoom * 0.92 - 1.0).max(0.0);
         self.lb_pan[0] = self.lb_pan[0].clamp(-m, m);
         self.lb_pan[1] = self.lb_pan[1].clamp(-m, m);
     }
@@ -801,17 +816,20 @@ impl State {
             self.drag_mode = DragMode::None;
             return;
         }
-        // Lightbox prev/next arrow buttons (only while an item is open).
-        if button == 0 && self.focus.is_some() {
+        // Edge arrow buttons. Focused: prev/next item. On the wall: hold to scroll left/right.
+        if button == 0 && (self.focus.is_some() || self.scroll_max > 0.0) {
             let (prev, next) = self.arrow_rects();
-            if hit(prev, x, y) {
-                self.navigate(-1);
+            let on_prev = hit(prev, x, y);
+            let on_next = hit(next, x, y);
+            if on_prev || on_next {
                 self.drag_mode = DragMode::None;
-                return;
-            }
-            if hit(next, x, y) {
-                self.navigate(1);
-                self.drag_mode = DragMode::None;
+                let dir = if on_prev { -1.0 } else { 1.0 };
+                if self.focus.is_some() {
+                    self.navigate(dir as i64);
+                } else {
+                    self.input_dir = dir;
+                    self.wall_scroll_held = true;
+                }
                 return;
             }
         }
@@ -828,6 +846,10 @@ impl State {
     }
 
     pub fn pointer_move(&mut self, x: f32, y: f32) {
+        // Track the cursor in NDC (y up) every move so wheel-zoom can center on it.
+        let w0 = self.config.width.max(1) as f32;
+        let h0 = self.config.height.max(1) as f32;
+        self.pointer_ndc = [x / w0 * 2.0 - 1.0, 1.0 - y / h0 * 2.0];
         if self.drag_mode == DragMode::None {
             return;
         }
@@ -870,6 +892,10 @@ impl State {
 
     /// Pointer released: a left press with no drag is a click → select / deselect.
     pub fn pointer_up(&mut self, _button: u8) {
+        if self.wall_scroll_held {
+            self.input_dir = 0.0; // stop the held edge-arrow scroll
+            self.wall_scroll_held = false;
+        }
         let mode = self.drag_mode;
         self.drag_mode = DragMode::None;
         if mode == DragMode::Scroll && !self.drag_moved {
@@ -902,7 +928,7 @@ impl State {
         // Center the thumb under the cursor so it tracks the pointer 1:1 (a real scrollbar grab).
         let frac = ((x - pad - thumb_w * 0.5) / travel).clamp(0.0, 1.0);
         self.scroll_x = frac * self.scroll_max.max(0.0);
-        self.velocity = 0.0;
+        // velocity (→ lean) is measured from the real motion in update(), like a left-drag.
     }
 
     fn viewport_h(&self) -> f32 {
@@ -953,19 +979,21 @@ impl State {
         if self.focus.is_none() {
             let max = self.scroll_max.max(0.0);
             match self.drag_mode {
-                DragMode::Scroll => {
+                // Left-drag and scrubber both own scroll_x directly; measure the real speed so the
+                // wall leans into the motion (the scrubber drives the lean too, like the web).
+                DragMode::Scroll | DragMode::Scrub => {
                     let measured = (self.scroll_x - self.prev_scroll_x) / dt.max(1e-4);
                     self.velocity += (measured - self.velocity) * 0.35; // low-pass → stable bank
                     self.velocity = self.velocity.clamp(-MAX_SPEED, MAX_SPEED);
                 }
-                DragMode::Scrub | DragMode::Pan => self.velocity = 0.0, // direct control, no bank
+                DragMode::Pan => self.velocity = 0.0,
                 DragMode::None => {
                     if self.input_dir != 0.0 {
                         self.velocity = (self.velocity + self.input_dir * ACCEL * dt)
                             .clamp(-MAX_SPEED, MAX_SPEED);
                     } else {
-                        self.velocity *= (1.0 - DAMP * dt).max(0.0);
-                        if self.velocity.abs() < 0.001 {
+                        self.velocity *= 0.045_f32.powf(dt); // momentum decay (matches web — eases out slowly)
+                        if self.velocity.abs() < 0.002 {
                             self.velocity = 0.0;
                         }
                     }
@@ -979,6 +1007,14 @@ impl State {
             self.velocity = 0.0;
         }
         self.prev_scroll_x = self.scroll_x;
+        // Ease the wall's lean toward the velocity-driven target so it flattens gradually (rather
+        // than snapping flat the instant you stop), matching the web's banking.
+        let bank_target = if self.focus.is_some() {
+            0.0
+        } else {
+            (self.velocity.signum() * self.velocity.abs().sqrt() * BANK_GAIN).clamp(-BANK_MAX, BANK_MAX)
+        };
+        self.bank += (bank_target - self.bank) * (6.0 * dt).min(1.0);
 
         // --- focus in/out transition ---
         let target_t = if self.focus.is_some() { 1.0 } else { 0.0 };
@@ -996,6 +1032,21 @@ impl State {
             self.cam_dist_target
         };
         self.cam_dist += (target_dist - self.cam_dist) * (6.0 * dt).min(1.0);
+
+        // Zoom toward the cursor: as the viewport shrinks/grows with the zoom, shift the wall so the
+        // world point under the pointer stays put (matches the web). Only on the wall, not focused.
+        let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+        let vph = self.viewport_h();
+        let vpw = vph * aspect;
+        if self.focus.is_none() && self.last_vp[0] > 0.0 {
+            let dw = self.last_vp[0] - vpw;
+            let dh = self.last_vp[1] - vph;
+            let max = self.scroll_max.max(0.0);
+            self.scroll_x = (self.scroll_x + self.pointer_ndc[0] * dw * 0.5).clamp(0.0, max);
+            self.pan_y = (self.pan_y + self.pointer_ndc[1] * dh * 0.5).clamp(-PAN_Y_MAX, PAN_Y_MAX);
+            self.prev_scroll_x = self.scroll_x; // zoom shift isn't a drag — don't let it bank
+        }
+        self.last_vp = [vpw, vph];
 
         // --- drain finished decodes: assign a layer + upload, or drop if no longer wanted ---
         // Cap GPU uploads per frame: a fast scroll can finish many decodes at once, and uploading
@@ -1324,10 +1375,8 @@ impl State {
         let tgt = Vec3::new(ex, ey, 0.0);
         let view = Mat4::look_at_rh(eye, tgt, Vec3::Y);
 
-        // Bank: sqrt(|velocity|) swing as you scroll (banks on slow scroll too), faded out on focus.
-        let v = self.velocity;
-        let bank =
-            (v.signum() * v.abs().sqrt() * BANK_GAIN).clamp(-BANK_MAX, BANK_MAX) * (1.0 - s);
+        // Bank: the eased lean (set in update from velocity), faded out as a tile is focused.
+        let bank = self.bank * (1.0 - s);
         let pivot = Vec3::new(ex, 0.0, 0.0);
         let model = Mat4::from_translation(pivot)
             * Mat4::from_rotation_y(bank)
@@ -1538,6 +1587,24 @@ impl State {
                 });
             }
         } else {
+            // On-screen left/right scroll arrows (hold to scroll), when the wall is scrollable.
+            if self.scroll_max > 0.0 {
+                let (prev, next) = self.arrow_rects();
+                v.push(crate::ui::Line {
+                    text: "‹".into(),
+                    x: prev[0] + ARROW_W * 0.5 - 9.0,
+                    y: prev[1] + ARROW_H * 0.5 - 30.0,
+                    size: 46.0,
+                    color: [235, 235, 240, 210],
+                });
+                v.push(crate::ui::Line {
+                    text: "›".into(),
+                    x: next[0] + ARROW_W * 0.5 - 9.0,
+                    y: next[1] + ARROW_H * 0.5 - 30.0,
+                    size: 46.0,
+                    color: [235, 235, 240, 210],
+                });
+            }
             // Big centered "Loading…" right after opening a folder, while the first tiles decode.
             let ready = self
                 .resident
@@ -1626,10 +1693,11 @@ impl State {
             color: [1.0, 1.0, 1.0, 0.12],
         });
 
-        // Lightbox prev/next button backgrounds — fade in with the focus, hidden at the ends.
+        // Edge arrow button backgrounds. Focused: prev/next (fade in, hidden at the ends). On the
+        // wall: left/right scroll buttons (when scrollable).
+        let to_ndc = |r: [f32; 4]| [nx(r[0]), ny_top(r[1] + r[3]), nw(r[2]), nhh(r[3])];
+        let (prev, next) = self.arrow_rects();
         if let Some(f) = self.focus {
-            let to_ndc = |r: [f32; 4]| [nx(r[0]), ny_top(r[1] + r[3]), nw(r[2]), nhh(r[3])];
-            let (prev, next) = self.arrow_rects();
             if f > 0 {
                 rects.push(OverlayRect {
                     rect: to_ndc(prev),
@@ -1642,21 +1710,14 @@ impl State {
                     color: [1.0, 1.0, 1.0, 0.14 * s],
                 });
             }
-        }
-
-        // Top loading bar — shown while tiles are actively decoding; grows as the visible window
-        // fills in, then disappears. (A virtualized wall never loads the whole library at once.)
-        if self.inflight > 0 {
-            let ready = self
-                .resident
-                .values()
-                .filter(|t| matches!(t, Tile::Ready { .. }))
-                .count();
-            let frac = (ready as f32 / self.resident.len().max(1) as f32).max(0.05);
-            let ph = nhh(3.0);
+        } else if self.scroll_max > 0.0 {
             rects.push(OverlayRect {
-                rect: [-1.0, 1.0 - ph, 2.0 * frac, ph],
-                color: [0.3, 0.6, 1.0, 0.95],
+                rect: to_ndc(prev),
+                color: [1.0, 1.0, 1.0, 0.10],
+            });
+            rects.push(OverlayRect {
+                rect: to_ndc(next),
+                color: [1.0, 1.0, 1.0, 0.10],
             });
         }
 

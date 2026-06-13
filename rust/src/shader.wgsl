@@ -47,8 +47,8 @@ fn vs_main(in: VsIn) -> VsOut {
         // Reflection: mirror the image vertically (top of the reflection, which touches the photo,
         // samples the photo's bottom edge) and fade from the touching edge (pos.y = 1) downward.
         out.uv = vec2<f32>(in.uv.x * in.uv_extent.x, (1.0 - in.uv.y) * in.uv_extent.y);
-        let edge = clamp((in.pos.y - 0.5) * 2.0, 0.0, 1.0); // visible over the top half only
-        out.fade = edge * edge * 0.18; // peak reflection opacity where it touches the photo (subtle)
+        let edge = clamp((in.pos.y - 0.5) * 2.0, 0.0, 1.0); // visible over the top half (≈0.5 photo)
+        out.fade = edge * 0.28; // linear fade from the photo edge → peak opacity where they touch
     } else {
         out.uv = in.uv * in.uv_extent; // sample only the used sub-rect of the layer
         out.fade = 1.0;
