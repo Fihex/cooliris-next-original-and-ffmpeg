@@ -188,6 +188,33 @@ struct VideoUi {
     full: [f32; 4],
 }
 
+/// Library sort order (cycled by the Sort toolbar button).
+#[derive(Clone, Copy, PartialEq)]
+enum SortMode {
+    NameAsc,
+    NameDesc,
+    DateNew,
+    DateOld,
+}
+impl SortMode {
+    fn label(self) -> &'static str {
+        match self {
+            SortMode::NameAsc => "Sort: Name \u{2191}",
+            SortMode::NameDesc => "Sort: Name \u{2193}",
+            SortMode::DateNew => "Sort: Date \u{2193}",
+            SortMode::DateOld => "Sort: Date \u{2191}",
+        }
+    }
+    fn next(self) -> SortMode {
+        match self {
+            SortMode::NameAsc => SortMode::NameDesc,
+            SortMode::NameDesc => SortMode::DateNew,
+            SortMode::DateNew => SortMode::DateOld,
+            SortMode::DateOld => SortMode::NameAsc,
+        }
+    }
+}
+
 /// Which texture the lightbox pass should bind for the focused image.
 enum LbDraw {
     None,
@@ -284,6 +311,7 @@ pub struct State {
     drag_moved: bool,
     open_requested: bool,   // the Open button was clicked (main opens the picker)
     show_info: bool,        // info panel toggle (filename/path of the focused/hovered item)
+    sort_mode: SortMode,    // current library sort order
     wall_scroll_held: bool, // an on-screen wall scroll arrow is held down
     scanning: bool,         // a folder is being picked/scanned on a worker thread
     focus: Option<usize>,      // currently-focused tile
@@ -350,7 +378,7 @@ impl State {
         surface.configure(&device, &config);
 
         // --- library (paths only — cheap, even for 16k) ---
-        let sources = Arc::new(gather_sources(folder.clone()));
+        let sources = Arc::new(sort_sources(gather_sources(folder.clone()), SortMode::NameAsc));
         let total = sources.len();
         let total_cols = (total.div_ceil(ROWS)) as i64;
         let scroll_max = (total_cols - 1).max(0) as f32 * CELL_X;
@@ -746,6 +774,7 @@ impl State {
             drag_moved: false,
             open_requested: false,
             show_info: false,
+            sort_mode: SortMode::NameAsc,
             wall_scroll_held: false,
             scanning: false,
             focus: None,
@@ -897,7 +926,7 @@ impl State {
             self.drag_mode = DragMode::None;
             return;
         }
-        // Top-right toolbar buttons: Fullscreen and Info (toggle).
+        // Top-right toolbar buttons: Fullscreen, Info (toggle), Sort (cycle).
         if button == 0 {
             if hit(self.fullscreen_btn(), x, y) {
                 self.fullscreen_requested = true;
@@ -906,6 +935,11 @@ impl State {
             }
             if hit(self.info_btn(), x, y) {
                 self.show_info = !self.show_info;
+                self.drag_mode = DragMode::None;
+                return;
+            }
+            if hit(self.sort_btn(), x, y) {
+                self.cycle_sort();
                 self.drag_mode = DragMode::None;
                 return;
             }
@@ -1132,7 +1166,23 @@ impl State {
         self.show_info = !self.show_info;
     }
 
-    /// Top-right toolbar buttons (pixel rects): Fullscreen, then Info to its left.
+    /// Cycle the library sort order and re-sort in place.
+    pub fn cycle_sort(&mut self) {
+        self.sort_mode = self.sort_mode.next();
+        self.apply_sort();
+    }
+
+    fn apply_sort(&mut self) {
+        if self.sources.is_empty() {
+            return;
+        }
+        // reload_with sorts the sources by self.sort_mode, so just hand it the current set.
+        let folder = self.current_folder.clone();
+        let srcs: Vec<Source> = (*self.sources).clone();
+        self.reload_with(folder, srcs);
+    }
+
+    /// Top-right toolbar buttons (pixel rects), right-to-left: Fullscreen, Info, Sort.
     fn fullscreen_btn(&self) -> [f32; 4] {
         let w = self.config.width as f32;
         [w - 12.0 - 96.0, BTN_Y, 96.0, BTN_H]
@@ -1140,6 +1190,10 @@ impl State {
     fn info_btn(&self) -> [f32; 4] {
         let w = self.config.width as f32;
         [w - 12.0 - 96.0 - 8.0 - 56.0, BTN_Y, 56.0, BTN_H]
+    }
+    fn sort_btn(&self) -> [f32; 4] {
+        let w = self.config.width as f32;
+        [w - 12.0 - 96.0 - 8.0 - 56.0 - 8.0 - 120.0, BTN_Y, 120.0, BTN_H]
     }
 
     /// Lightbox prev/next button rects (x, y, w, h, in pixels): (prev on the left, next on the
@@ -1738,7 +1792,7 @@ impl State {
     /// from the old library; the texture pool, pipelines and worker threads are all reused.
     pub fn reload_with(&mut self, folder: Option<PathBuf>, sources: Vec<Source>) {
         self.generation += 1;
-        self.sources = Arc::new(sources);
+        self.sources = Arc::new(sort_sources(sources, self.sort_mode));
         self.current_folder = folder;
         self.total = self.sources.len();
         self.total_cols = self.total.div_ceil(ROWS) as i64;
@@ -1794,6 +1848,16 @@ impl State {
             size: 15.0,
             color: [235, 235, 240, 255],
         });
+        if self.total > 0 {
+            let sb = self.sort_btn();
+            v.push(crate::ui::Line {
+                text: self.sort_mode.label().into(),
+                x: sb[0] + 10.0,
+                y: sb[1] + 9.0,
+                size: 14.0,
+                color: [235, 235, 240, 255],
+            });
+        }
         // Info panel: filename + parent folder of the focused (or hovered) item.
         if self.show_info {
             if let Some(i) = self.focus.or(self.hover_index) {
@@ -2102,6 +2166,12 @@ impl State {
             rect: to_chip(self.info_btn()),
             color: [1.0, 1.0, 1.0, if self.show_info { 0.24 } else { 0.12 }],
         });
+        if self.total > 0 {
+            rects.push(OverlayRect {
+                rect: to_chip(self.sort_btn()),
+                color: [1.0, 1.0, 1.0, 0.12],
+            });
+        }
 
         // Edge arrow button backgrounds. Focused: prev/next (fade in, hidden at the ends). On the
         // wall: left/right scroll buttons (when scrollable).
@@ -2473,6 +2543,49 @@ fn smoothstep(t: f32) -> f32 {
 /// Point-in-rect test for a pixel-space (x, y, w, h) rect.
 fn hit(rect: [f32; 4], x: f32, y: f32) -> bool {
     x >= rect[0] && x <= rect[0] + rect[2] && y >= rect[1] && y <= rect[1] + rect[3]
+}
+
+/// Sort a library by name or modified-date. Decorate–sort–undecorate so each file's name/date is
+/// read once, not on every comparison (matters for large libraries with the date modes).
+fn sort_sources(srcs: Vec<Source>, mode: SortMode) -> Vec<Source> {
+    let path = |s: &Source| match s {
+        Source::File(p) | Source::Video(p) => Some(p.clone()),
+        Source::Placeholder(_) => None,
+    };
+    match mode {
+        SortMode::NameAsc | SortMode::NameDesc => {
+            let mut keyed: Vec<(String, Source)> = srcs
+                .into_iter()
+                .map(|s| {
+                    let k = path(&s)
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+                        .unwrap_or_default();
+                    (k, s)
+                })
+                .collect();
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            if mode == SortMode::NameDesc {
+                keyed.reverse();
+            }
+            keyed.into_iter().map(|(_, s)| s).collect()
+        }
+        SortMode::DateNew | SortMode::DateOld => {
+            let mut keyed: Vec<(Option<std::time::SystemTime>, Source)> = srcs
+                .into_iter()
+                .map(|s| {
+                    let k = path(&s)
+                        .and_then(|p| std::fs::metadata(p).ok())
+                        .and_then(|m| m.modified().ok());
+                    (k, s)
+                })
+                .collect();
+            keyed.sort_by(|a, b| a.0.cmp(&b.0));
+            if mode == SortMode::DateNew {
+                keyed.reverse();
+            }
+            keyed.into_iter().map(|(_, s)| s).collect()
+        }
+    }
 }
 
 /// Seconds → "M:SS" (or "H:MM:SS").
