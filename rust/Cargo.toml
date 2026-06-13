@@ -18,6 +18,9 @@ path = "src/bin/video.rs"
 required-features = ["video"]
 
 [features]
+# Video is on by default now (libmpv is expected to be installed). On a machine without libmpv,
+# build the wall-only variant with `cargo build --no-default-features`.
+default = ["video"]
 # Enables the libmpv video path (and links libmpv via build.rs).
 video = []
 

@@ -37,6 +37,12 @@ mod stub {
             false
         }
         pub fn seek(&self, _secs: f64) {}
+        pub fn aid(&self) -> i64 {
+            0
+        }
+        pub fn sid(&self) -> i64 {
+            0
+        }
         #[allow(clippy::too_many_arguments)]
         pub fn draw<'a>(
             &'a self,
@@ -87,6 +93,7 @@ mod real {
     const API_TYPE: c_int = 1;
     const INVALID: c_int = 0;
     const FORMAT_FLAG: c_int = 3; // MPV_FORMAT_FLAG  (int*)
+    const FORMAT_INT64: c_int = 4; // MPV_FORMAT_INT64 (int64*)
     const FORMAT_DOUBLE: c_int = 5; // MPV_FORMAT_DOUBLE (double*)
 
     extern "C" {
@@ -384,6 +391,26 @@ fn fs(in: V) -> @location(0) vec4<f32> {
         pub fn seek(&self, secs: f64) {
             let s = format!("{secs:.3}");
             self.command(&["seek", &s, "absolute"]);
+        }
+
+        fn get_int(&self, name: &[u8]) -> i64 {
+            let mut out: i64 = 0;
+            unsafe {
+                mpv_get_property(
+                    self.mpv,
+                    name.as_ptr() as *const c_char,
+                    FORMAT_INT64,
+                    &mut out as *mut i64 as *mut c_void,
+                );
+            }
+            out
+        }
+        /// Current audio / subtitle track ids (0 = none/off).
+        pub fn aid(&self) -> i64 {
+            self.get_int(b"aid\0")
+        }
+        pub fn sid(&self) -> i64 {
+            self.get_int(b"sid\0")
         }
 
         pub fn update(&mut self, _device: &wgpu::Device, queue: &wgpu::Queue) {

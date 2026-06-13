@@ -24,8 +24,8 @@ const FULL_PX: u32 = 2048; // full-res size decoded for the focused photo (crisp
 const ROWS: usize = 3;
 const TILE: f32 = 1.0; // row height (ROW_H)
 const MAX_W: f32 = 1.55; // widest a landscape tile may get
-const GAP_X: f32 = 0.16;
-const GAP_Y: f32 = 0.16;
+const GAP_X: f32 = 0.10; // tighter than the web's 0.16 — items sit closer together
+const GAP_Y: f32 = 0.10;
 const CELL_X: f32 = MAX_W + GAP_X; // column pitch (1.71)
 const CELL_Y: f32 = TILE + GAP_Y;
 const DEFAULT_ASPECT: f32 = 1.4; // assumed aspect before a tile's image has decoded
@@ -56,9 +56,9 @@ const ANIM_SPEED: f32 = 4.0; // focus in/out transition speed (1 / seconds)
 const POOL: u32 = 128; // resident texture-array layers (fixed VRAM ceiling: POOL * 1MB)
 const INSTANCE_CAP: u64 = POOL as u64 * 2; // photos + their reflections (bottom row adds ~POOL/3)
 const KEEP_COLS: i64 = 16; // columns kept resident on each side of the camera
-const MAX_INFLIGHT: usize = 8; // concurrent decodes (throttle, like the JS MAX_INFLIGHT)
-const MAX_UPLOADS_PER_FRAME: usize = 4; // GPU texture uploads/frame (spread bursts → smooth scroll)
-const WORKERS: usize = 4; // decode threads
+const MAX_INFLIGHT: usize = 16; // concurrent decodes in flight (fills the wall faster on scroll)
+const MAX_UPLOADS_PER_FRAME: usize = 6; // GPU texture uploads/frame (spread bursts → smooth scroll)
+const WORKERS: usize = 6; // decode threads (≈ cores − 2, leaving room for render/UI)
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -284,10 +284,12 @@ pub struct State {
     open_requested: bool,   // the Open button was clicked (main opens the picker)
     wall_scroll_held: bool, // an on-screen wall scroll arrow is held down
     scanning: bool,         // a folder is being picked/scanned on a worker thread
-    focus: Option<usize>, // currently-focused tile
-    focus_t: f32,         // 0 = wall, 1 = focused (animated)
-    lb_zoom: f32,         // lightbox zoom (1 = fit; wheel zooms the focused item)
-    lb_pan: [f32; 2],     // lightbox pan offset in NDC (drag moves a zoomed item)
+    focus: Option<usize>,      // currently-focused tile
+    focus_t: f32,              // 0 = wall, 1 = focused (animated)
+    hover_index: Option<usize>,         // tile under the cursor (wall only)
+    hover_scales: HashMap<usize, f32>,  // per-tile eased zoom (smooth grow/shrink, no snapping)
+    lb_zoom: f32,              // lightbox zoom (1 = fit; wheel zooms the focused item)
+    lb_pan: [f32; 2],          // lightbox pan offset in NDC (drag moves a zoomed item)
     video: Option<crate::video::Player>, // playing the focused video tile, if any
     video_for: Option<usize>,            // which tile self.video belongs to
     last_activity: Instant,              // last pointer activity — video controls auto-hide on idle
@@ -744,6 +746,8 @@ impl State {
             scanning: false,
             focus: None,
             focus_t: 0.0,
+            hover_index: None,
+            hover_scales: HashMap::new(),
             lb_zoom: 1.0,
             lb_pan: [0.0, 0.0],
             video: None,
@@ -847,6 +851,25 @@ impl State {
         Some([-qw / 2.0 + self.lb_pan[0], -qh / 2.0 + self.lb_pan[1], qw, qh])
     }
 
+    /// Hover tooltip: the hovered item's filename + where to draw it (above the cursor).
+    fn hover_label(&self) -> Option<(String, f32, f32)> {
+        if self.focus.is_some() {
+            return None;
+        }
+        let i = self.hover_index?;
+        let name = match self.sources.get(i)? {
+            Source::File(p) | Source::Video(p) => {
+                p.file_name().map(|s| s.to_string_lossy().into_owned())?
+            }
+            Source::Placeholder(_) => return None,
+        };
+        let w = self.config.width as f32;
+        let h = self.config.height as f32;
+        let px = (self.pointer_ndc[0] + 1.0) * 0.5 * w;
+        let py = (1.0 - self.pointer_ndc[1]) * 0.5 * h;
+        Some((name, px, py - 36.0))
+    }
+
     /// True if a screen-space pixel falls on the focused image (vs the empty/dim area).
     fn click_on_lightbox_image(&self, x: f32, y: f32) -> bool {
         let Some(r) = self.lightbox_rect_ndc() else {
@@ -926,8 +949,15 @@ impl State {
         self.pointer_ndc = [x / w0 * 2.0 - 1.0, 1.0 - y / h0 * 2.0];
         self.last_activity = Instant::now(); // any motion un-hides the video controls
         if self.drag_mode == DragMode::None {
+            // Hover (wall only): the tile under the cursor zooms in place + shows its name.
+            self.hover_index = if self.focus.is_none() {
+                self.pick(x, y)
+            } else {
+                None
+            };
             return;
         }
+        self.hover_index = None; // no hover while dragging
         let dx = x - self.drag_last_x;
         let dy = y - self.drag_last_y;
         self.drag_last_x = x;
@@ -938,9 +968,17 @@ impl State {
             DragMode::Seek => self.seek_to_x(x),
             DragMode::Scrub => self.scrub_to(x),
             DragMode::Pan => {
-                let vph = self.viewport_h();
-                self.pan_y = (self.pan_y + dy / h * vph).clamp(-PAN_Y_MAX, PAN_Y_MAX);
-                if self.focus.is_none() {
+                if self.focus.is_some() {
+                    // Lightbox: middle/right-drag is the grab-to-move for the zoomed item (NDC:
+                    // +x right, +y up; screen y grows down → negate).
+                    let w = self.config.width.max(1) as f32;
+                    self.lb_pan[0] += dx / w * 2.0;
+                    self.lb_pan[1] -= dy / h * 2.0;
+                    self.clamp_lb_pan();
+                } else {
+                    // Wall: free grab-pan (vertical + horizontal).
+                    let vph = self.viewport_h();
+                    self.pan_y = (self.pan_y + dy / h * vph).clamp(-PAN_Y_MAX, PAN_Y_MAX);
                     self.scroll_x = (self.scroll_x - dx / h * vph).clamp(0.0, max);
                 }
             }
@@ -948,18 +986,13 @@ impl State {
                 if dx.abs() > 2.0 || dy.abs() > 2.0 {
                     self.drag_moved = true;
                 }
+                // Left-drag scrolls the wall; in the lightbox it does nothing (use middle/right to
+                // pan), and a left *click* on empty space closes — handled in pointer_up.
                 if self.focus.is_none() {
                     let vpw = self.viewport_h() * (self.config.width.max(1) as f32 / h);
                     let world = dx / h * vpw * DRAG_GAIN;
                     self.scroll_x = (self.scroll_x - world).clamp(0.0, max);
                     // velocity (for bank + release fling) is measured from real motion in update().
-                } else {
-                    // Lightbox: drag pans the (zoomed) focused item. NDC: +x right, +y up; screen
-                    // y grows down, so negate. A drag never closes the lightbox (only a click does).
-                    let w = self.config.width.max(1) as f32;
-                    self.lb_pan[0] += dx / w * 2.0;
-                    self.lb_pan[1] -= dy / h * 2.0;
-                    self.clamp_lb_pan();
                 }
             }
             DragMode::None => {}
@@ -1022,11 +1055,10 @@ impl State {
         let vph = 2.0 * (FOV_Y * 0.5).tan() * FOCUS_DIST;
         let vpw = vph * screen_aspect;
         let va = 16.0 / 9.0;
-        let m = 0.96; // small margin
         if va > screen_aspect {
-            [vpw * m, vpw * m / va]
+            [vpw, vpw / va] // fill width
         } else {
-            [vph * m * va, vph * m]
+            [vph * va, vph] // fill height
         }
     }
 
@@ -1105,14 +1137,15 @@ impl State {
         if self.focus.is_none() {
             let max = self.scroll_max.max(0.0);
             match self.drag_mode {
-                // Left-drag and scrubber both own scroll_x directly; measure the real speed so the
-                // wall leans into the motion (the scrubber drives the lean too, like the web).
-                DragMode::Scroll | DragMode::Scrub => {
+                // Left-drag, scrubber and grab-pan all move scroll_x directly; measure the real
+                // speed so the wall leans into the motion (and keeps leaning through a pan instead
+                // of snapping flat the instant you press middle/right).
+                DragMode::Scroll | DragMode::Scrub | DragMode::Pan => {
                     let measured = (self.scroll_x - self.prev_scroll_x) / dt.max(1e-4);
                     self.velocity += (measured - self.velocity) * 0.35; // low-pass → stable bank
                     self.velocity = self.velocity.clamp(-MAX_SPEED, MAX_SPEED);
                 }
-                DragMode::Pan | DragMode::Seek => self.velocity = 0.0,
+                DragMode::Seek => self.velocity = 0.0,
                 DragMode::None => {
                     if self.input_dir != 0.0 {
                         self.velocity = (self.velocity + self.input_dir * ACCEL * dt)
@@ -1141,6 +1174,24 @@ impl State {
             (self.velocity.signum() * self.velocity.abs().sqrt() * BANK_GAIN).clamp(-BANK_MAX, BANK_MAX)
         };
         self.bank += (bank_target - self.bank) * (6.0 * dt).min(1.0);
+
+        // Ease each tile's hover zoom independently so moving between tiles is smooth (the one
+        // under the cursor grows toward 1.12, the rest shrink back to 1.0 and are then dropped).
+        let hovered = if self.focus.is_none() {
+            self.hover_index
+        } else {
+            None
+        };
+        if let Some(i) = hovered {
+            self.hover_scales.entry(i).or_insert(1.0);
+        }
+        let k = (10.0 * dt).min(1.0);
+        self.hover_scales.retain(|&idx, sc| {
+            let target = if Some(idx) == hovered { 1.12 } else { 1.0 };
+            *sc += (target - *sc) * k;
+            // keep while still animating or actively hovered
+            Some(idx) == hovered || (*sc - 1.0).abs() > 0.004
+        });
 
         // --- focus in/out transition ---
         let target_t = if self.focus.is_some() { 1.0 } else { 0.0 };
@@ -1435,6 +1486,7 @@ impl State {
         let mut refl: Vec<Instance> = Vec::new();
         let mut placeholders: Vec<Instance> = Vec::new();
         let mut photos: Vec<Instance> = Vec::new();
+        let mut hovered: Option<Instance> = None; // drawn last so it sits above its neighbours
         let (first, last) = self.window_cols();
         for col in first..=last {
             for row in 0..ROWS {
@@ -1448,13 +1500,21 @@ impl State {
                 let baseline = row_baseline(row);
                 if let Some(Tile::Ready { layer, aspect, uv }) = self.resident.get(&i) {
                     let (w, h) = size_for(*aspect);
-                    photos.push(Instance {
+                    // Hover zoom-in-place (scales about the tile's center); the actively hovered
+                    // tile draws last so it sits above its neighbours.
+                    let sc = self.hover_scales.get(&i).copied().unwrap_or(1.0);
+                    let inst = Instance {
                         offset: [cx, baseline + h * 0.5],
-                        size: [w, h],
+                        size: [w * sc, h * sc],
                         layer: *layer,
                         uv_extent: *uv,
                         kind: 0,
-                    });
+                    };
+                    if self.hover_index == Some(i) {
+                        hovered = Some(inst);
+                    } else {
+                        photos.push(inst);
+                    }
                     // The bottom row sits on glass: a mirrored, fading copy hangs beneath it.
                     if row == ROWS - 1 {
                         refl.push(Instance {
@@ -1478,9 +1538,10 @@ impl State {
                 }
             }
         }
-        // Paint order: reflections (behind), then skeletons, then photos.
+        // Paint order: reflections (behind), then skeletons, then photos, then the hovered tile.
         refl.extend(placeholders);
         refl.extend(photos);
+        refl.extend(hovered);
         refl.truncate(INSTANCE_CAP as usize);
         self.num_instances = refl.len() as u32;
         if !refl.is_empty() {
@@ -1765,16 +1826,22 @@ impl State {
                     size: 14.0,
                     color: [225, 225, 230, 235],
                 });
+                let trk = |id: i64| if id > 0 { id.to_string() } else { "–".into() };
+                let (aid, sid) = self
+                    .video
+                    .as_ref()
+                    .map(|v| (v.aid(), v.sid()))
+                    .unwrap_or((0, 0));
                 v.push(crate::ui::Line {
-                    text: "Audio".into(),
-                    x: ui.audio[0] + 9.0,
+                    text: format!("Aud {}", trk(aid)),
+                    x: ui.audio[0] + 7.0,
                     y: ui.audio[1] + 7.0,
                     size: 14.0,
                     color: [230, 230, 235, 235],
                 });
                 v.push(crate::ui::Line {
-                    text: "Subs".into(),
-                    x: ui.subs[0] + 7.0,
+                    text: format!("Sub {}", trk(sid)),
+                    x: ui.subs[0] + 6.0,
                     y: ui.subs[1] + 7.0,
                     size: 14.0,
                     color: [230, 230, 235, 235],
@@ -1839,6 +1906,19 @@ impl State {
                     y: cy - 20.0,
                     size: 30.0,
                     color: [235, 235, 240, 255],
+                });
+            }
+            // Hover tooltip: the item's name (over the black bg pushed in overlay_rects).
+            if let Some((mut name, lx, ly)) = self.hover_label() {
+                if name.chars().count() > 48 {
+                    name = name.chars().take(47).collect::<String>() + "…";
+                }
+                v.push(crate::ui::Line {
+                    text: name,
+                    x: lx,
+                    y: ly,
+                    size: 15.0,
+                    color: [240, 240, 245, 255],
                 });
             }
         }
@@ -2014,6 +2094,16 @@ impl State {
                 });
             }
         }
+
+        // Hover tooltip background (the filename draws on top, in ui_lines).
+        if let Some((name, lx, ly)) = self.hover_label() {
+            let chars = name.chars().count().min(48) as f32;
+            let tw = (chars * 7.6 + 16.0).min(w - 16.0);
+            rects.push(OverlayRect {
+                rect: [nx(lx - 8.0), ny_top(ly + 21.0), nw(tw), nhh(24.0)],
+                color: [0.0, 0.0, 0.0, 0.72],
+            });
+        }
         rects
     }
 
@@ -2036,9 +2126,10 @@ impl State {
             &lines,
         );
 
-        // The lightbox backdrop blur/dim ramps in with the focus animation.
+        // Lightbox backdrop: fade the wall to plain black as an item is focused (dark factor 0 →
+        // the blurred scene is multiplied to black, so the focused item sits on solid black).
         let mix = smoothstep(self.focus_t);
-        self.post.set_params(&self.queue, mix, 0.42);
+        self.post.set_params(&self.queue, mix, 0.0);
 
         let mut enc = self
             .device

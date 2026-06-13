@@ -81,13 +81,16 @@ src/
 
 ```sh
 cd rust
-cargo run --release                       # opens a native folder picker
-cargo run --release -- /path/to/photos    # …or pass a folder (skips the picker)
-cargo run --release --features video -- /media   # video tiles play on focus (needs libmpv)
+cargo run --release                          # folder picker; video plays on focus (libmpv, default)
+cargo run --release -- /path/to/media        # …or pass a folder (skips the picker)
+cargo run --release --no-default-features -- /media  # wall-only build for machines without libmpv
 
 # A shippable optimized binary:
-cargo build --release                     # → target/release/cooliris-rs
+cargo build --release                        # → target/release/cooliris-rs
 ```
+
+Video is a **default feature** now (libmpv linked via pkg-config); use `--no-default-features`
+to build the wall-only variant where libmpv isn't installed.
 
 Run with no folder and a native picker appears (cancel → placeholder tiles). Cross-platform:
 Windows (DX12/Vulkan), macOS (Metal), Linux (Vulkan). First build compiles wgpu (~2–3 min);
