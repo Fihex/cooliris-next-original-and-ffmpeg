@@ -27,6 +27,8 @@ const GAP_X: f32 = 0.16;
 const GAP_Y: f32 = 0.16;
 const CELL_X: f32 = MAX_W + GAP_X; // column pitch (1.71)
 const CELL_Y: f32 = TILE + GAP_Y;
+const DEFAULT_ASPECT: f32 = 1.4; // assumed aspect before a tile's image has decoded
+const REFLECT_GAP: f32 = 0.09; // gap between a photo and its mirrored reflection
 const FOV_Y: f32 = 45.0 * std::f32::consts::PI / 180.0; // 45°, like the web camera
 const BASE_DIST: f32 = 7.2; // default camera distance (wheel zooms between MIN..MAX)
 const MIN_DIST: f32 = 4.5;
@@ -51,6 +53,7 @@ const DAMP: f32 = 6.0; // scroll velocity damping
 const ANIM_SPEED: f32 = 4.0; // focus in/out transition speed (1 / seconds)
 
 const POOL: u32 = 128; // resident texture-array layers (fixed VRAM ceiling: POOL * 1MB)
+const INSTANCE_CAP: u64 = POOL as u64 * 2; // photos + their reflections (bottom row adds ~POOL/3)
 const KEEP_COLS: i64 = 16; // columns kept resident on each side of the camera
 const MAX_INFLIGHT: usize = 8; // concurrent decodes (throttle, like the JS MAX_INFLIGHT)
 const MAX_UPLOADS_PER_FRAME: usize = 4; // GPU texture uploads/frame (spread bursts → smooth scroll)
@@ -70,6 +73,7 @@ struct Instance {
     size: [f32; 2],
     layer: u32,
     uv_extent: [f32; 2],
+    kind: u32, // 0 = photo, 1 = mirrored reflection (flips V + fades out)
 }
 
 #[repr(C)]
@@ -88,8 +92,8 @@ const INDICES: [u16; 6] = [0, 1, 2, 2, 1, 3];
 
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
-const INSTANCE_ATTRS: [wgpu::VertexAttribute; 4] =
-    wgpu::vertex_attr_array![2 => Float32x2, 3 => Float32x2, 4 => Uint32, 5 => Float32x2];
+const INSTANCE_ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    2 => Float32x2, 3 => Float32x2, 4 => Uint32, 5 => Float32x2, 6 => Uint32];
 
 /// A screen-space coloured rectangle (NDC). Used for the bottom scrubber bar overlay.
 #[repr(C)]
@@ -441,7 +445,7 @@ impl State {
         });
         let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("instances"),
-            size: POOL as u64 * size_of::<Instance>() as u64,
+            size: INSTANCE_CAP * size_of::<Instance>() as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1073,38 +1077,54 @@ impl State {
     }
 
     fn rebuild_instances(&mut self) {
-        let mut inst: Vec<Instance> = Vec::with_capacity(self.resident.len());
+        // Reflections first so they paint behind the photos (no depth buffer → paint order).
+        let mut refl: Vec<Instance> = Vec::new();
+        let mut photos: Vec<Instance> = Vec::new();
         for (&i, t) in &self.resident {
             if let Tile::Ready { layer, aspect, uv } = *t {
-                // Fixed row height; width follows the image aspect, capped so tiles stay in their
-                // column. Centered in the cell.
-                let mut w = TILE * aspect;
-                let mut h = TILE;
-                if w > MAX_W {
-                    w = MAX_W;
-                    h = MAX_W / aspect;
-                }
+                let (w, h) = size_for(aspect);
                 let col = (i / ROWS) as f32;
-                let row = (i % ROWS) as f32;
-                inst.push(Instance {
-                    offset: [col * CELL_X, (row - 1.0) * CELL_Y],
+                let row = i % ROWS;
+                // Bottom-align tiles to a shared row baseline (a "shelf"), so different-height
+                // photos — and their reflections — line up, exactly like the web wall.
+                let baseline = row_baseline(row);
+                photos.push(Instance {
+                    offset: [col * CELL_X, baseline + h * 0.5],
                     size: [w, h],
                     layer,
                     uv_extent: uv,
+                    kind: 0,
                 });
+                // The bottom row sits on glass: a mirrored, fading copy hangs beneath it.
+                if row == ROWS - 1 {
+                    refl.push(Instance {
+                        offset: [col * CELL_X, baseline - REFLECT_GAP - h * 0.5],
+                        size: [w, h],
+                        layer,
+                        uv_extent: uv,
+                        kind: 1,
+                    });
+                }
             }
         }
-        self.num_instances = inst.len() as u32;
-        if !inst.is_empty() {
+        refl.extend(photos);
+        refl.truncate(INSTANCE_CAP as usize);
+        self.num_instances = refl.len() as u32;
+        if !refl.is_empty() {
             self.queue
-                .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&inst));
+                .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&refl));
         }
     }
 
     fn tile_center(&self, i: usize) -> (f32, f32) {
         let col = (i / ROWS) as f32;
-        let row = (i % ROWS) as f32;
-        (col * CELL_X, (row - 1.0) * CELL_Y)
+        let row = i % ROWS;
+        let aspect = match self.resident.get(&i) {
+            Some(Tile::Ready { aspect, .. }) => *aspect,
+            _ => DEFAULT_ASPECT,
+        };
+        let (_w, h) = size_for(aspect);
+        (col * CELL_X, row_baseline(row) + h * 0.5)
     }
 
     /// Eye/target for the wall, blended toward the focused tile by `s` (0..1).
@@ -1174,7 +1194,8 @@ impl State {
         let hit = near + dir * t; // world point on the wall plane
 
         let col = (hit.x / CELL_X).round();
-        let row = (hit.y / CELL_Y).round() + 1.0;
+        // Invert the baseline placement (row 0 on top → row ROWS-1 on the bottom).
+        let row = ((ROWS as f32 - 1.0) * 0.5 - hit.y / CELL_Y).round();
         if col < 0.0 || row < 0.0 || row >= ROWS as f32 {
             return None;
         }
@@ -1670,6 +1691,23 @@ fn smoothstep(t: f32) -> f32 {
 /// Point-in-rect test for a pixel-space (x, y, w, h) rect.
 fn hit(rect: [f32; 4], x: f32, y: f32) -> bool {
     x >= rect[0] && x <= rect[0] + rect[2] && y >= rect[1] && y <= rect[1] + rect[3]
+}
+
+/// Tile (w, h) in world units for an image aspect: full row height, width capped at MAX_W (a very
+/// wide photo keeps MAX_W and loses height instead). Matches the web wall's sizing.
+fn size_for(aspect: f32) -> (f32, f32) {
+    let mut w = TILE * aspect;
+    let mut h = TILE;
+    if w > MAX_W {
+        w = MAX_W;
+        h = MAX_W / aspect;
+    }
+    (w, h)
+}
+
+/// Shared bottom line (the "shelf") a row's tiles sit on: row 0 on top, row ROWS-1 on the bottom.
+fn row_baseline(row: usize) -> f32 {
+    ((ROWS as f32 - 1.0) * 0.5 - row as f32) * CELL_Y - TILE * 0.5
 }
 
 fn hsv(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
