@@ -33,6 +33,9 @@ mod stub {
         pub fn duration(&self) -> f64 {
             0.0
         }
+        pub fn volume(&self) -> f64 {
+            100.0
+        }
         pub fn paused(&self) -> bool {
             false
         }
@@ -372,6 +375,10 @@ fn fs(in: V) -> @location(0) vec4<f32> {
         /// Total duration in seconds (0 if unknown).
         pub fn duration(&self) -> f64 {
             self.get_double(b"duration\0")
+        }
+        /// Volume (0–100).
+        pub fn volume(&self) -> f64 {
+            self.get_double(b"volume\0")
         }
         /// Whether playback is paused.
         pub fn paused(&self) -> bool {

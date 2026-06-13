@@ -8,6 +8,7 @@
 // Run: `cargo run --release -- /path/to/photos`  (no path → placeholder tiles).
 // Controls: mouse wheel or ←/→ to scroll the wall.
 
+mod components;
 mod post;
 mod state;
 mod ui;
@@ -154,6 +155,21 @@ impl ApplicationHandler for App {
                     }
                 } else {
                     state.pointer_up(code);
+                }
+            }
+            // While the search box is focused, the keyboard edits it (not wall shortcuts).
+            WindowEvent::KeyboardInput { event, .. }
+                if state.search_active() && event.state == ElementState::Pressed =>
+            {
+                use winit::keyboard::{Key, NamedKey};
+                match &event.logical_key {
+                    Key::Named(NamedKey::Backspace) => state.search_backspace(),
+                    Key::Named(NamedKey::Enter | NamedKey::Escape) => state.search_done(),
+                    _ => {
+                        if let Some(t) = &event.text {
+                            state.search_input(t);
+                        }
+                    }
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {

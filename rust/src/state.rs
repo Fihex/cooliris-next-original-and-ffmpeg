@@ -14,6 +14,8 @@ use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender};
 use glam::{Mat4, Vec3, Vec4};
+
+use crate::components::{self, Filter, MenuKind, OverlayRect, SortMode, UiAction, UiCtx, VideoCtx};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
@@ -41,15 +43,9 @@ const BANK_MAX: f32 = 0.5;
 const PAN_Y_MAX: f32 = 1.7; // vertical grab-pan limit
 const DRAG_GAIN: f32 = 0.6; // left-drag scroll sensitivity
 const SCRUB_ZONE_PX: f32 = 44.0; // bottom band that acts as the scrubber
-const BTN_X: f32 = 12.0; // Open button (toolbar, top-left), pixels
-const BTN_Y: f32 = 12.0;
-const BTN_W: f32 = 84.0;
-const BTN_H: f32 = 34.0;
-const TOPBAR_H: f32 = 52.0; // glass top bar height (pixels)
 const ARROW_W: f32 = 54.0; // lightbox prev/next buttons (vertically centered on each edge)
 const ARROW_H: f32 = 84.0;
 const ARROW_MARGIN: f32 = 18.0;
-const VCTL_H: f32 = 60.0; // video controls bar height (pixels, bottom of the screen)
 const ACCEL: f32 = 22.0; // arrow-key acceleration (world units / s²)
 const MAX_SPEED: f32 = 11.0;
 const ANIM_SPEED: f32 = 4.0; // focus in/out transition speed (1 / seconds)
@@ -97,16 +93,9 @@ const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
 const INSTANCE_ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
     2 => Float32x2, 3 => Float32x2, 4 => Uint32, 5 => Float32x2, 6 => Uint32];
 
-/// A screen-space coloured rectangle (NDC). Used for the bottom scrubber bar overlay.
-#[repr(C)]
-#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
-struct OverlayRect {
-    rect: [f32; 4], // x, y (NDC bottom-left) + w, h (NDC)
-    color: [f32; 4],
-}
 const OVERLAY_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
-const OVERLAY_CAP: u64 = 64; // dim, toolbar, arrows, scrubber track/thumb + tick lines
+const OVERLAY_CAP: u64 = 160; // wall overlay (dim/scrubber/arrows/ticks) + custom UI rects
 const OVERLAY_SHADER: &str = r#"
 struct In { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32> };
 struct V { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> };
@@ -180,39 +169,25 @@ struct Loaded {
     full: bool,
 }
 
-/// Pixel rects for the video controls bar (so hit-testing and drawing agree).
-struct VideoUi {
-    bar: [f32; 4],
-    play: [f32; 4],
-    seek: [f32; 4], // the track (x, y, w, h)
-    audio: [f32; 4],
-    subs: [f32; 4],
-    full: [f32; 4],
+/// One decoded GIF frame: pixels + size + how long to show it (seconds).
+struct GifFrame {
+    rgba: Vec<u8>,
+    w: u32,
+    h: u32,
+    delay: f32,
 }
-
-/// Library sort order (cycled by the Sort toolbar button).
-#[derive(Clone, Copy, PartialEq)]
-enum SortMode {
-    NameAsc,
-    NameDesc,
-    DateNew,
-    DateOld,
+/// All frames of the focused GIF (delivered from a worker thread).
+struct GifMsg {
+    index: usize,
+    gen: u64,
+    frames: Vec<GifFrame>,
 }
-impl SortMode {
-    fn label(self) -> &'static str {
-        match self {
-            SortMode::NameAsc => "Name \u{2191}",
-            SortMode::NameDesc => "Name \u{2193}",
-            SortMode::DateNew => "Date \u{2193}",
-            SortMode::DateOld => "Date \u{2191}",
-        }
-    }
-}
-
-/// An open dropdown menu (hand-rolled: a panel of clickable rows under a toolbar button).
-#[derive(Clone, Copy, PartialEq)]
-enum MenuKind {
-    Sort,
+/// The currently-animating focused GIF: its frames + playback cursor.
+struct GifAnim {
+    index: usize,
+    frames: Vec<GifFrame>,
+    cur: usize,
+    t: f32,
 }
 
 /// Which texture the lightbox pass should bind for the focused image.
@@ -241,7 +216,6 @@ enum DragMode {
     Scroll,
     Pan,
     Scrub,
-    Seek, // dragging the video seek bar
 }
 
 pub struct State {
@@ -279,6 +253,7 @@ pub struct State {
     tex: wgpu::Texture,
 
     // wall library + residency
+    all_sources: Arc<Vec<Source>>, // full scanned library (sorted); `sources` is the filtered view
     sources: Arc<Vec<Source>>,
     total: usize,
     total_cols: i64,
@@ -312,7 +287,13 @@ pub struct State {
     open_requested: bool,         // the Open button was clicked (main opens the picker)
     show_info: bool,              // info panel toggle (filename/path of the focused/hovered item)
     sort_mode: SortMode,          // current library sort order
+    filter_kind: Filter,          // type filter (all / photos / videos / audio)
     open_menu: Option<MenuKind>,  // which toolbar dropdown is open
+    search: String,               // search query (filters the wall by filename)
+    search_active: bool,          // the search box has keyboard focus (typing edits it)
+    view_dirty: bool,             // search/filter changed → rebuild the displayed view next frame
+    gif_anim: bool,               // Settings: animate GIFs on focus
+    reflections: bool,            // Settings: draw the glass reflections
     wall_scroll_held: bool, // an on-screen wall scroll arrow is held down
     scanning: bool,         // a folder is being picked/scanned on a worker thread
     focus: Option<usize>,      // currently-focused tile
@@ -323,6 +304,10 @@ pub struct State {
     lb_pan: [f32; 2],          // lightbox pan offset in NDC (drag moves a zoomed item)
     video: Option<crate::video::Player>, // playing the focused video tile, if any
     video_for: Option<usize>,            // which tile self.video belongs to
+    gif: Option<GifAnim>,                // animating focused GIF (plays into full_tex)
+    gif_pending: Option<usize>,          // GIF whose frames are being decoded on a worker
+    gif_tx: Sender<GifMsg>,
+    gif_rx: Receiver<GifMsg>,
     last_activity: Instant,              // last pointer activity — video controls auto-hide on idle
     fullscreen_requested: bool,          // a control asked to toggle fullscreen (main polls it)
     last_frame: Instant,
@@ -380,6 +365,7 @@ impl State {
 
         // --- library (paths only — cheap, even for 16k) ---
         let sources = Arc::new(sort_sources(gather_sources(folder.clone()), SortMode::NameAsc));
+        let all_sources = sources.clone(); // no filter at startup → view == full library
         let total = sources.len();
         let total_cols = (total.div_ceil(ROWS)) as i64;
         let scroll_max = (total_cols - 1).max(0) as f32 * CELL_X;
@@ -388,6 +374,7 @@ impl State {
         // --- decode worker pool ---
         let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
         let (result_tx, result_rx) = crossbeam_channel::unbounded::<Loaded>();
+        let (gif_tx, gif_rx) = crossbeam_channel::unbounded::<GifMsg>();
         for _ in 0..WORKERS {
             let job_rx = job_rx.clone();
             let result_tx = result_tx.clone();
@@ -747,6 +734,7 @@ impl State {
             camera_bgl,
             tex_bg,
             tex,
+            all_sources,
             sources,
             total,
             total_cols,
@@ -776,7 +764,13 @@ impl State {
             open_requested: false,
             show_info: false,
             sort_mode: SortMode::NameAsc,
+            filter_kind: Filter::All,
             open_menu: None,
+            search: String::new(),
+            search_active: false,
+            view_dirty: false,
+            gif_anim: true,
+            reflections: true,
             wall_scroll_held: false,
             scanning: false,
             focus: None,
@@ -787,6 +781,10 @@ impl State {
             lb_pan: [0.0, 0.0],
             video: None,
             video_for: None,
+            gif: None,
+            gif_pending: None,
+            gif_tx,
+            gif_rx,
             last_activity: Instant::now(),
             fullscreen_requested: false,
             last_frame: Instant::now(),
@@ -922,73 +920,17 @@ impl State {
         self.drag_last_y = y;
         self.drag_moved = false;
         self.last_activity = Instant::now();
-        // An open dropdown captures the click: pick a row, else close on any click outside it
-        // (the Sort button below toggles it shut).
-        if button == 0 && self.open_menu == Some(MenuKind::Sort) {
-            let (_, rows) = self.sort_menu();
-            for (rect, mode) in rows {
-                if hit(rect, x, y) {
-                    self.sort_mode = mode;
-                    self.apply_sort();
-                    self.open_menu = None;
-                    self.drag_mode = DragMode::None;
-                    return;
-                }
-            }
-            if !hit(self.sort_btn(), x, y) {
-                self.open_menu = None;
-                self.drag_mode = DragMode::None;
-                return;
-            }
-        }
-        // The Open button (top-left toolbar).
-        if button == 0 && x >= BTN_X && x <= BTN_X + BTN_W && y >= BTN_Y && y <= BTN_Y + BTN_H {
-            self.open_requested = true;
-            self.drag_mode = DragMode::None;
-            return;
-        }
-        // Top-right toolbar buttons: Fullscreen, Info (toggle), Sort (cycle).
+        // The custom UI (top bar, dropdowns, search, video controls) gets the click first.
         if button == 0 {
-            if hit(self.fullscreen_btn(), x, y) {
-                self.fullscreen_requested = true;
-                self.drag_mode = DragMode::None;
-                return;
-            }
-            if hit(self.info_btn(), x, y) {
-                self.show_info = !self.show_info;
-                self.drag_mode = DragMode::None;
-                return;
-            }
-            if hit(self.sort_btn(), x, y) {
-                self.open_menu = if self.open_menu == Some(MenuKind::Sort) {
-                    None
-                } else {
-                    Some(MenuKind::Sort)
-                };
+            if let Some(action) = components::hit_test(&self.ui_ctx(), x, y) {
+                self.apply_ui_action(action);
                 self.drag_mode = DragMode::None;
                 return;
             }
         }
-        // Video controls bar (when a video is focused + controls shown).
-        if button == 0 && self.video.is_some() && self.video_controls_visible() {
-            let ui = self.video_ui();
-            if hit(ui.bar, x, y) {
-                self.drag_mode = DragMode::None; // a click on the bar never closes the lightbox
-                if hit(ui.play, x, y) {
-                    self.video_command(&["cycle", "pause"]);
-                } else if hit(ui.audio, x, y) {
-                    self.video_command(&["cycle", "aid"]);
-                } else if hit(ui.subs, x, y) {
-                    self.video_command(&["cycle", "sid"]);
-                } else if hit(ui.full, x, y) {
-                    self.fullscreen_requested = true;
-                } else if hit([ui.seek[0], ui.bar[1], ui.seek[2], ui.bar[3]], x, y) {
-                    self.drag_mode = DragMode::Seek; // grab the seek bar (drag to scrub)
-                    self.seek_to_x(x);
-                }
-                return;
-            }
-        }
+        // A click anywhere else dismisses an open menu / search focus.
+        self.open_menu = None;
+        self.search_active = false;
         // Edge arrow buttons. Focused: prev/next item. On the wall: hold to scroll left/right.
         if button == 0 && (self.focus.is_some() || self.scroll_max > 0.0) {
             let (prev, next) = self.arrow_rects();
@@ -1028,8 +970,11 @@ impl State {
         self.pointer_ndc = [x / w0 * 2.0 - 1.0, 1.0 - y / h0 * 2.0];
         self.last_activity = Instant::now(); // any motion un-hides the video controls
         if self.drag_mode == DragMode::None {
-            // Hover (wall only): the tile under the cursor zooms in place + shows its name.
-            self.hover_index = if self.focus.is_none() {
+            // Hover (wall only): the tile under the cursor zooms in place + shows its name. Skip
+            // when the cursor is over the custom UI (top bar, menus, video bar).
+            self.hover_index = if self.focus.is_none()
+                && !components::pointer_over_ui(&self.ui_ctx(), x, y)
+            {
                 self.pick(x, y)
             } else {
                 None
@@ -1044,7 +989,6 @@ impl State {
         let h = self.config.height.max(1) as f32;
         let max = self.scroll_max.max(0.0);
         match self.drag_mode {
-            DragMode::Seek => self.seek_to_x(x),
             DragMode::Scrub => self.scrub_to(x),
             DragMode::Pan => {
                 if self.focus.is_some() {
@@ -1142,20 +1086,6 @@ impl State {
     }
 
     /// Pixel layout of the video controls bar.
-    fn video_ui(&self) -> VideoUi {
-        let w = self.config.width as f32;
-        let h = self.config.height as f32;
-        let by = h - VCTL_H;
-        VideoUi {
-            bar: [0.0, by, w, VCTL_H],
-            play: [16.0, by + 14.0, 32.0, 32.0],
-            seek: [180.0, by + 26.0, (w - 392.0).max(40.0), 8.0],
-            audio: [w - 200.0, by + 15.0, 60.0, 30.0],
-            subs: [w - 134.0, by + 15.0, 50.0, 30.0],
-            full: [w - 78.0, by + 15.0, 44.0, 30.0],
-        }
-    }
-
     /// (position, duration, paused) of the playing video, if any.
     fn video_state(&self) -> Option<(f64, f64, bool)> {
         let v = self.video.as_ref()?;
@@ -1172,17 +1102,6 @@ impl State {
         self.last_activity.elapsed().as_secs_f32() < 2.5 || paused
     }
 
-    /// Seek the video to the fraction of the seek track at pixel x.
-    fn seek_to_x(&self, x: f32) {
-        if let (Some(v), Some((_, dur, _))) = (self.video.as_ref(), self.video_state()) {
-            if dur > 0.0 {
-                let s = self.video_ui().seek;
-                let frac = ((x - s[0]) / s[2]).clamp(0.0, 1.0);
-                v.seek(frac as f64 * dur);
-            }
-        }
-    }
-
     pub fn take_fullscreen_request(&mut self) -> bool {
         std::mem::take(&mut self.fullscreen_requested)
     }
@@ -1192,50 +1111,158 @@ impl State {
     }
 
     fn apply_sort(&mut self) {
-        if self.sources.is_empty() {
+        if self.all_sources.is_empty() {
             return;
         }
-        // reload_with sorts the sources by self.sort_mode, so just hand it the current set.
-        let folder = self.current_folder.clone();
-        let srcs: Vec<Source> = (*self.sources).clone();
-        self.reload_with(folder, srcs);
+        self.all_sources = Arc::new(sort_sources((*self.all_sources).clone(), self.sort_mode));
+        self.rebuild_view();
     }
 
-    /// Top-right toolbar buttons (pixel rects), right-to-left: Fullscreen, Info, Sort.
-    fn fullscreen_btn(&self) -> [f32; 4] {
-        let w = self.config.width as f32;
-        [w - 12.0 - 96.0, BTN_Y, 96.0, BTN_H]
-    }
-    fn info_btn(&self) -> [f32; 4] {
-        let w = self.config.width as f32;
-        [w - 12.0 - 96.0 - 8.0 - 56.0, BTN_Y, 56.0, BTN_H]
-    }
-    fn sort_btn(&self) -> [f32; 4] {
-        // Left side, next to Open.
-        [BTN_X + BTN_W + 8.0, BTN_Y, 124.0, BTN_H]
-    }
-
-    /// Sort dropdown: the panel rect and one (row rect, mode) per option.
-    fn sort_menu(&self) -> ([f32; 4], [([f32; 4], SortMode); 4]) {
-        let sb = self.sort_btn();
-        let (rw, rh, pad) = (sb[2], 30.0, 4.0);
-        let px = sb[0];
-        let py = sb[1] + sb[3] + 4.0;
-        let modes = [
-            SortMode::NameAsc,
-            SortMode::NameDesc,
-            SortMode::DateNew,
-            SortMode::DateOld,
-        ];
-        let panel = [px, py, rw, rh * 4.0 + pad * 2.0];
-        let mut rows = [([0.0; 4], SortMode::NameAsc); 4];
-        for (i, m) in modes.iter().enumerate() {
-            rows[i] = (
-                [px + pad, py + pad + i as f32 * rh, rw - pad * 2.0, rh],
-                *m,
-            );
+    /// Snapshot the data the UI needs this frame.
+    fn ui_ctx(&self) -> UiCtx {
+        let ready = self
+            .resident
+            .values()
+            .filter(|t| matches!(t, Tile::Ready { .. }))
+            .count();
+        let info = if self.show_info {
+            self.focus.or(self.hover_index).and_then(|i| {
+                if let Some(Source::File(p) | Source::Video(p) | Source::Audio(p)) =
+                    self.sources.get(i)
+                {
+                    Some((
+                        p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                        p.parent().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+                    ))
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        let video = if self.video.is_some() {
+            let (pos, dur, paused) = self.video_state().unwrap_or((0.0, 0.0, false));
+            let (vol, aid, sid) = self
+                .video
+                .as_ref()
+                .map(|v| (v.volume(), v.aid(), v.sid()))
+                .unwrap_or((100.0, 0, 0));
+            let title = self
+                .focus
+                .and_then(|i| self.sources.get(i))
+                .and_then(|s| match s {
+                    Source::Video(p) | Source::Audio(p) | Source::File(p) => p.file_name(),
+                    _ => None,
+                })
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            Some(VideoCtx {
+                pos,
+                dur,
+                paused,
+                vol,
+                aid,
+                sid,
+                title,
+                visible: self.video_controls_visible(),
+            })
+        } else {
+            None
+        };
+        UiCtx {
+            w: self.config.width as f32,
+            h: self.config.height as f32,
+            sort: self.sort_mode,
+            filter: self.filter_kind,
+            menu: self.open_menu,
+            search: self.search.clone(),
+            search_active: self.search_active,
+            gif_anim: self.gif_anim,
+            reflections: self.reflections,
+            show_info: self.show_info,
+            total: self.total,
+            ready,
+            inflight: self.inflight,
+            info,
+            video,
+            pointer: [
+                (self.pointer_ndc[0] + 1.0) * 0.5 * self.config.width as f32,
+                (1.0 - self.pointer_ndc[1]) * 0.5 * self.config.height as f32,
+            ],
         }
-        (panel, rows)
+    }
+
+    /// Apply a click on the UI (returned by components::hit_test).
+    fn apply_ui_action(&mut self, a: UiAction) {
+        match a {
+            UiAction::Open => self.open_requested = true,
+            UiAction::Fullscreen => self.fullscreen_requested = true,
+            UiAction::ToggleInfo => self.show_info = !self.show_info,
+            UiAction::ToggleMenu(m) => {
+                self.open_menu = if self.open_menu == Some(m) { None } else { Some(m) };
+                self.search_active = false;
+            }
+            UiAction::CloseMenu => self.open_menu = None,
+            UiAction::SetSort(m) => {
+                self.open_menu = None;
+                if self.sort_mode != m {
+                    self.sort_mode = m;
+                    self.apply_sort();
+                }
+            }
+            UiAction::SetFilter(f) => {
+                self.open_menu = None;
+                if self.filter_kind != f {
+                    self.filter_kind = f;
+                    self.view_dirty = true;
+                }
+            }
+            UiAction::ToggleGifAnim => self.gif_anim = !self.gif_anim,
+            UiAction::ToggleReflections => self.reflections = !self.reflections,
+            UiAction::ActivateSearch => {
+                self.search_active = true;
+                self.open_menu = None;
+            }
+            UiAction::ClearSearch => {
+                self.search.clear();
+                self.view_dirty = true;
+            }
+            UiAction::VideoPause => self.video_command(&["cycle", "pause"]),
+            UiAction::VideoSeekRel(s) => self.video_command(&["seek", &s.to_string()]),
+            UiAction::VideoSeekFrac(f) => {
+                if let (Some(v), Some((_, dur, _))) = (self.video.as_ref(), self.video_state()) {
+                    if dur > 0.0 {
+                        v.seek(f as f64 * dur);
+                    }
+                }
+            }
+            UiAction::VideoVolume(vol) => {
+                self.video_command(&["set", "volume", &format!("{vol:.0}")])
+            }
+            UiAction::VideoAudio => self.video_command(&["cycle", "aid"]),
+            UiAction::VideoSub => self.video_command(&["cycle", "sid"]),
+        }
+    }
+
+    /// Type a character / edit the search box (called from main when the search box is active).
+    pub fn search_active(&self) -> bool {
+        self.search_active
+    }
+    pub fn search_input(&mut self, ch: &str) {
+        for c in ch.chars() {
+            if !c.is_control() {
+                self.search.push(c);
+            }
+        }
+        self.view_dirty = true;
+    }
+    pub fn search_backspace(&mut self) {
+        self.search.pop();
+        self.view_dirty = true;
+    }
+    pub fn search_done(&mut self) {
+        self.search_active = false;
     }
 
     /// Lightbox prev/next button rects (x, y, w, h, in pixels): (prev on the left, next on the
@@ -1261,6 +1288,12 @@ impl State {
         let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
+
+        // Search/filter changed → rebuild the displayed view.
+        if self.view_dirty {
+            self.view_dirty = false;
+            self.rebuild_view();
+        }
 
         // --- scroll physics (frozen while a tile is focused) ---
         // A live pointer drag owns scroll_x directly (set in pointer_move / scrub_to). Integrating
@@ -1288,7 +1321,7 @@ impl State {
                         self.velocity += (measured - self.velocity) * 0.35; // low-pass → stable bank
                         self.velocity = self.velocity.clamp(-MAX_SPEED, MAX_SPEED);
                     }
-                    DragMode::Scrub | DragMode::Seek => self.velocity = 0.0,
+                    DragMode::Scrub => self.velocity = 0.0,
                     DragMode::None => {
                         if self.input_dir != 0.0 {
                             self.velocity = (self.velocity + self.input_dir * ACCEL * dt)
@@ -1461,7 +1494,11 @@ impl State {
         // Request a full-resolution decode of the focused photo for a crisp lightbox (the thumb
         // shows immediately; the full image swaps in when it arrives). Dropped on deselect.
         match self.focus {
-            Some(f) if matches!(self.sources.get(f), Some(Source::File(_))) => {
+            // Skip the static full-res decode for an animated GIF — its frames own full_tex.
+            Some(f)
+                if matches!(self.sources.get(f), Some(Source::File(p))
+                    if !(self.gif_anim && is_gif(p))) =>
+            {
                 if self.full_pending != Some(f) && self.full_for != Some(f) {
                     self.full_pending = Some(f);
                     let _ = self.job_tx.send(Job {
@@ -1531,6 +1568,60 @@ impl State {
         }
         if let Some(v) = &mut self.video {
             v.update(&self.device, &self.queue);
+        }
+
+        // --- focused GIF animation (Settings → Animate GIFs): decode frames off-thread, then
+        // cycle them into full_tex (which the lightbox samples) on their per-frame delays ---
+        let gif_target = self.focus.filter(|&i| {
+            self.gif_anim && matches!(self.sources.get(i), Some(Source::File(p)) if is_gif(p))
+        });
+        match gif_target {
+            Some(i) => {
+                let have = self.gif.as_ref().map(|g| g.index) == Some(i);
+                if !have && self.gif_pending != Some(i) {
+                    if let Some(Source::File(p)) = self.sources.get(i).cloned() {
+                        self.gif = None;
+                        self.gif_pending = Some(i);
+                        let (tx, gen) = (self.gif_tx.clone(), self.generation);
+                        std::thread::spawn(move || {
+                            let frames = decode_gif(&p);
+                            let _ = tx.send(GifMsg { index: i, gen, frames });
+                        });
+                    }
+                }
+            }
+            None => {
+                self.gif = None;
+                self.gif_pending = None;
+            }
+        }
+        while let Ok(msg) = self.gif_rx.try_recv() {
+            if self.gif_pending == Some(msg.index) {
+                self.gif_pending = None;
+            }
+            if msg.gen == self.generation && self.focus == Some(msg.index) && !msg.frames.is_empty() {
+                self.gif = Some(GifAnim {
+                    index: msg.index,
+                    frames: msg.frames,
+                    cur: 0,
+                    t: 0.0,
+                });
+                self.upload_gif_frame(0);
+            }
+        }
+        let mut advance = None;
+        if let Some(g) = self.gif.as_mut() {
+            if self.focus == Some(g.index) && g.frames.len() > 1 {
+                g.t += dt;
+                while g.t >= g.frames[g.cur].delay {
+                    g.t -= g.frames[g.cur].delay;
+                    g.cur = (g.cur + 1) % g.frames.len();
+                }
+                advance = Some(g.cur);
+            }
+        }
+        if let Some(c) = advance {
+            self.upload_gif_frame(c);
         }
 
         // Opt-in streaming readout: RUST_LOG=cooliris_rs=debug
@@ -1629,6 +1720,38 @@ impl State {
         self.full_for = Some(res.index);
     }
 
+    /// Upload GIF frame `c` into full_tex (the lightbox samples it), so the focused GIF animates.
+    fn upload_gif_frame(&mut self, c: usize) {
+        let Some(g) = self.gif.as_ref() else {
+            return;
+        };
+        let Some(f) = g.frames.get(c) else {
+            return;
+        };
+        let (w, h, idx) = (f.w, f.h, g.index);
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.full_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &f.rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * w),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d {
+                width: w,
+                height: h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.full_extent = [w as f32 / FULL_PX as f32, h as f32 / FULL_PX as f32];
+        self.full_for = Some(idx);
+    }
+
     fn rebuild_instances(&mut self) {
         // Draw every tile in the visible window: a dark placeholder "skeleton" at the default size
         // until the image decodes, then the image at its true aspect. This keeps the grid full and
@@ -1667,7 +1790,7 @@ impl State {
                         photos.push(inst);
                     }
                     // The bottom row sits on glass: a mirrored, fading copy hangs beneath it.
-                    if row == ROWS - 1 {
+                    if row == ROWS - 1 && self.reflections {
                         refl.push(Instance {
                             offset: [cx, baseline - REFLECT_GAP - h * 0.5],
                             size: [w, h],
@@ -1840,9 +1963,42 @@ impl State {
     /// a big/slow folder doesn't freeze the window). The generation bump drops in-flight decodes
     /// from the old library; the texture pool, pipelines and worker threads are all reused.
     pub fn reload_with(&mut self, folder: Option<PathBuf>, sources: Vec<Source>) {
-        self.generation += 1;
-        self.sources = Arc::new(sort_sources(sources, self.sort_mode));
+        self.all_sources = Arc::new(sort_sources(sources, self.sort_mode));
         self.current_folder = folder;
+        self.scanning = false;
+        self.rebuild_view();
+        log::info!("loaded {} tiles", self.total);
+    }
+
+    /// Rebuild the displayed wall (`sources`) from the full library, applying the type filter and
+    /// the search query, then reset the streaming state. Used by load, sort, filter and search.
+    fn rebuild_view(&mut self) {
+        let q = self.search.to_lowercase();
+        let kind = self.filter_kind;
+        let name_of = |s: &Source| match s {
+            Source::File(p) | Source::Video(p) | Source::Audio(p) => {
+                p.file_name().map(|n| n.to_string_lossy().to_lowercase())
+            }
+            Source::Placeholder(_) => None,
+        };
+        let filtered: Vec<Source> = self
+            .all_sources
+            .iter()
+            .filter(|s| {
+                let kind_ok = match s {
+                    Source::Placeholder(_) => true,
+                    Source::File(_) => matches!(kind, Filter::All | Filter::Photos),
+                    Source::Video(_) => matches!(kind, Filter::All | Filter::Videos),
+                    Source::Audio(_) => matches!(kind, Filter::All | Filter::Audio),
+                };
+                let search_ok = q.is_empty() || name_of(s).map(|n| n.contains(&q)).unwrap_or(true);
+                kind_ok && search_ok
+            })
+            .cloned()
+            .collect();
+
+        self.generation += 1;
+        self.sources = Arc::new(filtered);
         self.total = self.sources.len();
         self.total_cols = self.total.div_ceil(ROWS) as i64;
         self.scroll_max = (self.total_cols - 1).max(0) as f32 * CELL_X;
@@ -1857,8 +2013,6 @@ impl State {
         self.video = None;
         self.video_for = None;
         self.num_instances = 0;
-        self.scanning = false;
-        log::info!("loaded {} tiles", self.total);
     }
 
     /// Whether the Open button was clicked since the last check (main opens the picker).
@@ -1873,106 +2027,9 @@ impl State {
 
     /// Toolbar text: the Open label + a folder hint or the loaded/total readout.
     fn ui_lines(&self) -> Vec<crate::ui::Line> {
-        let mut v = vec![crate::ui::Line {
-            text: "Open".into(),
-            x: BTN_X + 14.0,
-            y: BTN_Y + 8.0,
-            size: 17.0,
-            color: [235, 235, 240, 255],
-        }];
-        // Top-right toolbar labels.
-        let fsb = self.fullscreen_btn();
-        v.push(crate::ui::Line {
-            text: "Fullscreen".into(),
-            x: fsb[0] + 9.0,
-            y: fsb[1] + 9.0,
-            size: 15.0,
-            color: [235, 235, 240, 255],
-        });
-        let ib = self.info_btn();
-        v.push(crate::ui::Line {
-            text: "Info".into(),
-            x: ib[0] + 12.0,
-            y: ib[1] + 9.0,
-            size: 15.0,
-            color: [235, 235, 240, 255],
-        });
-        if self.total > 0 {
-            let sb = self.sort_btn();
-            v.push(crate::ui::Line {
-                text: format!("Sort: {}  \u{25be}", self.sort_mode.label()),
-                x: sb[0] + 10.0,
-                y: sb[1] + 9.0,
-                size: 14.0,
-                color: [235, 235, 240, 255],
-            });
-            // Open dropdown rows.
-            if self.open_menu == Some(MenuKind::Sort) {
-                let (_, rows) = self.sort_menu();
-                for (rect, mode) in rows {
-                    v.push(crate::ui::Line {
-                        text: mode.label().into(),
-                        x: rect[0] + 8.0,
-                        y: rect[1] + 7.0,
-                        size: 14.0,
-                        color: [235, 235, 240, 245],
-                    });
-                }
-            }
-        }
-        // Info panel: filename + parent folder of the focused (or hovered) item.
-        if self.show_info {
-            if let Some(i) = self.focus.or(self.hover_index) {
-                if let Some(Source::File(p) | Source::Video(p) | Source::Audio(p)) =
-                    self.sources.get(i)
-                {
-                    let name = p
-                        .file_name()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    let dir = p
-                        .parent()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    v.push(crate::ui::Line {
-                        text: name,
-                        x: BTN_X,
-                        y: BTN_Y + BTN_H + 10.0,
-                        size: 15.0,
-                        color: [235, 235, 240, 245],
-                    });
-                    v.push(crate::ui::Line {
-                        text: dir,
-                        x: BTN_X,
-                        y: BTN_Y + BTN_H + 30.0,
-                        size: 12.0,
-                        color: [180, 180, 190, 220],
-                    });
-                }
-            }
-        }
-        let ready = self
-            .resident
-            .values()
-            .filter(|t| matches!(t, Tile::Ready { .. }))
-            .count();
-        let status = if self.scanning {
-            "scanning folder…".to_string()
-        } else if self.current_folder.is_none() {
-            "drop a folder here · click Open · press O".to_string()
-        } else if self.inflight > 0 {
-            format!("{} items · {ready} loaded · {} loading", self.total, self.inflight)
-        } else {
-            format!("{} items · {ready} loaded", self.total)
-        };
-        v.push(crate::ui::Line {
-            text: status,
-            x: BTN_X + BTN_W + 16.0,
-            y: BTN_Y + 9.0,
-            size: 15.0,
-            color: [205, 205, 215, 235],
-        });
-
+        // The top bar / dropdowns / info / video labels are drawn by `components`; this layer only
+        // draws wall-space text: centered status, lightbox hints, edge arrows, hover tooltip.
+        let mut v: Vec<crate::ui::Line> = Vec::new();
         let cx = self.config.width as f32 * 0.5;
         let cy = self.config.height as f32 * 0.5;
         if self.scanning {
@@ -2034,73 +2091,7 @@ impl State {
                     color: [235, 235, 240, 255],
                 });
             }
-            // Video controls bar labels: play/pause, current/total time, track buttons, and a
-            // hover-time tooltip over the seek bar.
-            if self.video.is_some() && self.video_controls_visible() {
-                let ui = self.video_ui();
-                let (pos, dur, paused) = self.video_state().unwrap_or((0.0, 0.0, false));
-                v.push(crate::ui::Line {
-                    text: if paused { "▶".into() } else { "❚❚".into() },
-                    x: ui.play[0] + 7.0,
-                    y: ui.play[1] + 4.0,
-                    size: 20.0,
-                    color: [240, 240, 245, 255],
-                });
-                v.push(crate::ui::Line {
-                    text: format!("{} / {}", fmt_time(pos), fmt_time(dur)),
-                    x: 58.0,
-                    y: ui.bar[1] + 21.0,
-                    size: 14.0,
-                    color: [225, 225, 230, 235],
-                });
-                let trk = |id: i64| if id > 0 { id.to_string() } else { "–".into() };
-                let (aid, sid) = self
-                    .video
-                    .as_ref()
-                    .map(|v| (v.aid(), v.sid()))
-                    .unwrap_or((0, 0));
-                v.push(crate::ui::Line {
-                    text: format!("Aud {}", trk(aid)),
-                    x: ui.audio[0] + 7.0,
-                    y: ui.audio[1] + 7.0,
-                    size: 14.0,
-                    color: [230, 230, 235, 235],
-                });
-                v.push(crate::ui::Line {
-                    text: format!("Sub {}", trk(sid)),
-                    x: ui.subs[0] + 6.0,
-                    y: ui.subs[1] + 7.0,
-                    size: 14.0,
-                    color: [230, 230, 235, 235],
-                });
-                v.push(crate::ui::Line {
-                    text: "Full".into(),
-                    x: ui.full[0] + 8.0,
-                    y: ui.full[1] + 7.0,
-                    size: 14.0,
-                    color: [230, 230, 235, 235],
-                });
-                // Hover-time over the seek bar.
-                let w = self.config.width as f32;
-                let h = self.config.height as f32;
-                let px = (self.pointer_ndc[0] + 1.0) * 0.5 * w;
-                let py = (1.0 - self.pointer_ndc[1]) * 0.5 * h;
-                if dur > 0.0
-                    && px >= ui.seek[0]
-                    && px <= ui.seek[0] + ui.seek[2]
-                    && py >= ui.bar[1]
-                    && py <= ui.bar[1] + ui.bar[3]
-                {
-                    let f = ((px - ui.seek[0]) / ui.seek[2]).clamp(0.0, 1.0) as f64;
-                    v.push(crate::ui::Line {
-                        text: fmt_time(f * dur),
-                        x: px - 18.0,
-                        y: ui.bar[1] - 26.0,
-                        size: 15.0,
-                        color: [255, 255, 255, 255],
-                    });
-                }
-            }
+            // (Video controls — play/pause, seek, time, tracks — are drawn by `components`.)
         } else {
             // On-screen left/right scroll arrows (hold to scroll), when the wall is scrollable.
             if self.scroll_max > 0.0 {
@@ -2215,58 +2206,8 @@ impl State {
             color: [0.02, 0.02, 0.03, 0.93 * s],
         });
 
-        // Glass top bar — a translucent strip the toolbar buttons sit on.
-        rects.push(OverlayRect {
-            rect: [-1.0, ny_top(TOPBAR_H), 2.0, nhh(TOPBAR_H)],
-            color: [0.05, 0.05, 0.08, 0.66],
-        });
-        // Open button background.
-        rects.push(OverlayRect {
-            rect: [nx(BTN_X), ny_top(BTN_Y + BTN_H), nw(BTN_W), nhh(BTN_H)],
-            color: [1.0, 1.0, 1.0, 0.12],
-        });
-        // Top-right toolbar: Fullscreen + Info buttons (Info brightens when on).
-        let to_chip = |r: [f32; 4]| [nx(r[0]), ny_top(r[1] + r[3]), nw(r[2]), nhh(r[3])];
-        rects.push(OverlayRect {
-            rect: to_chip(self.fullscreen_btn()),
-            color: [1.0, 1.0, 1.0, 0.12],
-        });
-        rects.push(OverlayRect {
-            rect: to_chip(self.info_btn()),
-            color: [1.0, 1.0, 1.0, if self.show_info { 0.24 } else { 0.12 }],
-        });
-        if self.total > 0 {
-            rects.push(OverlayRect {
-                rect: to_chip(self.sort_btn()),
-                color: [1.0, 1.0, 1.0, if self.open_menu == Some(MenuKind::Sort) { 0.2 } else { 0.12 }],
-            });
-        }
-        // Sort dropdown: panel + a row per option (current = bright, hovered = lit).
-        if self.open_menu == Some(MenuKind::Sort) {
-            let (panel, rows) = self.sort_menu();
-            let pp = self.pointer_ndc;
-            let ppx = (pp[0] + 1.0) * 0.5 * w;
-            let ppy = (1.0 - pp[1]) * 0.5 * h;
-            rects.push(OverlayRect {
-                rect: to_chip(panel),
-                color: [0.08, 0.08, 0.11, 0.97],
-            });
-            for (rect, mode) in rows {
-                let a = if mode == self.sort_mode {
-                    0.22
-                } else if hit(rect, ppx, ppy) {
-                    0.14
-                } else {
-                    0.0
-                };
-                if a > 0.0 {
-                    rects.push(OverlayRect {
-                        rect: to_chip(rect),
-                        color: [1.0, 1.0, 1.0, a],
-                    });
-                }
-            }
-        }
+        // (Top bar, dropdowns, search and video controls are built by `components` and merged in
+        // render — this layer only draws the wall overlay below.)
 
         // Edge arrow button backgrounds. Focused: prev/next (fade in, hidden at the ends). On the
         // wall: left/right scroll buttons (when scrollable).
@@ -2329,46 +2270,6 @@ impl State {
             });
         }
 
-        // Video controls bar (bottom): background, seek track + fill + knob, and button chips.
-        if self.video.is_some() && self.video_controls_visible() {
-            let ui = self.video_ui();
-            // pixel rect [x,y,w,h] (top-left origin) → overlay NDC rect.
-            let r = |p: [f32; 4]| [nx(p[0]), ny_top(p[1] + p[3]), nw(p[2]), nhh(p[3])];
-            rects.push(OverlayRect {
-                rect: r(ui.bar),
-                color: [0.0, 0.0, 0.0, 0.55],
-            });
-            let (pos, dur, _) = self.video_state().unwrap_or((0.0, 0.0, false));
-            let frac = if dur > 0.0 {
-                (pos / dur).clamp(0.0, 1.0) as f32
-            } else {
-                0.0
-            };
-            rects.push(OverlayRect {
-                rect: r(ui.seek),
-                color: [1.0, 1.0, 1.0, 0.22],
-            });
-            rects.push(OverlayRect {
-                rect: r([ui.seek[0], ui.seek[1], ui.seek[2] * frac, ui.seek[3]]),
-                color: [0.35, 0.70, 1.0, 0.95],
-            });
-            rects.push(OverlayRect {
-                rect: r([
-                    ui.seek[0] + ui.seek[2] * frac - 5.0,
-                    ui.seek[1] - 5.0,
-                    10.0,
-                    ui.seek[3] + 10.0,
-                ]),
-                color: [1.0, 1.0, 1.0, 0.95],
-            });
-            for b in [ui.play, ui.audio, ui.subs, ui.full] {
-                rects.push(OverlayRect {
-                    rect: r(b),
-                    color: [1.0, 1.0, 1.0, 0.12],
-                });
-            }
-        }
-
         // Hover tooltip background (the filename draws on top, in ui_lines).
         if let Some((name, lx, ly)) = self.hover_label() {
             let chars = name.chars().count().min(48) as f32;
@@ -2385,13 +2286,19 @@ impl State {
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&Default::default());
 
-        let overlay = self.overlay_rects();
+        // Wall overlay (dim, scrubber, arrows, hover bg) + the custom UI (top bar, dropdowns,
+        // search, video controls) built by `components`.
+        let mut overlay = self.overlay_rects();
+        let mut lines = self.ui_lines();
+        let (ui_rects, ui_lines) = components::build(&self.ui_ctx());
+        overlay.extend(ui_rects);
+        lines.extend(ui_lines);
+        overlay.truncate(OVERLAY_CAP as usize);
         if !overlay.is_empty() {
             self.queue
                 .write_buffer(&self.overlay_buf, 0, bytemuck::cast_slice(&overlay));
         }
         let lb_visible = self.prepare_lightbox();
-        let lines = self.ui_lines();
         self.ui.prepare(
             &self.device,
             &self.queue,
@@ -2708,6 +2615,48 @@ enum Kind {
 }
 
 /// Classify a path by extension (None = ignore / not media).
+fn is_gif(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("gif"))
+        .unwrap_or(false)
+}
+
+/// Decode every frame of a GIF (downscaled to fit FULL_PX) with its delay, for in-place animation.
+/// Runs on a worker thread; empty on failure.
+fn decode_gif(path: &std::path::Path) -> Vec<GifFrame> {
+    use image::AnimationDecoder;
+    let Ok(file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(dec) = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(file)) else {
+        return Vec::new();
+    };
+    let Ok(frames) = dec.into_frames().collect_frames() else {
+        return Vec::new();
+    };
+    frames
+        .into_iter()
+        .take(400) // cap pathological GIFs
+        .map(|f| {
+            let (n, d) = f.delay().numer_denom_ms();
+            let delay = (n as f32 / d.max(1) as f32 / 1000.0).max(0.02);
+            let buf = f.into_buffer();
+            let (w, h) = (buf.width(), buf.height());
+            if w > FULL_PX || h > FULL_PX {
+                let img = image::DynamicImage::ImageRgba8(buf)
+                    .resize(FULL_PX, FULL_PX, image::imageops::FilterType::Triangle)
+                    .to_rgba8();
+                let (w, h) = (img.width(), img.height());
+                GifFrame { rgba: img.into_raw(), w, h, delay }
+            } else {
+                GifFrame { rgba: buf.into_raw(), w, h, delay }
+            }
+        })
+        .collect()
+}
+
+/// Classify a path by extension (None = ignore / not media).
 fn classify(p: &std::path::Path) -> Option<Kind> {
     match p
         .extension()
@@ -2790,20 +2739,6 @@ fn sort_sources(srcs: Vec<Source>, mode: SortMode) -> Vec<Source> {
             }
             keyed.into_iter().map(|(_, s)| s).collect()
         }
-    }
-}
-
-/// Seconds → "M:SS" (or "H:MM:SS").
-fn fmt_time(s: f64) -> String {
-    if !s.is_finite() || s < 0.0 {
-        return "0:00".into();
-    }
-    let t = s as u64;
-    let (h, m, sec) = (t / 3600, (t % 3600) / 60, t % 60);
-    if h > 0 {
-        format!("{h}:{m:02}:{sec:02}")
-    } else {
-        format!("{m}:{sec:02}")
     }
 }
 
