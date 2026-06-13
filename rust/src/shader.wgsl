@@ -64,9 +64,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let c = textureSample(atlas, atlas_sampler, in.uv, i32(in.layer));
     var a = c.a;
     if (in.kind == 1u) {
-        // Reflection visible only over the top quarter of the photo height, fading to nothing —
-        // computed per-pixel so the cutoff is sharp (vertex interpolation would smear it).
-        a = a * clamp((in.vy - 0.75) * 4.0, 0.0, 1.0) * 0.28;
+        // Reflection visible over the top half of the photo height, fading to nothing — computed
+        // per-pixel so the cutoff is sharp (vertex interpolation would smear it).
+        a = a * clamp((in.vy - 0.5) * 2.0, 0.0, 1.0) * 0.28;
     }
     return vec4<f32>(c.rgb, a);
 }
