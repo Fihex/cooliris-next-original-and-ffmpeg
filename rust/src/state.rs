@@ -160,6 +160,7 @@ fn fs(in: V) -> @location(0) vec4<f32> {
 pub enum Source {
     File(PathBuf),
     Video(PathBuf),
+    Audio(PathBuf), // music: cover-art thumbnail, plays via mpv on focus
     Placeholder(usize),
 }
 
@@ -891,7 +892,7 @@ impl State {
         }
         let i = self.hover_index?;
         let name = match self.sources.get(i)? {
-            Source::File(p) | Source::Video(p) => {
+            Source::File(p) | Source::Video(p) | Source::Audio(p) => {
                 p.file_name().map(|s| s.to_string_lossy().into_owned())?
             }
             Source::Placeholder(_) => return None,
@@ -1469,7 +1470,8 @@ impl State {
             self.video = None; // dropping the player stops mpv
             self.video_for = self.focus;
             if let Some(idx) = self.focus {
-                if let Source::Video(path) = self.sources[idx].clone() {
+                // Play videos and music (audio) through mpv on focus.
+                if let Source::Video(path) | Source::Audio(path) = self.sources[idx].clone() {
                     self.video = Some(crate::video::Player::start(
                         &self.device,
                         &self.queue,
@@ -1861,7 +1863,9 @@ impl State {
         // Info panel: filename + parent folder of the focused (or hovered) item.
         if self.show_info {
             if let Some(i) = self.focus.or(self.hover_index) {
-                if let Some(Source::File(p) | Source::Video(p)) = self.sources.get(i) {
+                if let Some(Source::File(p) | Source::Video(p) | Source::Audio(p)) =
+                    self.sources.get(i)
+                {
                     let name = p
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
@@ -2377,8 +2381,11 @@ impl State {
             });
             self.post.draw_composite(&mut rp);
             // Playing video draws over its (focused) tile, sized to fill the focused view (16:9,
-            // the mpv render aspect), with the same zoom/pan as a focused photo.
+            // the mpv render aspect). Audio has no video frame — it shows its cover in the lightbox
+            // and just plays in the background, so only draw the quad for actual videos.
+            let is_video = matches!(self.focus.and_then(|i| self.sources.get(i)), Some(Source::Video(_)));
             if let (Some(v), Some(idx)) = (&self.video, self.focus) {
+                if is_video {
                 let (cx, cy) = self.tile_center(idx);
                 let [sw, sh] = self.video_fill_size();
                 let screen_aspect = self.config.width as f32 / self.config.height.max(1) as f32;
@@ -2387,6 +2394,7 @@ impl State {
                 let oy = cy + self.lb_pan[1] * vph * 0.5;
                 let size = [sw * self.lb_zoom, sh * self.lb_zoom];
                 v.draw(&mut rp, &self.camera_bg, [ox, oy], size, &self.queue);
+                }
             }
             // Lightbox: the focused image (full-res once ready, otherwise the streamed thumbnail).
             let lb_tex = match lb_visible {
@@ -2447,6 +2455,10 @@ fn decode(source: &Source, full: bool) -> (Vec<u8>, u32, u32) {
         Source::Video(p) => {
             video_thumb(p, target).unwrap_or_else(|| (video_placeholder(), TILE_PX, TILE_PX))
         }
+        Source::Audio(p) => {
+            // Embedded cover art (ffmpeg reads the attached picture); else a music-note tile.
+            cover_thumb(p, target).unwrap_or_else(|| (music_placeholder(), TILE_PX, TILE_PX))
+        }
         Source::Placeholder(i) => (placeholder(*i), TILE_PX, TILE_PX),
     }
 }
@@ -2471,6 +2483,54 @@ fn video_thumb(p: &std::path::Path, target: u32) -> Option<(Vec<u8>, u32, u32)> 
     let (w, h) = (rgba.width(), rgba.height());
     draw_play_badge(&mut rgba, w, h);
     Some((rgba.into_raw(), w, h))
+}
+
+/// Extract embedded cover art from an audio file via ffmpeg (the attached picture is a video
+/// stream). None → no art (fall back to the music placeholder).
+fn cover_thumb(p: &std::path::Path, target: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-loglevel", "error", "-i"])
+        .arg(p)
+        .args(["-frames:v", "1", "-vf"])
+        .arg(format!(
+            "scale={target}:{target}:force_original_aspect_ratio=decrease"
+        ))
+        .args(["-f", "image2pipe", "-vcodec", "png", "pipe:1"])
+        .output()
+        .ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    let rgba = image::load_from_memory(&out.stdout).ok()?.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    Some((rgba.into_raw(), w, h))
+}
+
+/// A dark tile with a music note — the grid thumbnail for an audio file with no embedded cover.
+fn music_placeholder() -> Vec<u8> {
+    let mut buf = vec![0u8; (TILE_PX * TILE_PX * 4) as usize];
+    let (cx, cy) = (TILE_PX as f32 * 0.42, TILE_PX as f32 * 0.62);
+    let head_r = TILE_PX as f32 * 0.10;
+    let stem_x = cx + head_r * 0.9;
+    for y in 0..TILE_PX {
+        for x in 0..TILE_PX {
+            let i = ((y * TILE_PX + x) * 4) as usize;
+            buf[i] = 26;
+            buf[i + 1] = 24;
+            buf[i + 2] = 34;
+            buf[i + 3] = 255;
+            let (fx, fy) = (x as f32, y as f32);
+            let note = (fx - cx).hypot(fy - cy) < head_r // note head
+                || (fx >= stem_x && fx < stem_x + head_r * 0.32 && fy > cy - head_r * 4.0 && fy < cy) // stem
+                || (fx >= stem_x && fx < stem_x + head_r * 1.6 && fy > cy - head_r * 4.0 && fy < cy - head_r * 3.0); // flag
+            if note {
+                buf[i] = 225;
+                buf[i + 1] = 225;
+                buf[i + 2] = 235;
+            }
+        }
+    }
+    buf
 }
 
 /// Draw a play badge (a dim circle + white triangle) over the center of a thumbnail.
@@ -2543,22 +2603,30 @@ pub fn gather_sources(folder: Option<PathBuf>) -> Vec<Source> {
     paths
         .into_iter()
         .map(|p| match classify(&p) {
-            Some(true) => Source::Video(p),
+            Some(Kind::Video) => Source::Video(p),
+            Some(Kind::Audio) => Source::Audio(p),
             _ => Source::File(p),
         })
         .collect()
 }
 
-/// `Some(true)` = video, `Some(false)` = image, `None` = ignore.
-fn classify(p: &std::path::Path) -> Option<bool> {
+enum Kind {
+    Image,
+    Video,
+    Audio,
+}
+
+/// Classify a path by extension (None = ignore / not media).
+fn classify(p: &std::path::Path) -> Option<Kind> {
     match p
         .extension()
         .and_then(|s| s.to_str())
         .map(|s| s.to_ascii_lowercase())
         .as_deref()
     {
-        Some("mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v") => Some(true),
-        Some("jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp") => Some(false),
+        Some("mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v") => Some(Kind::Video),
+        Some("mp3" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "wav" | "wma") => Some(Kind::Audio),
+        Some("jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp") => Some(Kind::Image),
         _ => None,
     }
 }
@@ -2595,7 +2663,7 @@ fn hit(rect: [f32; 4], x: f32, y: f32) -> bool {
 /// read once, not on every comparison (matters for large libraries with the date modes).
 fn sort_sources(srcs: Vec<Source>, mode: SortMode) -> Vec<Source> {
     let path = |s: &Source| match s {
-        Source::File(p) | Source::Video(p) => Some(p.clone()),
+        Source::File(p) | Source::Video(p) | Source::Audio(p) => Some(p.clone()),
         Source::Placeholder(_) => None,
     };
     match mode {
