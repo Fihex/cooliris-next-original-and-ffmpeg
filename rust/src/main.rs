@@ -183,7 +183,12 @@ impl ApplicationHandler for App {
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    // Our logs at info; wgpu/naga are extremely chatty (info spam + benign startup warnings), so
+    // silence them. Override anytime with RUST_LOG=…
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("warn,cooliris_rs=info,wgpu_hal=error"),
+    )
+    .init();
 
     // Start the wall immediately (no forced dialog). Pass a folder on the CLI, or open one at
     // runtime via the toolbar's Open button, drag-and-drop, or the O key.
