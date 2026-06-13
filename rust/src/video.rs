@@ -27,6 +27,16 @@ mod stub {
         }
         pub fn update(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue) {}
         pub fn command(&self, _args: &[&str]) {}
+        pub fn position(&self) -> f64 {
+            0.0
+        }
+        pub fn duration(&self) -> f64 {
+            0.0
+        }
+        pub fn paused(&self) -> bool {
+            false
+        }
+        pub fn seek(&self, _secs: f64) {}
         #[allow(clippy::too_many_arguments)]
         pub fn draw<'a>(
             &'a self,
@@ -76,6 +86,8 @@ mod real {
     const SW_POINTER: c_int = 20;
     const API_TYPE: c_int = 1;
     const INVALID: c_int = 0;
+    const FORMAT_FLAG: c_int = 3; // MPV_FORMAT_FLAG  (int*)
+    const FORMAT_DOUBLE: c_int = 5; // MPV_FORMAT_DOUBLE (double*)
 
     extern "C" {
         fn mpv_create() -> *mut MpvHandle;
@@ -87,6 +99,12 @@ mod real {
             data: *const c_char,
         ) -> c_int;
         fn mpv_command(ctx: *mut MpvHandle, args: *const *const c_char) -> c_int;
+        fn mpv_get_property(
+            ctx: *mut MpvHandle,
+            name: *const c_char,
+            format: c_int,
+            data: *mut c_void,
+        ) -> c_int;
         fn mpv_wait_event(ctx: *mut MpvHandle, timeout: f64) -> *mut MpvEvent;
         fn mpv_render_context_create(
             res: *mut *mut MpvRenderContext,
@@ -321,6 +339,51 @@ fn fs(in: V) -> @location(0) vec4<f32> {
                 ptrs.push(ptr::null());
                 mpv_command(self.mpv, ptrs.as_ptr());
             }
+        }
+
+        fn get_double(&self, name: &[u8]) -> f64 {
+            let mut out: f64 = 0.0;
+            unsafe {
+                mpv_get_property(
+                    self.mpv,
+                    name.as_ptr() as *const c_char,
+                    FORMAT_DOUBLE,
+                    &mut out as *mut f64 as *mut c_void,
+                );
+            }
+            if out.is_finite() {
+                out
+            } else {
+                0.0
+            }
+        }
+
+        /// Current playback position in seconds (0 if unknown).
+        pub fn position(&self) -> f64 {
+            self.get_double(b"time-pos\0")
+        }
+        /// Total duration in seconds (0 if unknown).
+        pub fn duration(&self) -> f64 {
+            self.get_double(b"duration\0")
+        }
+        /// Whether playback is paused.
+        pub fn paused(&self) -> bool {
+            let mut out: c_int = 0;
+            unsafe {
+                mpv_get_property(
+                    self.mpv,
+                    b"pause\0".as_ptr() as *const c_char,
+                    FORMAT_FLAG,
+                    &mut out as *mut c_int as *mut c_void,
+                );
+            }
+            out != 0
+        }
+
+        /// Seek to an absolute time in seconds.
+        pub fn seek(&self, secs: f64) {
+            let s = format!("{secs:.3}");
+            self.command(&["seek", &s, "absolute"]);
         }
 
         pub fn update(&mut self, _device: &wgpu::Device, queue: &wgpu::Queue) {

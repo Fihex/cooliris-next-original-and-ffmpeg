@@ -34,8 +34,10 @@ folder dialog is forced at startup — the wall opens straight away with the Ope
 Controls — **wall:** **wheel** zoom (toward the cursor) · **left-drag** scroll · **right/middle-drag**
 pan · **bottom bar** scrub · **edge arrows** / **←→** scroll · click a tile to focus. **Lightbox:**
 **wheel** zoom the photo · **drag** pan when zoomed · **‹ ›** / **←→** prev/next · **Esc** back.
-**Video** (needs `--features video`): **Space** play/pause · **A** audio track · **S** subtitles.
-**F** fullscreen · **O** / Open button / drag-and-drop to load a folder · **Esc** back / exit fullscreen / quit.
+**Video** (needs `--features video`): an on-screen controls bar (play/pause · click/drag the
+**seek bar**, hover it for a time tooltip · **Audio** / **Subs** track cycle · **Full**) that
+auto-hides when idle; keys **Space** play/pause · **A** audio · **S** subtitles. **F** fullscreen ·
+**O** / Open button / drag-and-drop to load a folder · **Esc** back / exit fullscreen / quit.
 
 ## Roadmap (each step is a runnable milestone)
 

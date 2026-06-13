@@ -145,6 +145,13 @@ impl ApplicationHandler for App {
                         state.set_scanning(true);
                         spawn_picker(&self.folder_tx);
                     }
+                    if state.take_fullscreen_request() {
+                        let fs = match state.window.fullscreen() {
+                            Some(_) => None,
+                            None => Some(Fullscreen::Borderless(None)),
+                        };
+                        state.window.set_fullscreen(fs);
+                    }
                 } else {
                     state.pointer_up(code);
                 }

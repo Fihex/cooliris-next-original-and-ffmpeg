@@ -48,6 +48,7 @@ const BTN_H: f32 = 34.0;
 const ARROW_W: f32 = 54.0; // lightbox prev/next buttons (vertically centered on each edge)
 const ARROW_H: f32 = 84.0;
 const ARROW_MARGIN: f32 = 18.0;
+const VCTL_H: f32 = 60.0; // video controls bar height (pixels, bottom of the screen)
 const ACCEL: f32 = 22.0; // arrow-key acceleration (world units / s²)
 const MAX_SPEED: f32 = 11.0;
 const ANIM_SPEED: f32 = 4.0; // focus in/out transition speed (1 / seconds)
@@ -177,6 +178,16 @@ struct Loaded {
     full: bool,
 }
 
+/// Pixel rects for the video controls bar (so hit-testing and drawing agree).
+struct VideoUi {
+    bar: [f32; 4],
+    play: [f32; 4],
+    seek: [f32; 4], // the track (x, y, w, h)
+    audio: [f32; 4],
+    subs: [f32; 4],
+    full: [f32; 4],
+}
+
 /// Which texture the lightbox pass should bind for the focused image.
 enum LbDraw {
     None,
@@ -203,6 +214,7 @@ enum DragMode {
     Scroll,
     Pan,
     Scrub,
+    Seek, // dragging the video seek bar
 }
 
 pub struct State {
@@ -278,6 +290,8 @@ pub struct State {
     lb_pan: [f32; 2],     // lightbox pan offset in NDC (drag moves a zoomed item)
     video: Option<crate::video::Player>, // playing the focused video tile, if any
     video_for: Option<usize>,            // which tile self.video belongs to
+    last_activity: Instant,              // last pointer activity — video controls auto-hide on idle
+    fullscreen_requested: bool,          // a control asked to toggle fullscreen (main polls it)
     last_frame: Instant,
     frame: u64,
 }
@@ -734,6 +748,8 @@ impl State {
             lb_pan: [0.0, 0.0],
             video: None,
             video_for: None,
+            last_activity: Instant::now(),
+            fullscreen_requested: false,
             last_frame: Instant::now(),
             frame: 0,
         };
@@ -847,11 +863,32 @@ impl State {
         self.drag_last_x = x;
         self.drag_last_y = y;
         self.drag_moved = false;
+        self.last_activity = Instant::now();
         // The Open button (top-left toolbar).
         if button == 0 && x >= BTN_X && x <= BTN_X + BTN_W && y >= BTN_Y && y <= BTN_Y + BTN_H {
             self.open_requested = true;
             self.drag_mode = DragMode::None;
             return;
+        }
+        // Video controls bar (when a video is focused + controls shown).
+        if button == 0 && self.video.is_some() && self.video_controls_visible() {
+            let ui = self.video_ui();
+            if hit(ui.bar, x, y) {
+                self.drag_mode = DragMode::None; // a click on the bar never closes the lightbox
+                if hit(ui.play, x, y) {
+                    self.video_command(&["cycle", "pause"]);
+                } else if hit(ui.audio, x, y) {
+                    self.video_command(&["cycle", "aid"]);
+                } else if hit(ui.subs, x, y) {
+                    self.video_command(&["cycle", "sid"]);
+                } else if hit(ui.full, x, y) {
+                    self.fullscreen_requested = true;
+                } else if hit([ui.seek[0], ui.bar[1], ui.seek[2], ui.bar[3]], x, y) {
+                    self.drag_mode = DragMode::Seek; // grab the seek bar (drag to scrub)
+                    self.seek_to_x(x);
+                }
+                return;
+            }
         }
         // Edge arrow buttons. Focused: prev/next item. On the wall: hold to scroll left/right.
         if button == 0 && (self.focus.is_some() || self.scroll_max > 0.0) {
@@ -887,6 +924,7 @@ impl State {
         let w0 = self.config.width.max(1) as f32;
         let h0 = self.config.height.max(1) as f32;
         self.pointer_ndc = [x / w0 * 2.0 - 1.0, 1.0 - y / h0 * 2.0];
+        self.last_activity = Instant::now(); // any motion un-hides the video controls
         if self.drag_mode == DragMode::None {
             return;
         }
@@ -897,6 +935,7 @@ impl State {
         let h = self.config.height.max(1) as f32;
         let max = self.scroll_max.max(0.0);
         match self.drag_mode {
+            DragMode::Seek => self.seek_to_x(x),
             DragMode::Scrub => self.scrub_to(x),
             DragMode::Pan => {
                 let vph = self.viewport_h();
@@ -991,6 +1030,52 @@ impl State {
         }
     }
 
+    /// Pixel layout of the video controls bar.
+    fn video_ui(&self) -> VideoUi {
+        let w = self.config.width as f32;
+        let h = self.config.height as f32;
+        let by = h - VCTL_H;
+        VideoUi {
+            bar: [0.0, by, w, VCTL_H],
+            play: [16.0, by + 14.0, 32.0, 32.0],
+            seek: [180.0, by + 26.0, (w - 392.0).max(40.0), 8.0],
+            audio: [w - 200.0, by + 15.0, 60.0, 30.0],
+            subs: [w - 134.0, by + 15.0, 50.0, 30.0],
+            full: [w - 78.0, by + 15.0, 44.0, 30.0],
+        }
+    }
+
+    /// (position, duration, paused) of the playing video, if any.
+    fn video_state(&self) -> Option<(f64, f64, bool)> {
+        let v = self.video.as_ref()?;
+        Some((v.position(), v.duration(), v.paused()))
+    }
+
+    /// Video controls show when a video is focused and there's been recent pointer activity (or
+    /// it's paused) — they auto-hide after a few idle seconds, like the web player.
+    fn video_controls_visible(&self) -> bool {
+        if self.focus.is_none() || self.video.is_none() {
+            return false;
+        }
+        let paused = self.video_state().map(|(_, _, p)| p).unwrap_or(false);
+        self.last_activity.elapsed().as_secs_f32() < 2.5 || paused
+    }
+
+    /// Seek the video to the fraction of the seek track at pixel x.
+    fn seek_to_x(&self, x: f32) {
+        if let (Some(v), Some((_, dur, _))) = (self.video.as_ref(), self.video_state()) {
+            if dur > 0.0 {
+                let s = self.video_ui().seek;
+                let frac = ((x - s[0]) / s[2]).clamp(0.0, 1.0);
+                v.seek(frac as f64 * dur);
+            }
+        }
+    }
+
+    pub fn take_fullscreen_request(&mut self) -> bool {
+        std::mem::take(&mut self.fullscreen_requested)
+    }
+
     /// Lightbox prev/next button rects (x, y, w, h, in pixels): (prev on the left, next on the
     /// right). Shared by hit-testing, the overlay backgrounds and the glyph placement.
     fn arrow_rects(&self) -> ([f32; 4], [f32; 4]) {
@@ -1027,7 +1112,7 @@ impl State {
                     self.velocity += (measured - self.velocity) * 0.35; // low-pass → stable bank
                     self.velocity = self.velocity.clamp(-MAX_SPEED, MAX_SPEED);
                 }
-                DragMode::Pan => self.velocity = 0.0,
+                DragMode::Pan | DragMode::Seek => self.velocity = 0.0,
                 DragMode::None => {
                     if self.input_dir != 0.0 {
                         self.velocity = (self.velocity + self.input_dir * ACCEL * dt)
@@ -1632,13 +1717,17 @@ impl State {
                     color: [240, 240, 245, 240],
                 });
             }
-            v.push(crate::ui::Line {
-                text: format!("{} / {}   ·   click ‹ › or ← →   ·   Esc", idx + 1, self.total),
-                x: cx - 140.0,
-                y: self.config.height as f32 - 40.0,
-                size: 16.0,
-                color: [225, 225, 230, 235],
-            });
+            // Position/help hint at the bottom — hidden for a playing video (its controls bar
+            // occupies that space instead).
+            if !(self.video.is_some() && self.video_controls_visible()) {
+                v.push(crate::ui::Line {
+                    text: format!("{} / {}   ·   click ‹ › or ← →   ·   Esc", idx + 1, self.total),
+                    x: cx - 140.0,
+                    y: self.config.height as f32 - 40.0,
+                    size: 16.0,
+                    color: [225, 225, 230, 235],
+                });
+            }
             if matches!(self.sources.get(idx), Some(Source::Video(_))) && !cfg!(feature = "video") {
                 // This build has no libmpv linked — explain why the clip isn't playing.
                 v.push(crate::ui::Line {
@@ -1656,6 +1745,67 @@ impl State {
                     size: 30.0,
                     color: [235, 235, 240, 255],
                 });
+            }
+            // Video controls bar labels: play/pause, current/total time, track buttons, and a
+            // hover-time tooltip over the seek bar.
+            if self.video.is_some() && self.video_controls_visible() {
+                let ui = self.video_ui();
+                let (pos, dur, paused) = self.video_state().unwrap_or((0.0, 0.0, false));
+                v.push(crate::ui::Line {
+                    text: if paused { "▶".into() } else { "❚❚".into() },
+                    x: ui.play[0] + 7.0,
+                    y: ui.play[1] + 4.0,
+                    size: 20.0,
+                    color: [240, 240, 245, 255],
+                });
+                v.push(crate::ui::Line {
+                    text: format!("{} / {}", fmt_time(pos), fmt_time(dur)),
+                    x: 58.0,
+                    y: ui.bar[1] + 21.0,
+                    size: 14.0,
+                    color: [225, 225, 230, 235],
+                });
+                v.push(crate::ui::Line {
+                    text: "Audio".into(),
+                    x: ui.audio[0] + 9.0,
+                    y: ui.audio[1] + 7.0,
+                    size: 14.0,
+                    color: [230, 230, 235, 235],
+                });
+                v.push(crate::ui::Line {
+                    text: "Subs".into(),
+                    x: ui.subs[0] + 7.0,
+                    y: ui.subs[1] + 7.0,
+                    size: 14.0,
+                    color: [230, 230, 235, 235],
+                });
+                v.push(crate::ui::Line {
+                    text: "Full".into(),
+                    x: ui.full[0] + 8.0,
+                    y: ui.full[1] + 7.0,
+                    size: 14.0,
+                    color: [230, 230, 235, 235],
+                });
+                // Hover-time over the seek bar.
+                let w = self.config.width as f32;
+                let h = self.config.height as f32;
+                let px = (self.pointer_ndc[0] + 1.0) * 0.5 * w;
+                let py = (1.0 - self.pointer_ndc[1]) * 0.5 * h;
+                if dur > 0.0
+                    && px >= ui.seek[0]
+                    && px <= ui.seek[0] + ui.seek[2]
+                    && py >= ui.bar[1]
+                    && py <= ui.bar[1] + ui.bar[3]
+                {
+                    let f = ((px - ui.seek[0]) / ui.seek[2]).clamp(0.0, 1.0) as f64;
+                    v.push(crate::ui::Line {
+                        text: fmt_time(f * dur),
+                        x: px - 18.0,
+                        y: ui.bar[1] - 26.0,
+                        size: 15.0,
+                        color: [255, 255, 255, 255],
+                    });
+                }
             }
         } else {
             // On-screen left/right scroll arrows (hold to scroll), when the wall is scrollable.
@@ -1823,6 +1973,46 @@ impl State {
                 rect: [nx(thumb_x), by, nw(thumb_w), bh],
                 color: [0.95, 0.96, 1.0, 0.9],
             });
+        }
+
+        // Video controls bar (bottom): background, seek track + fill + knob, and button chips.
+        if self.video.is_some() && self.video_controls_visible() {
+            let ui = self.video_ui();
+            // pixel rect [x,y,w,h] (top-left origin) → overlay NDC rect.
+            let r = |p: [f32; 4]| [nx(p[0]), ny_top(p[1] + p[3]), nw(p[2]), nhh(p[3])];
+            rects.push(OverlayRect {
+                rect: r(ui.bar),
+                color: [0.0, 0.0, 0.0, 0.55],
+            });
+            let (pos, dur, _) = self.video_state().unwrap_or((0.0, 0.0, false));
+            let frac = if dur > 0.0 {
+                (pos / dur).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            rects.push(OverlayRect {
+                rect: r(ui.seek),
+                color: [1.0, 1.0, 1.0, 0.22],
+            });
+            rects.push(OverlayRect {
+                rect: r([ui.seek[0], ui.seek[1], ui.seek[2] * frac, ui.seek[3]]),
+                color: [0.35, 0.70, 1.0, 0.95],
+            });
+            rects.push(OverlayRect {
+                rect: r([
+                    ui.seek[0] + ui.seek[2] * frac - 5.0,
+                    ui.seek[1] - 5.0,
+                    10.0,
+                    ui.seek[3] + 10.0,
+                ]),
+                color: [1.0, 1.0, 1.0, 0.95],
+            });
+            for b in [ui.play, ui.audio, ui.subs, ui.full] {
+                rects.push(OverlayRect {
+                    rect: r(b),
+                    color: [1.0, 1.0, 1.0, 0.12],
+                });
+            }
         }
         rects
     }
@@ -2083,6 +2273,20 @@ fn smoothstep(t: f32) -> f32 {
 /// Point-in-rect test for a pixel-space (x, y, w, h) rect.
 fn hit(rect: [f32; 4], x: f32, y: f32) -> bool {
     x >= rect[0] && x <= rect[0] + rect[2] && y >= rect[1] && y <= rect[1] + rect[3]
+}
+
+/// Seconds → "M:SS" (or "H:MM:SS").
+fn fmt_time(s: f64) -> String {
+    if !s.is_finite() || s < 0.0 {
+        return "0:00".into();
+    }
+    let t = s as u64;
+    let (h, m, sec) = (t / 3600, (t % 3600) / 60, t % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{sec:02}")
+    } else {
+        format!("{m}:{sec:02}")
+    }
 }
 
 /// Tile (w, h) in world units for an image aspect: full row height, width capped at MAX_W (a very
