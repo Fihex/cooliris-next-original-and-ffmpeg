@@ -23,7 +23,7 @@ use winit::{
     event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{KeyCode, PhysicalKey},
-    window::{Window, WindowId},
+    window::{Fullscreen, Window, WindowId},
 };
 
 use state::State;
@@ -176,10 +176,30 @@ impl ApplicationHandler for App {
                         state.set_scanning(true);
                         spawn_picker(&self.folder_tx);
                     }
-                    // Esc returns from focus, then (if already on the wall) quits.
+                    // F toggles borderless fullscreen (wall, lightbox, or video).
+                    PhysicalKey::Code(KeyCode::KeyF) if pressed => {
+                        let fs = match state.window.fullscreen() {
+                            Some(_) => None,
+                            None => Some(Fullscreen::Borderless(None)),
+                        };
+                        state.window.set_fullscreen(fs);
+                    }
+                    // Video controls (only act on a focused video; need --features video to play).
+                    PhysicalKey::Code(KeyCode::Space) if pressed => {
+                        state.video_command(&["cycle", "pause"]);
+                    }
+                    PhysicalKey::Code(KeyCode::KeyA) if pressed => {
+                        state.video_command(&["cycle", "aid"]); // next audio track
+                    }
+                    PhysicalKey::Code(KeyCode::KeyS) if pressed => {
+                        state.video_command(&["cycle", "sid"]); // next subtitle track
+                    }
+                    // Esc: leave the lightbox, else exit fullscreen, else quit.
                     PhysicalKey::Code(KeyCode::Escape) if pressed => {
                         if state.is_focused() {
                             state.back();
+                        } else if state.window.fullscreen().is_some() {
+                            state.window.set_fullscreen(None);
                         } else {
                             event_loop.exit();
                         }

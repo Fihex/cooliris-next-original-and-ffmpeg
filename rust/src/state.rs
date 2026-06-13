@@ -1448,6 +1448,14 @@ impl State {
         self.focus.is_some()
     }
 
+    /// Forward an mpv command to the playing video (no-op when nothing is playing or the `video`
+    /// feature is off). e.g. ["cycle","pause"], ["cycle","aid"], ["cycle","sid"].
+    pub fn video_command(&self, args: &[&str]) {
+        if let Some(v) = &self.video {
+            v.command(args);
+        }
+    }
+
     /// Prev/next item in the lightbox (dir = -1 / +1).
     pub fn navigate(&mut self, dir: i64) {
         if let (Some(f), true) = (self.focus, self.total > 0) {

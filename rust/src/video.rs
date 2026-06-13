@@ -26,6 +26,7 @@ mod stub {
             Player
         }
         pub fn update(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue) {}
+        pub fn command(&self, _args: &[&str]) {}
         #[allow(clippy::too_many_arguments)]
         pub fn draw<'a>(
             &'a self,
@@ -306,6 +307,19 @@ fn fs(in: V) -> @location(0) vec4<f32> {
                 tex_bg,
                 rect_buf,
                 rect_bg,
+            }
+        }
+
+        /// Send an mpv command (NULL-terminated argv), e.g. ["cycle","pause"] / ["cycle","aid"].
+        pub fn command(&self, args: &[&str]) {
+            unsafe {
+                let cstrs: Vec<CString> = args
+                    .iter()
+                    .filter_map(|a| CString::new(*a).ok())
+                    .collect();
+                let mut ptrs: Vec<*const c_char> = cstrs.iter().map(|c| c.as_ptr()).collect();
+                ptrs.push(ptr::null());
+                mpv_command(self.mpv, ptrs.as_ptr());
             }
         }
 

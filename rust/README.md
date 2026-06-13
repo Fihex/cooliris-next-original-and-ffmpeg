@@ -31,9 +31,11 @@ A small toolbar shows an **Open** button (top-left) and the **item count** with 
 while tiles decode; open a folder with the button, by **drag-and-drop**, or the **O** key. (No
 folder dialog is forced at startup — the wall opens straight away with the Open hint.)
 
-Controls: **wheel** zoom · **left-drag** scroll (click a tile to focus — video tiles play in
-place with `--features video`) · **right/middle-drag** pan · **bottom bar** scrub · **←→**
-scroll · **O** / Open button / drag-and-drop to load a folder · **Esc** back / quit.
+Controls — **wall:** **wheel** zoom (toward the cursor) · **left-drag** scroll · **right/middle-drag**
+pan · **bottom bar** scrub · **edge arrows** / **←→** scroll · click a tile to focus. **Lightbox:**
+**wheel** zoom the photo · **drag** pan when zoomed · **‹ ›** / **←→** prev/next · **Esc** back.
+**Video** (needs `--features video`): **Space** play/pause · **A** audio track · **S** subtitles.
+**F** fullscreen · **O** / Open button / drag-and-drop to load a folder · **Esc** back / exit fullscreen / quit.
 
 ## Roadmap (each step is a runnable milestone)
 
