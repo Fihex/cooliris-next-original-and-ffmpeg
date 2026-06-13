@@ -2444,8 +2444,54 @@ fn decode(source: &Source, full: bool) -> (Vec<u8>, u32, u32) {
                 }
             }
         }
-        Source::Video(_) => (video_placeholder(), TILE_PX, TILE_PX),
+        Source::Video(p) => {
+            video_thumb(p, target).unwrap_or_else(|| (video_placeholder(), TILE_PX, TILE_PX))
+        }
         Source::Placeholder(i) => (placeholder(*i), TILE_PX, TILE_PX),
+    }
+}
+
+/// Extract a poster frame from a video via ffmpeg, scaled to fit `target`, with a play badge drawn
+/// on it. Returns None (→ fall back to the placeholder) if ffmpeg is missing or fails.
+fn video_thumb(p: &std::path::Path, target: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-nostdin", "-loglevel", "error", "-i"])
+        .arg(p)
+        .args(["-frames:v", "1", "-vf"])
+        .arg(format!(
+            "scale={target}:{target}:force_original_aspect_ratio=decrease"
+        ))
+        .args(["-f", "image2pipe", "-vcodec", "png", "pipe:1"])
+        .output()
+        .ok()?;
+    if !out.status.success() || out.stdout.is_empty() {
+        return None;
+    }
+    let mut rgba = image::load_from_memory(&out.stdout).ok()?.to_rgba8();
+    let (w, h) = (rgba.width(), rgba.height());
+    draw_play_badge(&mut rgba, w, h);
+    Some((rgba.into_raw(), w, h))
+}
+
+/// Draw a play badge (a dim circle + white triangle) over the center of a thumbnail.
+fn draw_play_badge(buf: &mut image::RgbaImage, w: u32, h: u32) {
+    let (cx, cy) = (w as f32 * 0.5, h as f32 * 0.5);
+    let r = w.min(h) as f32 * 0.15;
+    for y in 0..h {
+        for x in 0..w {
+            let (dx, dy) = (x as f32 - cx, y as f32 - cy);
+            if dx * dx + dy * dy >= r * r {
+                continue;
+            }
+            let px = buf.get_pixel_mut(x, y);
+            // Play triangle (pointing right), else darken the circle behind it.
+            if dx > -r * 0.4 && dx < r * 0.5 && dy.abs() < (r * 0.5 - dx) * 0.72 {
+                *px = image::Rgba([245, 245, 250, 255]);
+            } else {
+                let c = px.0;
+                *px = image::Rgba([c[0] / 2, c[1] / 2, c[2] / 2, 255]);
+            }
+        }
     }
 }
 
