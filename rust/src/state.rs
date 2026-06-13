@@ -766,9 +766,9 @@ impl State {
     /// zoom, horizontal (trackpad) = pan. Web feel.
     pub fn wheel(&mut self, dx: f32, dy: f32) {
         if self.focus.is_some() {
-            // Zoom the focused item toward the cursor (dy < 0 is scroll-up → zoom in). Fit → 8×.
+            // Zoom the focused item toward the cursor, 1.2× per wheel step (matches the web). 1→8×.
             let old = self.lb_zoom;
-            let factor = (1.0 - dy * 0.0022).clamp(0.6, 1.7);
+            let factor = if dy < 0.0 { 1.2 } else { 1.0 / 1.2 };
             self.lb_zoom = (self.lb_zoom * factor).clamp(1.0, 8.0);
             let ratio = self.lb_zoom / old;
             // Keep the point under the cursor fixed as the image scales about it.
@@ -802,6 +802,43 @@ impl State {
     fn reset_lb_view(&mut self) {
         self.lb_zoom = 1.0;
         self.lb_pan = [0.0, 0.0];
+    }
+
+    /// Aspect (w/h) of the focused image — full-res if loaded, else the thumbnail. None for videos
+    /// or nothing decoded yet.
+    fn focused_aspect(&self) -> Option<f32> {
+        let idx = self.focus?;
+        if self.full_for == Some(idx) {
+            return Some(self.full_extent[0] / self.full_extent[1]);
+        }
+        match self.resident.get(&idx) {
+            Some(Tile::Ready { aspect, .. }) => Some(*aspect),
+            _ => None,
+        }
+    }
+
+    /// The focused image's on-screen rect in NDC (x, y bottom-left, w, h), with zoom + pan applied.
+    fn lightbox_rect_ndc(&self) -> Option<[f32; 4]> {
+        let aspect = self.focused_aspect()?;
+        let sa = self.config.width as f32 / self.config.height.max(1) as f32;
+        let margin = 0.92;
+        let (fitw, fith) = if aspect > sa {
+            (2.0 * margin, 2.0 * margin * sa / aspect)
+        } else {
+            (2.0 * margin * aspect / sa, 2.0 * margin)
+        };
+        let (qw, qh) = (fitw * self.lb_zoom, fith * self.lb_zoom);
+        Some([-qw / 2.0 + self.lb_pan[0], -qh / 2.0 + self.lb_pan[1], qw, qh])
+    }
+
+    /// True if a screen-space pixel falls on the focused image (vs the empty/dim area).
+    fn click_on_lightbox_image(&self, x: f32, y: f32) -> bool {
+        let Some(r) = self.lightbox_rect_ndc() else {
+            return false;
+        };
+        let nx = x / self.config.width.max(1) as f32 * 2.0 - 1.0;
+        let ny = 1.0 - y / self.config.height.max(1) as f32 * 2.0;
+        nx >= r[0] && nx <= r[0] + r[2] && ny >= r[1] && ny <= r[1] + r[3]
     }
 
     /// Pointer pressed (button: 0 left, 1 middle, 2 right). Bottom band scrubs; middle/right
@@ -900,8 +937,12 @@ impl State {
         self.drag_mode = DragMode::None;
         if mode == DragMode::Scroll && !self.drag_moved {
             if self.focus.is_some() {
-                self.recenter_on_focus(); // leave the wall on the photo you were viewing
-                self.focus = None;
+                // Like the web: a click closes only on the empty/dim area — clicking the image
+                // itself does nothing (so you can't accidentally close while interacting with it).
+                if !self.click_on_lightbox_image(self.drag_last_x, self.drag_last_y) {
+                    self.recenter_on_focus(); // leave the wall on the photo you were viewing
+                    self.focus = None;
+                }
             } else if let Some(i) = self.pick(self.drag_last_x, self.drag_last_y) {
                 self.focus = Some(i);
                 self.reset_lb_view();
