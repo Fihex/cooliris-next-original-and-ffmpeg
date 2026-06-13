@@ -114,6 +114,37 @@ fn vs(@builtin(vertex_index) vi: u32, in: In) -> V {
 fn fs(in: V) -> @location(0) vec4<f32> { return in.color; }
 "#;
 
+/// Lightbox: the focused image drawn as a fitted, centered screen-space quad over a dimmed wall.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct LbUniform {
+    rect: [f32; 4],     // NDC x, y (bottom-left), w, h
+    uv_layer: [f32; 4], // uv.x, uv.y (extent), layer, alpha
+}
+const LIGHTBOX_SHADER: &str = r#"
+@group(0) @binding(0) var atlas: texture_2d_array<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct LB { rect: vec4<f32>, uv_layer: vec4<f32> };
+@group(1) @binding(0) var<uniform> lb: LB;
+struct V { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32> };
+@vertex
+fn vs(@builtin(vertex_index) i: u32) -> V {
+    var c = array<vec2<f32>, 6>(
+        vec2(0.,0.), vec2(1.,0.), vec2(0.,1.), vec2(0.,1.), vec2(1.,0.), vec2(1.,1.));
+    let q = c[i];
+    let p = lb.rect.xy + q * lb.rect.zw;
+    var out: V;
+    out.clip = vec4(p, 0.0, 1.0);
+    out.uv = vec2(q.x, 1.0 - q.y) * lb.uv_layer.xy;
+    return out;
+}
+@fragment
+fn fs(in: V) -> @location(0) vec4<f32> {
+    let c = textureSample(atlas, samp, in.uv, i32(lb.uv_layer.z));
+    return vec4(c.rgb, lb.uv_layer.w);
+}
+"#;
+
 /// Where a tile's pixels come from — an image file, a video file (shown as a play tile, played on
 /// focus), or a generated placeholder when no folder is given.
 #[derive(Clone)]
@@ -172,6 +203,9 @@ pub struct State {
     num_instances: u32,
     overlay_pipeline: wgpu::RenderPipeline,
     overlay_buf: wgpu::Buffer,
+    lightbox_pipeline: wgpu::RenderPipeline,
+    lb_buf: wgpu::Buffer,
+    lb_bg: wgpu::BindGroup,
     ui: crate::ui::Ui,
 
     camera_buf: wgpu::Buffer,
@@ -503,6 +537,69 @@ impl State {
         });
         let ui = crate::ui::Ui::new(&device, &queue, config.format);
 
+        // --- lightbox (focused image fitted over the dimmed wall; reuses the tile texture array) ---
+        let lb_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lightbox"),
+            size: size_of::<LbUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let lb_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("lb-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let lb_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("lb-bg"),
+            layout: &lb_bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: lb_buf.as_entire_binding(),
+            }],
+        });
+        let lb_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("lightbox-shader"),
+            source: wgpu::ShaderSource::Wgsl(LIGHTBOX_SHADER.into()),
+        });
+        let lb_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("lb-pl"),
+            bind_group_layouts: &[&tex_bgl, &lb_bgl],
+            push_constant_ranges: &[],
+        });
+        let lightbox_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("lightbox-pipeline"),
+            layout: Some(&lb_layout),
+            vertex: wgpu::VertexState {
+                module: &lb_shader,
+                entry_point: "vs",
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &lb_shader,
+                entry_point: "fs",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+
         let mut state = State {
             window,
             surface,
@@ -517,6 +614,9 @@ impl State {
             num_instances: 0,
             overlay_pipeline,
             overlay_buf,
+            lightbox_pipeline,
+            lb_buf,
+            lb_bg,
             ui,
             camera_buf,
             camera_bg,
@@ -757,13 +857,28 @@ impl State {
             .iter()
             .filter(|(i, t)| {
                 let col = (**i / ROWS) as i64;
-                (col < first || col > last) && !matches!(t, Tile::Loading)
+                (col < first || col > last)
+                    && !matches!(t, Tile::Loading)
+                    && Some(**i) != self.focus // never evict the open (focused) item
             })
             .map(|(i, _)| *i)
             .collect();
         for i in evict {
             if let Some(Tile::Ready { layer, .. }) = self.resident.remove(&i) {
                 self.free_layers.push(layer);
+            }
+        }
+
+        // Always keep the open (focused) item loaded — prev/next can move it outside the window.
+        if let Some(f) = self.focus {
+            if !self.resident.contains_key(&f) && self.inflight < MAX_INFLIGHT {
+                self.resident.insert(f, Tile::Loading);
+                self.inflight += 1;
+                let _ = self.job_tx.send(Job {
+                    index: f,
+                    source: self.sources[f].clone(),
+                    gen: self.generation,
+                });
             }
         }
 
@@ -992,6 +1107,21 @@ impl State {
         self.focus.is_some()
     }
 
+    /// Prev/next item in the lightbox (dir = -1 / +1).
+    pub fn navigate(&mut self, dir: i64) {
+        if let (Some(f), true) = (self.focus, self.total > 0) {
+            self.focus = Some((f as i64 + dir).clamp(0, self.total as i64 - 1) as usize);
+        }
+    }
+
+    /// True while the open item's image hasn't finished decoding yet.
+    fn focus_loading(&self) -> bool {
+        match self.focus {
+            Some(i) => !matches!(self.resident.get(&i), Some(Tile::Ready { .. })),
+            None => false,
+        }
+    }
+
     pub fn current_folder(&self) -> Option<&std::path::Path> {
         self.current_folder.as_deref()
     }
@@ -1048,22 +1178,75 @@ impl State {
             size: 15.0,
             color: [205, 205, 215, 235],
         });
-        // A big centered "Loading…" right after opening a folder, while the first tiles decode.
-        let ready = self
-            .resident
-            .values()
-            .filter(|t| matches!(t, Tile::Ready { .. }))
-            .count();
-        if self.inflight > 0 && ready < 6 {
+
+        let cx = self.config.width as f32 * 0.5;
+        let cy = self.config.height as f32 * 0.5;
+        if let Some(idx) = self.focus {
+            // Lightbox: item position + prev/next hint, and "Loading…" until the image decodes.
             v.push(crate::ui::Line {
-                text: "Loading…".into(),
-                x: self.config.width as f32 * 0.5 - 52.0,
-                y: self.config.height as f32 * 0.5 - 20.0,
-                size: 30.0,
-                color: [235, 235, 240, 255],
+                text: format!("{} / {}     ‹ ← →  ·  Esc ›", idx + 1, self.total),
+                x: cx - 120.0,
+                y: self.config.height as f32 - 40.0,
+                size: 16.0,
+                color: [225, 225, 230, 235],
             });
+            if self.focus_loading() {
+                v.push(crate::ui::Line {
+                    text: "Loading…".into(),
+                    x: cx - 52.0,
+                    y: cy - 20.0,
+                    size: 30.0,
+                    color: [235, 235, 240, 255],
+                });
+            }
+        } else {
+            // Big centered "Loading…" right after opening a folder, while the first tiles decode.
+            let ready = self
+                .resident
+                .values()
+                .filter(|t| matches!(t, Tile::Ready { .. }))
+                .count();
+            if self.inflight > 0 && ready < 6 {
+                v.push(crate::ui::Line {
+                    text: "Loading…".into(),
+                    x: cx - 52.0,
+                    y: cy - 20.0,
+                    size: 30.0,
+                    color: [235, 235, 240, 255],
+                });
+            }
         }
         v
+    }
+
+    /// Fit the focused image to the screen (preserving aspect), fade it in, and write the
+    /// lightbox uniform. Returns whether there's an image to draw (false for videos / not loaded).
+    fn prepare_lightbox(&self) -> bool {
+        let Some(idx) = self.focus else {
+            return false;
+        };
+        if matches!(self.sources.get(idx), Some(Source::Video(_))) {
+            return false; // videos play via the video layer, not the lightbox
+        }
+        let Some(Tile::Ready { layer, aspect, uv }) = self.resident.get(&idx) else {
+            return false; // still decoding
+        };
+        let w = self.config.width.max(1) as f32;
+        let h = self.config.height.max(1) as f32;
+        let screen_aspect = w / h;
+        let margin = 0.92; // leave a border around the fitted image
+        let (qw, qh) = if *aspect > screen_aspect {
+            (2.0 * margin, 2.0 * margin * screen_aspect / *aspect)
+        } else {
+            (2.0 * margin * *aspect / screen_aspect, 2.0 * margin)
+        };
+        let u = LbUniform {
+            rect: [-qw / 2.0, -qh / 2.0, qw, qh],
+            uv_layer: [uv[0], uv[1], *layer as f32, smoothstep(self.focus_t)],
+        };
+        self.queue
+            .write_buffer(&self.lb_buf, 0, bytemuck::cast_slice(&[u]));
+        true
     }
 
     /// Screen-space overlay rects: the Open button background, a top loading bar, and the bottom
@@ -1076,6 +1259,14 @@ impl State {
         let ny_top = |px: f32| 1.0 - px / h * 2.0; // px from top → NDC y
         let nhh = |px: f32| px / h * 2.0;
         let mut rects = Vec::new();
+
+        // [0] Lightbox dim — full-screen, ramps with focus (alpha 0 when not focused). Drawn
+        // before the fitted image; the rest of the overlay is drawn after it.
+        let s = smoothstep(self.focus_t);
+        rects.push(OverlayRect {
+            rect: [-1.0, -1.0, 2.0, 2.0],
+            color: [0.02, 0.02, 0.03, 0.93 * s],
+        });
 
         // Open button background.
         rects.push(OverlayRect {
@@ -1132,6 +1323,7 @@ impl State {
             self.queue
                 .write_buffer(&self.overlay_buf, 0, bytemuck::cast_slice(&overlay));
         }
+        let lb_visible = self.prepare_lightbox();
         let lines = self.ui_lines();
         self.ui.prepare(
             &self.device,
@@ -1175,16 +1367,29 @@ impl State {
                 rp.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
                 rp.draw_indexed(0..INDICES.len() as u32, 0, 0..self.num_instances);
             }
-            // Playing video draws over its (focused) tile.
+            // Lightbox dim (overlay rect [0]) — between the wall and the fitted image.
+            if !overlay.is_empty() {
+                rp.set_pipeline(&self.overlay_pipeline);
+                rp.set_vertex_buffer(0, self.overlay_buf.slice(..));
+                rp.draw(0..6, 0..1);
+            }
+            // Playing video draws over its (focused) tile, on top of the dim.
             if let (Some(v), Some(idx)) = (&self.video, self.focus) {
                 let (cx, cy) = self.tile_center(idx);
                 v.draw(&mut rp, &self.camera_bg, [cx, cy], [1.6, 0.9], &self.queue);
             }
-            // Toolbar + scrubber overlay (2D, on top of everything).
-            if !overlay.is_empty() {
+            // Lightbox: the focused image fitted + centered over the dimmed wall.
+            if lb_visible {
+                rp.set_pipeline(&self.lightbox_pipeline);
+                rp.set_bind_group(0, &self.tex_bg, &[]);
+                rp.set_bind_group(1, &self.lb_bg, &[]);
+                rp.draw(0..6, 0..1);
+            }
+            // Toolbar + scrubber overlay (rects [1..]).
+            if overlay.len() > 1 {
                 rp.set_pipeline(&self.overlay_pipeline);
                 rp.set_vertex_buffer(0, self.overlay_buf.slice(..));
-                rp.draw(0..6, 0..overlay.len() as u32);
+                rp.draw(0..6, 1..overlay.len() as u32);
             }
             self.ui.render(&mut rp);
         }
@@ -1301,6 +1506,11 @@ fn placeholder(i: usize) -> Vec<u8> {
         }
     }
     buf
+}
+
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 fn hsv(h: f32, s: f32, v: f32) -> (u8, u8, u8) {

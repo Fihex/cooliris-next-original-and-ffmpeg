@@ -129,11 +129,24 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
                 match event.physical_key {
+                    // Arrows: prev/next in the lightbox, otherwise scroll the wall.
                     PhysicalKey::Code(KeyCode::ArrowRight) => {
-                        state.set_dir(if pressed { 1.0 } else { 0.0 })
+                        if state.is_focused() {
+                            if pressed {
+                                state.navigate(1);
+                            }
+                        } else {
+                            state.set_dir(if pressed { 1.0 } else { 0.0 });
+                        }
                     }
                     PhysicalKey::Code(KeyCode::ArrowLeft) => {
-                        state.set_dir(if pressed { -1.0 } else { 0.0 })
+                        if state.is_focused() {
+                            if pressed {
+                                state.navigate(-1);
+                            }
+                        } else {
+                            state.set_dir(if pressed { -1.0 } else { 0.0 });
+                        }
                     }
                     // O opens a folder picker at runtime.
                     PhysicalKey::Code(KeyCode::KeyO) if pressed => spawn_picker(&self.folder_tx),
