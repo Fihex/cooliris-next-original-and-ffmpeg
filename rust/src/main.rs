@@ -13,6 +13,7 @@ mod ui;
 mod video;
 
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
 
 use winit::{
@@ -26,11 +27,31 @@ use winit::{
 
 use state::State;
 
-#[derive(Default)]
 struct App {
     state: Option<State>,
     cursor: (f64, f64),
     folder: Option<PathBuf>,
+    folder_tx: Sender<PathBuf>,   // picker threads send the chosen folder here
+    folder_rx: Receiver<PathBuf>, // polled each frame → reload
+}
+
+/// Open the native folder picker on a worker thread (blocking it inside the winit loop hangs /
+/// fails on some Linux portals); the chosen folder comes back via the channel.
+fn spawn_picker(tx: &Sender<PathBuf>) {
+    let tx = tx.clone();
+    log::info!("opening folder picker…");
+    std::thread::spawn(move || {
+        match rfd::FileDialog::new()
+            .set_title("Open a photo / video folder")
+            .pick_folder()
+        {
+            Some(dir) => {
+                log::info!("picked folder: {dir:?}");
+                let _ = tx.send(dir);
+            }
+            None => log::info!("folder picker cancelled / unavailable"),
+        }
+    });
 }
 
 impl ApplicationHandler for App {
@@ -99,12 +120,7 @@ impl ApplicationHandler for App {
                 if btn_state == ElementState::Pressed {
                     state.pointer_down(code, cx, cy);
                     if state.take_open_request() {
-                        if let Some(dir) = rfd::FileDialog::new()
-                            .set_title("Open a folder")
-                            .pick_folder()
-                        {
-                            state.reload(Some(dir));
-                        }
+                        spawn_picker(&self.folder_tx);
                     }
                 } else {
                     state.pointer_up(code);
@@ -120,13 +136,7 @@ impl ApplicationHandler for App {
                         state.set_dir(if pressed { -1.0 } else { 0.0 })
                     }
                     // O opens a folder picker at runtime.
-                    PhysicalKey::Code(KeyCode::KeyO) if pressed => {
-                        if let Some(dir) =
-                            rfd::FileDialog::new().set_title("Open a folder").pick_folder()
-                        {
-                            state.reload(Some(dir));
-                        }
-                    }
+                    PhysicalKey::Code(KeyCode::KeyO) if pressed => spawn_picker(&self.folder_tx),
                     // Esc returns from focus, then (if already on the wall) quits.
                     PhysicalKey::Code(KeyCode::Escape) if pressed => {
                         if state.is_focused() {
@@ -139,6 +149,10 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // A picker thread may have delivered a folder.
+                while let Ok(folder) = self.folder_rx.try_recv() {
+                    state.reload(Some(folder));
+                }
                 state.update();
                 match state.render() {
                     Ok(()) => {}
@@ -165,9 +179,13 @@ fn main() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
+    let (folder_tx, folder_rx) = std::sync::mpsc::channel();
     let mut app = App {
+        state: None,
+        cursor: (0.0, 0.0),
         folder,
-        ..App::default()
+        folder_tx,
+        folder_rx,
     };
     event_loop.run_app(&mut app).expect("event loop error");
 }

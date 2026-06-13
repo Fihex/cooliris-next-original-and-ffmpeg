@@ -1048,6 +1048,21 @@ impl State {
             size: 15.0,
             color: [205, 205, 215, 235],
         });
+        // A big centered "Loading…" right after opening a folder, while the first tiles decode.
+        let ready = self
+            .resident
+            .values()
+            .filter(|t| matches!(t, Tile::Ready { .. }))
+            .count();
+        if self.inflight > 0 && ready < 6 {
+            v.push(crate::ui::Line {
+                text: "Loading…".into(),
+                x: self.config.width as f32 * 0.5 - 52.0,
+                y: self.config.height as f32 * 0.5 - 20.0,
+                size: 30.0,
+                color: [235, 235, 240, 255],
+            });
+        }
         v
     }
 
@@ -1229,16 +1244,22 @@ fn gather_sources(folder: Option<PathBuf>) -> Vec<Source> {
         log::info!("no folder chosen — showing placeholders");
         return (0..24).map(Source::Placeholder).collect();
     };
-    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .into_iter()
-        .flatten()
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!("can't read folder {dir:?}: {e} — showing placeholders");
+            return (0..24).map(Source::Placeholder).collect();
+        }
+    };
+    let mut paths: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| classify(p).is_some())
         .collect();
     paths.sort();
+    log::info!("folder {dir:?}: {} media files", paths.len());
     if paths.is_empty() {
-        log::info!("no media in {dir:?} — showing placeholders");
+        log::info!("no images/videos in {dir:?} — showing placeholders");
         return (0..24).map(Source::Placeholder).collect();
     }
     paths
