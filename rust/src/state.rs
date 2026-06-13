@@ -20,6 +20,7 @@ use winit::window::Window;
 
 // Layout + motion tuned to match the web wall (libmpv/src/wall/WallScene.ts).
 const TILE_PX: u32 = 512; // texture-array layer size (images resized to fit, preserving aspect)
+const FULL_PX: u32 = 2048; // full-res size decoded for the focused photo (crisp lightbox)
 const ROWS: usize = 3;
 const TILE: f32 = 1.0; // row height (ROW_H)
 const MAX_W: f32 = 1.55; // widest a landscape tile may get
@@ -165,14 +166,23 @@ pub enum Source {
 struct Job {
     index: usize,
     source: Source,
-    gen: u64, // library generation — results from an old library are dropped
+    gen: u64,   // library generation — results from an old library are dropped
+    full: bool, // decode at FULL_PX for the focused lightbox (vs TILE_PX thumbnail)
 }
 struct Loaded {
     index: usize,
     rgba: Vec<u8>, // empty == decode failed
-    w: u32,        // resized dims (≤ TILE_PX), preserving aspect
+    w: u32,        // resized dims (≤ TILE_PX or FULL_PX), preserving aspect
     h: u32,
     gen: u64,
+    full: bool,
+}
+
+/// Which texture the lightbox pass should bind for the focused image.
+enum LbDraw {
+    None,
+    Thumb, // the streamed 512px thumbnail (tile array)
+    Full,  // the full-resolution texture
 }
 
 /// Per-resident-tile status.
@@ -214,6 +224,13 @@ pub struct State {
     lightbox_pipeline: wgpu::RenderPipeline,
     lb_buf: wgpu::Buffer,
     lb_bg: wgpu::BindGroup,
+    // Full-resolution texture for the focused photo (a single high-res layer the lightbox samples
+    // instead of the 512px thumb — bound as an alternate group(0), reusing the lightbox pipeline).
+    full_tex: wgpu::Texture,
+    full_bg: wgpu::BindGroup,
+    full_for: Option<usize>,     // index currently uploaded into full_tex
+    full_pending: Option<usize>, // index whose full decode is in flight
+    full_extent: [f32; 2],       // fraction of full_tex the image fills
     ui: crate::ui::Ui,
 
     camera_buf: wgpu::Buffer,
@@ -323,7 +340,7 @@ impl State {
             let result_tx = result_tx.clone();
             std::thread::spawn(move || {
                 while let Ok(job) = job_rx.recv() {
-                    let (rgba, w, h) = decode(&job.source);
+                    let (rgba, w, h) = decode(&job.source, job.full);
                     if result_tx
                         .send(Loaded {
                             index: job.index,
@@ -331,6 +348,7 @@ impl State {
                             w,
                             h,
                             gen: job.gen,
+                            full: job.full,
                         })
                         .is_err()
                     {
@@ -610,6 +628,42 @@ impl State {
             cache: None,
         });
 
+        // Full-resolution texture for the focused photo: one reusable FULL_PX layer (~16 MB). It's
+        // a 1-layer 2d-array so the existing lightbox pipeline (which samples texture_2d_array) can
+        // bind it as an alternate group(0) with no extra pipeline.
+        let full_tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("full-res"),
+            size: wgpu::Extent3d {
+                width: FULL_PX,
+                height: FULL_PX,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let full_view = full_tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let full_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("full-bg"),
+            layout: &tex_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&full_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
         let mut state = State {
             window,
             surface,
@@ -627,6 +681,11 @@ impl State {
             lightbox_pipeline,
             lb_buf,
             lb_bg,
+            full_tex,
+            full_bg,
+            full_for: None,
+            full_pending: None,
+            full_extent: [1.0, 1.0],
             ui,
             camera_buf,
             camera_bg,
@@ -892,6 +951,11 @@ impl State {
             let Ok(res) = self.result_rx.try_recv() else {
                 break;
             };
+            // Full-res lightbox decodes are off the thumbnail throttle (one at a time, not pooled).
+            if res.full {
+                self.apply_full(res);
+                continue;
+            }
             self.inflight = self.inflight.saturating_sub(1);
             if res.gen != self.generation {
                 continue; // result from a previous library (folder was swapped)
@@ -957,7 +1021,28 @@ impl State {
                     index: f,
                     source: self.sources[f].clone(),
                     gen: self.generation,
+                    full: false,
                 });
+            }
+        }
+
+        // Request a full-resolution decode of the focused photo for a crisp lightbox (the thumb
+        // shows immediately; the full image swaps in when it arrives). Dropped on deselect.
+        match self.focus {
+            Some(f) if matches!(self.sources.get(f), Some(Source::File(_))) => {
+                if self.full_pending != Some(f) && self.full_for != Some(f) {
+                    self.full_pending = Some(f);
+                    let _ = self.job_tx.send(Job {
+                        index: f,
+                        source: self.sources[f].clone(),
+                        gen: self.generation,
+                        full: true,
+                    });
+                }
+            }
+            _ => {
+                self.full_pending = None;
+                self.full_for = None;
             }
         }
 
@@ -986,6 +1071,7 @@ impl State {
                         index: idx,
                         source: self.sources[idx].clone(),
                         gen: self.generation,
+                        full: false,
                     });
                 }
             }
@@ -1074,6 +1160,40 @@ impl State {
                 depth_or_array_layers: 1,
             },
         );
+    }
+
+    /// Upload a finished full-resolution decode into full_tex — if it's still the focused photo.
+    fn apply_full(&mut self, res: Loaded) {
+        if self.full_pending == Some(res.index) {
+            self.full_pending = None;
+        }
+        if res.gen != self.generation || self.focus != Some(res.index) {
+            return; // library swapped or the user moved on before it finished
+        }
+        if res.rgba.is_empty() || res.w == 0 || res.h == 0 {
+            return; // decode failed — keep showing the thumbnail
+        }
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.full_tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &res.rgba,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * res.w),
+                rows_per_image: Some(res.h),
+            },
+            wgpu::Extent3d {
+                width: res.w,
+                height: res.h,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.full_extent = [res.w as f32 / FULL_PX as f32, res.h as f32 / FULL_PX as f32];
+        self.full_for = Some(res.index);
     }
 
     fn rebuild_instances(&mut self) {
@@ -1373,34 +1493,41 @@ impl State {
         v
     }
 
-    /// Fit the focused image to the screen (preserving aspect), fade it in, and write the
-    /// lightbox uniform. Returns whether there's an image to draw (false for videos / not loaded).
-    fn prepare_lightbox(&self) -> bool {
+    /// Fit the focused image to the screen (preserving aspect), fade it in, and write the lightbox
+    /// uniform. Prefers the full-res texture once it's uploaded, else the streamed thumbnail.
+    /// Returns which texture the render pass should bind (None for videos / nothing decoded yet).
+    fn prepare_lightbox(&self) -> LbDraw {
         let Some(idx) = self.focus else {
-            return false;
+            return LbDraw::None;
         };
         if matches!(self.sources.get(idx), Some(Source::Video(_))) {
-            return false; // videos play via the video layer, not the lightbox
+            return LbDraw::None; // videos play via the video layer, not the lightbox
         }
-        let Some(Tile::Ready { layer, aspect, uv }) = self.resident.get(&idx) else {
-            return false; // still decoding
+        // (aspect, uv extent, layer, which bind group) — full-res if ready, else the thumb.
+        let (aspect, uv, layer, draw) = if self.full_for == Some(idx) {
+            let e = self.full_extent;
+            (e[0] / e[1], e, 0.0, LbDraw::Full)
+        } else if let Some(Tile::Ready { layer, aspect, uv }) = self.resident.get(&idx) {
+            (*aspect, *uv, *layer as f32, LbDraw::Thumb)
+        } else {
+            return LbDraw::None; // still decoding
         };
         let w = self.config.width.max(1) as f32;
         let h = self.config.height.max(1) as f32;
         let screen_aspect = w / h;
         let margin = 0.92; // leave a border around the fitted image
-        let (qw, qh) = if *aspect > screen_aspect {
-            (2.0 * margin, 2.0 * margin * screen_aspect / *aspect)
+        let (qw, qh) = if aspect > screen_aspect {
+            (2.0 * margin, 2.0 * margin * screen_aspect / aspect)
         } else {
-            (2.0 * margin * *aspect / screen_aspect, 2.0 * margin)
+            (2.0 * margin * aspect / screen_aspect, 2.0 * margin)
         };
         let u = LbUniform {
             rect: [-qw / 2.0, -qh / 2.0, qw, qh],
-            uv_layer: [uv[0], uv[1], *layer as f32, smoothstep(self.focus_t)],
+            uv_layer: [uv[0], uv[1], layer, smoothstep(self.focus_t)],
         };
         self.queue
             .write_buffer(&self.lb_buf, 0, bytemuck::cast_slice(&[u]));
-        true
+        draw
     }
 
     /// Screen-space overlay rects: the Open button background, a top loading bar, and the bottom
@@ -1546,10 +1673,16 @@ impl State {
                 let (cx, cy) = self.tile_center(idx);
                 v.draw(&mut rp, &self.camera_bg, [cx, cy], [1.6, 0.9], &self.queue);
             }
-            // Lightbox: the focused image fitted + centered over the dimmed wall.
-            if lb_visible {
+            // Lightbox: the focused image fitted + centered over the dimmed wall (full-res texture
+            // once it's ready, otherwise the streamed thumbnail).
+            let lb_tex = match lb_visible {
+                LbDraw::Full => Some(&self.full_bg),
+                LbDraw::Thumb => Some(&self.tex_bg),
+                LbDraw::None => None,
+            };
+            if let Some(tex_bg) = lb_tex {
                 rp.set_pipeline(&self.lightbox_pipeline);
-                rp.set_bind_group(0, &self.tex_bg, &[]);
+                rp.set_bind_group(0, tex_bg, &[]);
                 rp.set_bind_group(1, &self.lb_bg, &[]);
                 rp.draw(0..6, 0..1);
             }
@@ -1569,7 +1702,8 @@ impl State {
 
 /// Decode + downscale one tile (runs on a worker thread). Resizes to fit TILE_PX preserving
 /// aspect; returns (rgba, w, h). Empty/zero == failure.
-fn decode(source: &Source) -> (Vec<u8>, u32, u32) {
+fn decode(source: &Source, full: bool) -> (Vec<u8>, u32, u32) {
+    let target = if full { FULL_PX } else { TILE_PX };
     match source {
         Source::File(p) => {
             // Decode by CONTENT, not extension — many files are mislabeled (a ".jpg" whose bytes
@@ -1580,9 +1714,13 @@ fn decode(source: &Source) -> (Vec<u8>, u32, u32) {
                 .and_then(|r| r.decode().map_err(|e| e.to_string()));
             match decoded {
                 Ok(img) => {
-                    let t = img
-                        .resize(TILE_PX, TILE_PX, image::imageops::FilterType::Triangle)
-                        .to_rgba8();
+                    // Only downscale; never upscale a small image (no quality to gain, wastes VRAM).
+                    let t = if img.width() > target || img.height() > target {
+                        img.resize(target, target, image::imageops::FilterType::Triangle)
+                            .to_rgba8()
+                    } else {
+                        img.to_rgba8()
+                    };
                     let (w, h) = (t.width(), t.height());
                     (t.into_raw(), w, h)
                 }
