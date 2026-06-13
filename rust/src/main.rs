@@ -8,6 +8,7 @@
 // Run: `cargo run --release -- /path/to/photos`  (no path → placeholder tiles).
 // Controls: mouse wheel or ←/→ to scroll the wall.
 
+mod post;
 mod state;
 mod ui;
 mod video;

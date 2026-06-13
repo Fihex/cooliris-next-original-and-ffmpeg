@@ -231,6 +231,7 @@ pub struct State {
     full_for: Option<usize>,     // index currently uploaded into full_tex
     full_pending: Option<usize>, // index whose full decode is in flight
     full_extent: [f32; 2],       // fraction of full_tex the image fills
+    post: crate::post::Post,     // offscreen scene + blur for the lightbox backdrop
     ui: crate::ui::Ui,
 
     camera_buf: wgpu::Buffer,
@@ -566,6 +567,7 @@ impl State {
             mapped_at_creation: false,
         });
         let ui = crate::ui::Ui::new(&device, &queue, config.format);
+        let post = crate::post::Post::new(&device, &queue, config.format, size.width, size.height);
 
         // --- lightbox (focused image fitted over the dimmed wall; reuses the tile texture array) ---
         let lb_buf = device.create_buffer(&wgpu::BufferDescriptor {
@@ -688,6 +690,7 @@ impl State {
             full_for: None,
             full_pending: None,
             full_extent: [1.0, 1.0],
+            post,
             ui,
             camera_buf,
             camera_bg,
@@ -746,6 +749,8 @@ impl State {
             self.config.width = size.width;
             self.config.height = size.height;
             self.surface.configure(&self.device, &self.config);
+            self.post
+                .resize(&self.device, &self.queue, size.width, size.height);
             self.upload_camera();
         }
     }
@@ -1694,16 +1699,22 @@ impl State {
             &lines,
         );
 
+        // The lightbox backdrop blur/dim ramps in with the focus animation.
+        let mix = smoothstep(self.focus_t);
+        self.post.set_params(&self.queue, mix, 0.42);
+
         let mut enc = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame-encoder"),
             });
+
+        // Pass 1: the wall (tiles + reflections) → the offscreen scene texture.
         {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("wall-pass"),
+                label: Some("scene-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
+                    view: self.post.scene_view(),
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -1728,12 +1739,36 @@ impl State {
                 rp.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
                 rp.draw_indexed(0..INDICES.len() as u32, 0, 0..self.num_instances);
             }
-            // Lightbox dim (overlay rect [0]) — between the wall and the fitted image.
-            if !overlay.is_empty() {
-                rp.set_pipeline(&self.overlay_pipeline);
-                rp.set_vertex_buffer(0, self.overlay_buf.slice(..));
-                rp.draw(0..6, 0..1);
-            }
+        }
+
+        // Passes 2–3: blur the scene for the backdrop (only while the lightbox is open).
+        if mix > 0.001 {
+            self.post.record_blur(&mut enc);
+        }
+
+        // Pass 4: composite the backdrop (sharp wall ↔ blurred+dark) to the swapchain, then draw
+        // the focused video / image and the 2D overlay + text on top.
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("present-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.02,
+                            g: 0.02,
+                            b: 0.03,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.post.draw_composite(&mut rp);
             // Playing video draws over its (focused) tile, sized to fill the focused view (16:9,
             // the mpv render aspect), with the same zoom/pan as a focused photo.
             if let (Some(v), Some(idx)) = (&self.video, self.focus) {
@@ -1746,8 +1781,7 @@ impl State {
                 let size = [sw * self.lb_zoom, sh * self.lb_zoom];
                 v.draw(&mut rp, &self.camera_bg, [ox, oy], size, &self.queue);
             }
-            // Lightbox: the focused image fitted + centered over the dimmed wall (full-res texture
-            // once it's ready, otherwise the streamed thumbnail).
+            // Lightbox: the focused image (full-res once ready, otherwise the streamed thumbnail).
             let lb_tex = match lb_visible {
                 LbDraw::Full => Some(&self.full_bg),
                 LbDraw::Thumb => Some(&self.tex_bg),
@@ -1759,7 +1793,7 @@ impl State {
                 rp.set_bind_group(1, &self.lb_bg, &[]);
                 rp.draw(0..6, 0..1);
             }
-            // Toolbar + scrubber overlay (rects [1..]).
+            // Toolbar + scrubber + arrows (overlay rects [1..]; [0] dim is now done by composite).
             if overlay.len() > 1 {
                 rp.set_pipeline(&self.overlay_pipeline);
                 rp.set_vertex_buffer(0, self.overlay_buf.slice(..));
