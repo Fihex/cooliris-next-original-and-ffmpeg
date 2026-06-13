@@ -870,6 +870,21 @@ impl State {
         2.0 * (FOV_Y * 0.5).tan() * self.cam_dist
     }
 
+    /// World-space size for the focused video quad: a 16:9 rect (mpv renders into 1280×720) fitted
+    /// to the viewport at FOCUS_DIST, so a focused video fills the view like a focused photo.
+    fn video_fill_size(&self) -> [f32; 2] {
+        let screen_aspect = self.config.width as f32 / self.config.height.max(1) as f32;
+        let vph = 2.0 * (FOV_Y * 0.5).tan() * FOCUS_DIST;
+        let vpw = vph * screen_aspect;
+        let va = 16.0 / 9.0;
+        let m = 0.96; // small margin
+        if va > screen_aspect {
+            [vpw * m, vpw * m / va]
+        } else {
+            [vph * m * va, vph * m]
+        }
+    }
+
     /// Lightbox prev/next button rects (x, y, w, h, in pixels): (prev on the left, next on the
     /// right). Shared by hit-testing, the overlay backgrounds and the glyph placement.
     fn arrow_rects(&self) -> ([f32; 4], [f32; 4]) {
@@ -1464,7 +1479,16 @@ impl State {
                 size: 16.0,
                 color: [225, 225, 230, 235],
             });
-            if self.focus_loading() {
+            if matches!(self.sources.get(idx), Some(Source::Video(_))) && !cfg!(feature = "video") {
+                // This build has no libmpv linked — explain why the clip isn't playing.
+                v.push(crate::ui::Line {
+                    text: "▶  video — rebuild with  --features video  to play".into(),
+                    x: cx - 230.0,
+                    y: cy - 16.0,
+                    size: 22.0,
+                    color: [235, 235, 240, 255],
+                });
+            } else if self.focus_loading() {
                 v.push(crate::ui::Line {
                     text: "Loading…".into(),
                     x: cx - 52.0,
@@ -1668,10 +1692,11 @@ impl State {
                 rp.set_vertex_buffer(0, self.overlay_buf.slice(..));
                 rp.draw(0..6, 0..1);
             }
-            // Playing video draws over its (focused) tile, on top of the dim.
+            // Playing video draws over its (focused) tile, sized to fill the focused view (16:9,
+            // the mpv render aspect) instead of the small tile, so it shows full-size like a photo.
             if let (Some(v), Some(idx)) = (&self.video, self.focus) {
                 let (cx, cy) = self.tile_center(idx);
-                v.draw(&mut rp, &self.camera_bg, [cx, cy], [1.6, 0.9], &self.queue);
+                v.draw(&mut rp, &self.camera_bg, [cx, cy], self.video_fill_size(), &self.queue);
             }
             // Lightbox: the focused image fitted + centered over the dimmed wall (full-res texture
             // once it's ready, otherwise the streamed thumbnail).
