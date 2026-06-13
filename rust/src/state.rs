@@ -104,7 +104,7 @@ struct OverlayRect {
 }
 const OVERLAY_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
-const OVERLAY_CAP: u64 = 8;
+const OVERLAY_CAP: u64 = 64; // dim, toolbar, arrows, scrubber track/thumb + tick lines
 const OVERLAY_SHADER: &str = r#"
 struct In { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32> };
 struct V { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> };
@@ -1302,36 +1302,58 @@ impl State {
     }
 
     fn rebuild_instances(&mut self) {
+        // Draw every tile in the visible window: a dark placeholder "skeleton" at the default size
+        // until the image decodes, then the image at its true aspect. This keeps the grid full and
+        // evenly spaced (matching the web) instead of leaving holes where tiles haven't loaded.
         // Reflections first so they paint behind the photos (no depth buffer → paint order).
         let mut refl: Vec<Instance> = Vec::new();
+        let mut placeholders: Vec<Instance> = Vec::new();
         let mut photos: Vec<Instance> = Vec::new();
-        for (&i, t) in &self.resident {
-            if let Tile::Ready { layer, aspect, uv } = *t {
-                let (w, h) = size_for(aspect);
-                let col = (i / ROWS) as f32;
-                let row = i % ROWS;
+        let (first, last) = self.window_cols();
+        for col in first..=last {
+            for row in 0..ROWS {
+                let i = col as usize * ROWS + row;
+                if i >= self.total {
+                    continue;
+                }
+                let cx = col as f32 * CELL_X;
                 // Bottom-align tiles to a shared row baseline (a "shelf"), so different-height
                 // photos — and their reflections — line up, exactly like the web wall.
                 let baseline = row_baseline(row);
-                photos.push(Instance {
-                    offset: [col * CELL_X, baseline + h * 0.5],
-                    size: [w, h],
-                    layer,
-                    uv_extent: uv,
-                    kind: 0,
-                });
-                // The bottom row sits on glass: a mirrored, fading copy hangs beneath it.
-                if row == ROWS - 1 {
-                    refl.push(Instance {
-                        offset: [col * CELL_X, baseline - REFLECT_GAP - h * 0.5],
+                if let Some(Tile::Ready { layer, aspect, uv }) = self.resident.get(&i) {
+                    let (w, h) = size_for(*aspect);
+                    photos.push(Instance {
+                        offset: [cx, baseline + h * 0.5],
                         size: [w, h],
-                        layer,
-                        uv_extent: uv,
-                        kind: 1,
+                        layer: *layer,
+                        uv_extent: *uv,
+                        kind: 0,
+                    });
+                    // The bottom row sits on glass: a mirrored, fading copy hangs beneath it.
+                    if row == ROWS - 1 {
+                        refl.push(Instance {
+                            offset: [cx, baseline - REFLECT_GAP - h * 0.5],
+                            size: [w, h],
+                            layer: *layer,
+                            uv_extent: *uv,
+                            kind: 1,
+                        });
+                    }
+                } else {
+                    // Not decoded yet → skeleton at the default tile size.
+                    let (w, h) = size_for(DEFAULT_ASPECT);
+                    placeholders.push(Instance {
+                        offset: [cx, baseline + h * 0.5],
+                        size: [w, h],
+                        layer: 0,
+                        uv_extent: [1.0, 1.0],
+                        kind: 2,
                     });
                 }
             }
         }
+        // Paint order: reflections (behind), then skeletons, then photos.
+        refl.extend(placeholders);
         refl.extend(photos);
         refl.truncate(INSTANCE_CAP as usize);
         self.num_instances = refl.len() as u32;
@@ -1729,21 +1751,36 @@ impl State {
             });
         }
 
-        // Bottom scrubber (only when scrollable and not focused): a track with a draggable thumb
-        // whose width shows how much of the library is on screen, like a scrollbar.
+        // Bottom scrubber (only when scrollable and not focused): a taller track with evenly spaced
+        // tick lines and a draggable thumb whose width shows how much of the library is on screen.
         if self.focus.is_none() && self.scroll_max > 0.0 {
             let (pad, track_w, thumb_w) = self.scrubber_geom();
-            let bh = nhh(9.0);
-            let by = -1.0 + nhh(12.0);
+            let bh = nhh(18.0); // taller bar
+            let by = -1.0 + nhh(14.0);
             rects.push(OverlayRect {
                 rect: [nx(pad), by, nw(track_w), bh],
-                color: [1.0, 1.0, 1.0, 0.15],
+                color: [1.0, 1.0, 1.0, 0.14],
             });
+            // Tick lines across the track (one per column step, capped so we never overflow).
+            let ticks = (self.total_cols.max(1) as usize).min(40);
+            if ticks > 1 {
+                let tw = nw(1.5);
+                let th = nhh(10.0);
+                let ty = -1.0 + nhh(18.0);
+                for k in 0..=ticks {
+                    let fx = k as f32 / ticks as f32;
+                    let x = pad + (track_w - 1.5) * fx;
+                    rects.push(OverlayRect {
+                        rect: [nx(x), ty, tw, th],
+                        color: [1.0, 1.0, 1.0, 0.18],
+                    });
+                }
+            }
             let frac = (self.scroll_x / self.scroll_max).clamp(0.0, 1.0);
             let thumb_x = pad + (track_w - thumb_w) * frac;
             rects.push(OverlayRect {
                 rect: [nx(thumb_x), by, nw(thumb_w), bh],
-                color: [0.95, 0.96, 1.0, 0.85],
+                color: [0.95, 0.96, 1.0, 0.9],
             });
         }
         rects

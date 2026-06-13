@@ -30,6 +30,7 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
     @location(1) @interpolate(flat) layer: u32,
     @location(2) fade: f32, // reflection alpha at this vertex (1 = photo edge, 0 = far)
+    @location(3) @interpolate(flat) kind: u32, // 0 photo, 1 reflection, 2 placeholder skeleton
 };
 
 @vertex
@@ -42,6 +43,7 @@ fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip = camera.view_proj * vec4<f32>(world, 1.0);
     out.layer = in.layer;
+    out.kind = in.kind;
 
     if (in.kind == 1u) {
         // Reflection: mirror the image vertically (top of the reflection, which touches the photo,
@@ -58,6 +60,9 @@ fn vs_main(in: VsIn) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    if (in.kind == 2u) {
+        return vec4<f32>(0.10, 0.11, 0.14, 1.0); // placeholder skeleton (shown until the image loads)
+    }
     let c = textureSample(atlas, atlas_sampler, in.uv, i32(in.layer));
     return vec4<f32>(c.rgb, c.a * in.fade);
 }
