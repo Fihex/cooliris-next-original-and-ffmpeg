@@ -234,6 +234,7 @@ pub struct State {
 
     // camera / scroll
     scroll_x: f32,
+    prev_scroll_x: f32, // last frame's scroll_x — measures real drag speed for banking
     velocity: f32,
     input_dir: f32,
     scroll_max: f32,
@@ -639,6 +640,7 @@ impl State {
             job_tx,
             result_rx,
             scroll_x: 0.0,
+            prev_scroll_x: 0.0,
             velocity: 0.0,
             input_dir: 0.0,
             scroll_max,
@@ -758,7 +760,7 @@ impl State {
                     let vpw = self.viewport_h() * (self.config.width.max(1) as f32 / h);
                     let world = dx / h * vpw * DRAG_GAIN;
                     self.scroll_x = (self.scroll_x - world).clamp(0.0, max);
-                    self.velocity = (-world * 60.0).clamp(-MAX_SPEED, MAX_SPEED); // fling
+                    // velocity (for bank + release fling) is measured from real motion in update().
                 }
             }
             DragMode::None => {}
@@ -771,6 +773,7 @@ impl State {
         self.drag_mode = DragMode::None;
         if mode == DragMode::Scroll && !self.drag_moved {
             if self.focus.is_some() {
+                self.recenter_on_focus(); // leave the wall on the photo you were viewing
                 self.focus = None;
             } else if let Some(i) = self.pick(self.drag_last_x, self.drag_last_y) {
                 self.focus = Some(i);
@@ -778,10 +781,24 @@ impl State {
         }
     }
 
-    fn scrub_to(&mut self, x: f32) {
+    /// Scrubber track geometry in pixels: (left pad, track width, thumb width). The thumb width
+    /// reflects how much of the library is on screen, like a real scrollbar.
+    fn scrubber_geom(&self) -> (f32, f32, f32) {
         let w = self.config.width.max(1) as f32;
+        let h = self.config.height.max(1) as f32;
         let pad = 16.0;
-        let frac = ((x - pad) / (w - 2.0 * pad)).clamp(0.0, 1.0);
+        let track_w = (w - 2.0 * pad).max(1.0);
+        let vpw = self.viewport_h() * (w / h);
+        let content = self.total_cols.max(1) as f32 * CELL_X;
+        let thumb_w = track_w * (vpw / content).clamp(0.06, 1.0);
+        (pad, track_w, thumb_w)
+    }
+
+    fn scrub_to(&mut self, x: f32) {
+        let (pad, track_w, thumb_w) = self.scrubber_geom();
+        let travel = (track_w - thumb_w).max(1.0);
+        // Center the thumb under the cursor so it tracks the pointer 1:1 (a real scrollbar grab).
+        let frac = ((x - pad - thumb_w * 0.5) / travel).clamp(0.0, 1.0);
         self.scroll_x = frac * self.scroll_max.max(0.0);
         self.velocity = 0.0;
     }
@@ -812,24 +829,39 @@ impl State {
         self.last_frame = now;
 
         // --- scroll physics (frozen while a tile is focused) ---
+        // A live pointer drag owns scroll_x directly (set in pointer_move / scrub_to). Integrating
+        // inertia on top would double-move it — and, worse, keep it drifting and banked while the
+        // cursor holds still. So while dragging we only *measure* the actual per-frame speed (low-
+        // passed) to drive the bank; that measured speed then becomes the fling when you let go.
         if self.focus.is_none() {
-            if self.input_dir != 0.0 {
-                self.velocity =
-                    (self.velocity + self.input_dir * ACCEL * dt).clamp(-MAX_SPEED, MAX_SPEED);
-            } else {
-                self.velocity *= (1.0 - DAMP * dt).max(0.0);
-                if self.velocity.abs() < 0.001 {
-                    self.velocity = 0.0;
-                }
-            }
             let max = self.scroll_max.max(0.0);
-            self.scroll_x = (self.scroll_x + self.velocity * dt).clamp(0.0, max);
-            if self.scroll_x <= 0.0 || self.scroll_x >= max {
-                self.velocity = 0.0;
+            match self.drag_mode {
+                DragMode::Scroll => {
+                    let measured = (self.scroll_x - self.prev_scroll_x) / dt.max(1e-4);
+                    self.velocity += (measured - self.velocity) * 0.35; // low-pass → stable bank
+                    self.velocity = self.velocity.clamp(-MAX_SPEED, MAX_SPEED);
+                }
+                DragMode::Scrub | DragMode::Pan => self.velocity = 0.0, // direct control, no bank
+                DragMode::None => {
+                    if self.input_dir != 0.0 {
+                        self.velocity = (self.velocity + self.input_dir * ACCEL * dt)
+                            .clamp(-MAX_SPEED, MAX_SPEED);
+                    } else {
+                        self.velocity *= (1.0 - DAMP * dt).max(0.0);
+                        if self.velocity.abs() < 0.001 {
+                            self.velocity = 0.0;
+                        }
+                    }
+                    self.scroll_x = (self.scroll_x + self.velocity * dt).clamp(0.0, max);
+                    if self.scroll_x <= 0.0 || self.scroll_x >= max {
+                        self.velocity = 0.0;
+                    }
+                }
             }
         } else {
             self.velocity = 0.0;
         }
+        self.prev_scroll_x = self.scroll_x;
 
         // --- focus in/out transition ---
         let target_t = if self.focus.is_some() { 1.0 } else { 0.0 };
@@ -926,7 +958,7 @@ impl State {
         }
 
         // --- dispatch new loads, nearest column first, throttled ---
-        let center = (self.scroll_x / CELL_X).round() as i64;
+        let center = self.view_center();
         'outer: for d in 0..=KEEP_COLS {
             for side in 0..2 {
                 if d == 0 && side == 1 {
@@ -993,8 +1025,17 @@ impl State {
         }
     }
 
+    /// Column the streaming window centers on: the focused item while the lightbox is open (so its
+    /// neighbours decode in the background → prev/next is instant), else the scrolled position.
+    fn view_center(&self) -> i64 {
+        match self.focus {
+            Some(f) => (f / ROWS) as i64,
+            None => (self.scroll_x / CELL_X).round() as i64,
+        }
+    }
+
     fn window_cols(&self) -> (i64, i64) {
-        let center = (self.scroll_x / CELL_X).round() as i64;
+        let center = self.view_center();
         (
             (center - KEEP_COLS).max(0),
             (center + KEEP_COLS).min(self.total_cols - 1),
@@ -1141,9 +1182,22 @@ impl State {
         (idx < self.total).then_some(idx)
     }
 
-    /// Esc / back: return to the wall.
+    /// Esc / back: return to the wall, landing on the photo you were viewing (after prev/next).
     pub fn back(&mut self) {
+        self.recenter_on_focus();
         self.focus = None;
+    }
+
+    /// Move the wall under the focused item so closing the lightbox leaves you where you stopped,
+    /// not back where you opened from. Invisible while focused (the camera is locked to the tile),
+    /// so the only effect is where the zoom-out lands.
+    fn recenter_on_focus(&mut self) {
+        if let Some(f) = self.focus {
+            let col = (f / ROWS) as f32;
+            self.scroll_x = (col * CELL_X).clamp(0.0, self.scroll_max.max(0.0));
+            self.prev_scroll_x = self.scroll_x;
+            self.velocity = 0.0;
+        }
     }
 
     pub fn is_focused(&self) -> bool {
@@ -1387,25 +1441,21 @@ impl State {
             });
         }
 
-        // Bottom scrubber (only when scrollable and not focused).
+        // Bottom scrubber (only when scrollable and not focused): a track with a draggable thumb
+        // whose width shows how much of the library is on screen, like a scrollbar.
         if self.focus.is_none() && self.scroll_max > 0.0 {
-            let pad = 16.0;
-            let bh = nhh(6.0);
-            let by = -1.0 + nhh(10.0);
-            let track_w = w - 2.0 * pad;
+            let (pad, track_w, thumb_w) = self.scrubber_geom();
+            let bh = nhh(9.0);
+            let by = -1.0 + nhh(12.0);
             rects.push(OverlayRect {
                 rect: [nx(pad), by, nw(track_w), bh],
-                color: [1.0, 1.0, 1.0, 0.12],
+                color: [1.0, 1.0, 1.0, 0.15],
             });
             let frac = (self.scroll_x / self.scroll_max).clamp(0.0, 1.0);
-            let vpw = self.viewport_h() * (w / h);
-            let content = self.total_cols.max(1) as f32 * CELL_X;
-            let thumb_frac = (vpw / content).clamp(0.08, 1.0);
-            let thumb_w = track_w * thumb_frac;
             let thumb_x = pad + (track_w - thumb_w) * frac;
             rects.push(OverlayRect {
                 rect: [nx(thumb_x), by, nw(thumb_w), bh],
-                color: [1.0, 1.0, 1.0, 0.55],
+                color: [0.95, 0.96, 1.0, 0.85],
             });
         }
         rects
