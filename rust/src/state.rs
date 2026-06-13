@@ -24,8 +24,8 @@ const FULL_PX: u32 = 2048; // full-res size decoded for the focused photo (crisp
 const ROWS: usize = 3;
 const TILE: f32 = 1.0; // row height (ROW_H)
 const MAX_W: f32 = 1.55; // widest a landscape tile may get
-const GAP_X: f32 = 0.06; // tight spacing — items sit close together
-const GAP_Y: f32 = 0.06;
+const GAP_X: f32 = 0.10; // equal horizontal/vertical world gap
+const GAP_Y: f32 = 0.10;
 const CELL_X: f32 = MAX_W + GAP_X; // column pitch (1.71)
 const CELL_Y: f32 = TILE + GAP_Y;
 const DEFAULT_ASPECT: f32 = 1.4; // assumed aspect before a tile's image has decoded
@@ -45,6 +45,7 @@ const BTN_X: f32 = 12.0; // Open button (toolbar, top-left), pixels
 const BTN_Y: f32 = 12.0;
 const BTN_W: f32 = 84.0;
 const BTN_H: f32 = 34.0;
+const TOPBAR_H: f32 = 52.0; // glass top bar height (pixels)
 const ARROW_W: f32 = 54.0; // lightbox prev/next buttons (vertically centered on each edge)
 const ARROW_H: f32 = 84.0;
 const ARROW_MARGIN: f32 = 18.0;
@@ -200,20 +201,18 @@ enum SortMode {
 impl SortMode {
     fn label(self) -> &'static str {
         match self {
-            SortMode::NameAsc => "Sort: Name \u{2191}",
-            SortMode::NameDesc => "Sort: Name \u{2193}",
-            SortMode::DateNew => "Sort: Date \u{2193}",
-            SortMode::DateOld => "Sort: Date \u{2191}",
+            SortMode::NameAsc => "Name \u{2191}",
+            SortMode::NameDesc => "Name \u{2193}",
+            SortMode::DateNew => "Date \u{2193}",
+            SortMode::DateOld => "Date \u{2191}",
         }
     }
-    fn next(self) -> SortMode {
-        match self {
-            SortMode::NameAsc => SortMode::NameDesc,
-            SortMode::NameDesc => SortMode::DateNew,
-            SortMode::DateNew => SortMode::DateOld,
-            SortMode::DateOld => SortMode::NameAsc,
-        }
-    }
+}
+
+/// An open dropdown menu (hand-rolled: a panel of clickable rows under a toolbar button).
+#[derive(Clone, Copy, PartialEq)]
+enum MenuKind {
+    Sort,
 }
 
 /// Which texture the lightbox pass should bind for the focused image.
@@ -310,9 +309,10 @@ pub struct State {
     drag_last_x: f32,
     drag_last_y: f32,
     drag_moved: bool,
-    open_requested: bool,   // the Open button was clicked (main opens the picker)
-    show_info: bool,        // info panel toggle (filename/path of the focused/hovered item)
-    sort_mode: SortMode,    // current library sort order
+    open_requested: bool,         // the Open button was clicked (main opens the picker)
+    show_info: bool,              // info panel toggle (filename/path of the focused/hovered item)
+    sort_mode: SortMode,          // current library sort order
+    open_menu: Option<MenuKind>,  // which toolbar dropdown is open
     wall_scroll_held: bool, // an on-screen wall scroll arrow is held down
     scanning: bool,         // a folder is being picked/scanned on a worker thread
     focus: Option<usize>,      // currently-focused tile
@@ -776,6 +776,7 @@ impl State {
             open_requested: false,
             show_info: false,
             sort_mode: SortMode::NameAsc,
+            open_menu: None,
             wall_scroll_held: false,
             scanning: false,
             focus: None,
@@ -921,6 +922,25 @@ impl State {
         self.drag_last_y = y;
         self.drag_moved = false;
         self.last_activity = Instant::now();
+        // An open dropdown captures the click: pick a row, else close on any click outside it
+        // (the Sort button below toggles it shut).
+        if button == 0 && self.open_menu == Some(MenuKind::Sort) {
+            let (_, rows) = self.sort_menu();
+            for (rect, mode) in rows {
+                if hit(rect, x, y) {
+                    self.sort_mode = mode;
+                    self.apply_sort();
+                    self.open_menu = None;
+                    self.drag_mode = DragMode::None;
+                    return;
+                }
+            }
+            if !hit(self.sort_btn(), x, y) {
+                self.open_menu = None;
+                self.drag_mode = DragMode::None;
+                return;
+            }
+        }
         // The Open button (top-left toolbar).
         if button == 0 && x >= BTN_X && x <= BTN_X + BTN_W && y >= BTN_Y && y <= BTN_Y + BTN_H {
             self.open_requested = true;
@@ -940,7 +960,11 @@ impl State {
                 return;
             }
             if hit(self.sort_btn(), x, y) {
-                self.cycle_sort();
+                self.open_menu = if self.open_menu == Some(MenuKind::Sort) {
+                    None
+                } else {
+                    Some(MenuKind::Sort)
+                };
                 self.drag_mode = DragMode::None;
                 return;
             }
@@ -1167,12 +1191,6 @@ impl State {
         self.show_info = !self.show_info;
     }
 
-    /// Cycle the library sort order and re-sort in place.
-    pub fn cycle_sort(&mut self) {
-        self.sort_mode = self.sort_mode.next();
-        self.apply_sort();
-    }
-
     fn apply_sort(&mut self) {
         if self.sources.is_empty() {
             return;
@@ -1193,8 +1211,31 @@ impl State {
         [w - 12.0 - 96.0 - 8.0 - 56.0, BTN_Y, 56.0, BTN_H]
     }
     fn sort_btn(&self) -> [f32; 4] {
-        let w = self.config.width as f32;
-        [w - 12.0 - 96.0 - 8.0 - 56.0 - 8.0 - 120.0, BTN_Y, 120.0, BTN_H]
+        // Left side, next to Open.
+        [BTN_X + BTN_W + 8.0, BTN_Y, 124.0, BTN_H]
+    }
+
+    /// Sort dropdown: the panel rect and one (row rect, mode) per option.
+    fn sort_menu(&self) -> ([f32; 4], [([f32; 4], SortMode); 4]) {
+        let sb = self.sort_btn();
+        let (rw, rh, pad) = (sb[2], 30.0, 4.0);
+        let px = sb[0];
+        let py = sb[1] + sb[3] + 4.0;
+        let modes = [
+            SortMode::NameAsc,
+            SortMode::NameDesc,
+            SortMode::DateNew,
+            SortMode::DateOld,
+        ];
+        let panel = [px, py, rw, rh * 4.0 + pad * 2.0];
+        let mut rows = [([0.0; 4], SortMode::NameAsc); 4];
+        for (i, m) in modes.iter().enumerate() {
+            rows[i] = (
+                [px + pad, py + pad + i as f32 * rh, rw - pad * 2.0, rh],
+                *m,
+            );
+        }
+        (panel, rows)
     }
 
     /// Lightbox prev/next button rects (x, y, w, h, in pixels): (prev on the left, next on the
@@ -1278,6 +1319,10 @@ impl State {
         };
         self.bank += (bank_target - self.bank) * (6.0 * dt).min(1.0);
 
+        // No hover while an item is focused (otherwise the name tooltip lingers over the lightbox).
+        if self.focus.is_some() {
+            self.hover_index = None;
+        }
         // Ease each tile's hover zoom independently so moving between tiles is smooth (the one
         // under the cursor grows toward 1.12, the rest shrink back to 1.0 and are then dropped).
         let hovered = if self.focus.is_none() {
@@ -1313,12 +1358,14 @@ impl State {
         };
         self.cam_dist += (target_dist - self.cam_dist) * (6.0 * dt).min(1.0);
 
-        // Zoom toward the cursor: as the viewport shrinks/grows with the zoom, shift the wall so the
-        // world point under the pointer stays put (matches the web). Only on the wall, not focused.
+        // Zoom toward the cursor: as the viewport shrinks/grows with a *wheel* zoom, shift the wall
+        // so the point under the pointer stays put (matches the web). Skipped during the focus
+        // open/close transition (focus_t animating) — otherwise the zoom-out on close drifts the
+        // wall toward the cursor and you don't land centered on the item you were viewing.
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
         let vph = self.viewport_h();
         let vpw = vph * aspect;
-        if self.focus.is_none() && self.last_vp[0] > 0.0 {
+        if self.focus.is_none() && self.focus_t < 0.01 && self.last_vp[0] > 0.0 {
             let dw = self.last_vp[0] - vpw;
             let dh = self.last_vp[1] - vph;
             let max = self.scroll_max.max(0.0);
@@ -1853,12 +1900,25 @@ impl State {
         if self.total > 0 {
             let sb = self.sort_btn();
             v.push(crate::ui::Line {
-                text: self.sort_mode.label().into(),
+                text: format!("Sort: {}  \u{25be}", self.sort_mode.label()),
                 x: sb[0] + 10.0,
                 y: sb[1] + 9.0,
                 size: 14.0,
                 color: [235, 235, 240, 255],
             });
+            // Open dropdown rows.
+            if self.open_menu == Some(MenuKind::Sort) {
+                let (_, rows) = self.sort_menu();
+                for (rect, mode) in rows {
+                    v.push(crate::ui::Line {
+                        text: mode.label().into(),
+                        x: rect[0] + 8.0,
+                        y: rect[1] + 7.0,
+                        size: 14.0,
+                        color: [235, 235, 240, 245],
+                    });
+                }
+            }
         }
         // Info panel: filename + parent folder of the focused (or hovered) item.
         if self.show_info {
@@ -2155,6 +2215,11 @@ impl State {
             color: [0.02, 0.02, 0.03, 0.93 * s],
         });
 
+        // Glass top bar — a translucent strip the toolbar buttons sit on.
+        rects.push(OverlayRect {
+            rect: [-1.0, ny_top(TOPBAR_H), 2.0, nhh(TOPBAR_H)],
+            color: [0.05, 0.05, 0.08, 0.66],
+        });
         // Open button background.
         rects.push(OverlayRect {
             rect: [nx(BTN_X), ny_top(BTN_Y + BTN_H), nw(BTN_W), nhh(BTN_H)],
@@ -2173,8 +2238,34 @@ impl State {
         if self.total > 0 {
             rects.push(OverlayRect {
                 rect: to_chip(self.sort_btn()),
-                color: [1.0, 1.0, 1.0, 0.12],
+                color: [1.0, 1.0, 1.0, if self.open_menu == Some(MenuKind::Sort) { 0.2 } else { 0.12 }],
             });
+        }
+        // Sort dropdown: panel + a row per option (current = bright, hovered = lit).
+        if self.open_menu == Some(MenuKind::Sort) {
+            let (panel, rows) = self.sort_menu();
+            let pp = self.pointer_ndc;
+            let ppx = (pp[0] + 1.0) * 0.5 * w;
+            let ppy = (1.0 - pp[1]) * 0.5 * h;
+            rects.push(OverlayRect {
+                rect: to_chip(panel),
+                color: [0.08, 0.08, 0.11, 0.97],
+            });
+            for (rect, mode) in rows {
+                let a = if mode == self.sort_mode {
+                    0.22
+                } else if hit(rect, ppx, ppy) {
+                    0.14
+                } else {
+                    0.0
+                };
+                if a > 0.0 {
+                    rects.push(OverlayRect {
+                        rect: to_chip(rect),
+                        color: [1.0, 1.0, 1.0, a],
+                    });
+                }
+            }
         }
 
         // Edge arrow button backgrounds. Focused: prev/next (fade in, hidden at the ends). On the
