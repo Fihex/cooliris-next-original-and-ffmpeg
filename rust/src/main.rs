@@ -27,21 +27,24 @@ use winit::{
 
 use state::State;
 
-/// A scanned library delivered from a worker thread: the folder + its media sources.
-type Loaded = (PathBuf, Vec<state::Source>);
+/// Message from a picker/scan worker thread.
+enum LoadMsg {
+    Library(PathBuf, Vec<state::Source>), // a scanned folder
+    Cancelled,                            // the picker was dismissed
+}
 
 struct App {
     state: Option<State>,
     cursor: (f64, f64),
     folder: Option<PathBuf>,
-    folder_tx: Sender<Loaded>,   // picker/scan threads send the scanned library here
-    folder_rx: Receiver<Loaded>, // polled each frame → reload_with
+    folder_tx: Sender<LoadMsg>,   // picker/scan threads send results here
+    folder_rx: Receiver<LoadMsg>, // polled each frame
 }
 
 /// Open the native folder picker on a worker thread (blocking it inside the winit loop hangs /
 /// fails on some Linux portals), then scan the folder there too (a big/slow tree shouldn't freeze
 /// the window). The scanned library comes back via the channel.
-fn spawn_picker(tx: &Sender<Loaded>) {
+fn spawn_picker(tx: &Sender<LoadMsg>) {
     let tx = tx.clone();
     log::info!("opening folder picker…");
     std::thread::spawn(move || {
@@ -52,19 +55,22 @@ fn spawn_picker(tx: &Sender<Loaded>) {
             Some(dir) => {
                 log::info!("picked folder: {dir:?}");
                 let sources = state::gather_sources(Some(dir.clone()));
-                let _ = tx.send((dir, sources));
+                let _ = tx.send(LoadMsg::Library(dir, sources));
             }
-            None => log::info!("folder picker cancelled / unavailable"),
+            None => {
+                log::info!("folder picker cancelled / unavailable");
+                let _ = tx.send(LoadMsg::Cancelled);
+            }
         }
     });
 }
 
 /// Scan a folder (e.g. a drag-and-dropped one) on a worker thread.
-fn spawn_scan(tx: &Sender<Loaded>, dir: PathBuf) {
+fn spawn_scan(tx: &Sender<LoadMsg>, dir: PathBuf) {
     let tx = tx.clone();
     std::thread::spawn(move || {
         let sources = state::gather_sources(Some(dir.clone()));
-        let _ = tx.send((dir, sources));
+        let _ = tx.send(LoadMsg::Library(dir, sources));
     });
 }
 
@@ -102,6 +108,7 @@ impl ApplicationHandler for App {
                 };
                 if let Some(f) = folder {
                     if state.current_folder() != Some(f.as_path()) {
+                        state.set_scanning(true);
                         spawn_scan(&self.folder_tx, f);
                     }
                 }
@@ -134,6 +141,7 @@ impl ApplicationHandler for App {
                 if btn_state == ElementState::Pressed {
                     state.pointer_down(code, cx, cy);
                     if state.take_open_request() {
+                        state.set_scanning(true);
                         spawn_picker(&self.folder_tx);
                     }
                 } else {
@@ -163,7 +171,10 @@ impl ApplicationHandler for App {
                         }
                     }
                     // O opens a folder picker at runtime.
-                    PhysicalKey::Code(KeyCode::KeyO) if pressed => spawn_picker(&self.folder_tx),
+                    PhysicalKey::Code(KeyCode::KeyO) if pressed => {
+                        state.set_scanning(true);
+                        spawn_picker(&self.folder_tx);
+                    }
                     // Esc returns from focus, then (if already on the wall) quits.
                     PhysicalKey::Code(KeyCode::Escape) if pressed => {
                         if state.is_focused() {
@@ -176,9 +187,12 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                // A picker/scan thread may have delivered a scanned library.
-                while let Ok((folder, sources)) = self.folder_rx.try_recv() {
-                    state.reload_with(Some(folder), sources);
+                // A picker/scan thread may have delivered a result.
+                while let Ok(msg) = self.folder_rx.try_recv() {
+                    match msg {
+                        LoadMsg::Library(folder, sources) => state.reload_with(Some(folder), sources),
+                        LoadMsg::Cancelled => state.set_scanning(false),
+                    }
                 }
                 state.update();
                 match state.render() {

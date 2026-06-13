@@ -42,6 +42,9 @@ const BTN_X: f32 = 12.0; // Open button (toolbar, top-left), pixels
 const BTN_Y: f32 = 12.0;
 const BTN_W: f32 = 84.0;
 const BTN_H: f32 = 34.0;
+const ARROW_W: f32 = 54.0; // lightbox prev/next buttons (vertically centered on each edge)
+const ARROW_H: f32 = 84.0;
+const ARROW_MARGIN: f32 = 18.0;
 const ACCEL: f32 = 22.0; // arrow-key acceleration (world units / s²)
 const MAX_SPEED: f32 = 11.0;
 const DAMP: f32 = 6.0; // scroll velocity damping
@@ -50,6 +53,7 @@ const ANIM_SPEED: f32 = 4.0; // focus in/out transition speed (1 / seconds)
 const POOL: u32 = 128; // resident texture-array layers (fixed VRAM ceiling: POOL * 1MB)
 const KEEP_COLS: i64 = 16; // columns kept resident on each side of the camera
 const MAX_INFLIGHT: usize = 8; // concurrent decodes (throttle, like the JS MAX_INFLIGHT)
+const MAX_UPLOADS_PER_FRAME: usize = 4; // GPU texture uploads/frame (spread bursts → smooth scroll)
 const WORKERS: usize = 4; // decode threads
 
 #[repr(C)]
@@ -241,6 +245,7 @@ pub struct State {
     drag_last_y: f32,
     drag_moved: bool,
     open_requested: bool, // the Open button was clicked (main opens the picker)
+    scanning: bool,       // a folder is being picked/scanned on a worker thread
     focus: Option<usize>, // currently-focused tile
     focus_t: f32,         // 0 = wall, 1 = focused (animated)
     video: Option<crate::video::Player>, // playing the focused video tile, if any
@@ -645,6 +650,7 @@ impl State {
             drag_last_y: 0.0,
             drag_moved: false,
             open_requested: false,
+            scanning: false,
             focus: None,
             focus_t: 0.0,
             video: None,
@@ -698,6 +704,20 @@ impl State {
             self.open_requested = true;
             self.drag_mode = DragMode::None;
             return;
+        }
+        // Lightbox prev/next arrow buttons (only while an item is open).
+        if button == 0 && self.focus.is_some() {
+            let (prev, next) = self.arrow_rects();
+            if hit(prev, x, y) {
+                self.navigate(-1);
+                self.drag_mode = DragMode::None;
+                return;
+            }
+            if hit(next, x, y) {
+                self.navigate(1);
+                self.drag_mode = DragMode::None;
+                return;
+            }
         }
         let h = self.config.height as f32;
         if self.focus.is_none() && self.scroll_max > 0.0 && y > h - SCRUB_ZONE_PX {
@@ -770,6 +790,17 @@ impl State {
         2.0 * (FOV_Y * 0.5).tan() * self.cam_dist
     }
 
+    /// Lightbox prev/next button rects (x, y, w, h, in pixels): (prev on the left, next on the
+    /// right). Shared by hit-testing, the overlay backgrounds and the glyph placement.
+    fn arrow_rects(&self) -> ([f32; 4], [f32; 4]) {
+        let w = self.config.width as f32;
+        let h = self.config.height as f32;
+        let y = (h - ARROW_H) * 0.5;
+        let prev = [ARROW_MARGIN, y, ARROW_W, ARROW_H];
+        let next = [w - ARROW_MARGIN - ARROW_W, y, ARROW_W, ARROW_H];
+        (prev, next)
+    }
+
     /// Arrow keys: -1 left, +1 right, 0 released.
     pub fn set_dir(&mut self, dir: f32) {
         self.input_dir = dir;
@@ -818,7 +849,13 @@ impl State {
         self.cam_dist += (target_dist - self.cam_dist) * (6.0 * dt).min(1.0);
 
         // --- drain finished decodes: assign a layer + upload, or drop if no longer wanted ---
-        while let Ok(res) = self.result_rx.try_recv() {
+        // Cap GPU uploads per frame: a fast scroll can finish many decodes at once, and uploading
+        // them all in one frame hitches. Spread them over frames — the rest stay queued.
+        let mut uploads = 0;
+        while uploads < MAX_UPLOADS_PER_FRAME {
+            let Ok(res) = self.result_rx.try_recv() else {
+                break;
+            };
             self.inflight = self.inflight.saturating_sub(1);
             if res.gen != self.generation {
                 continue; // result from a previous library (folder was swapped)
@@ -826,9 +863,11 @@ impl State {
             if !matches!(self.resident.get(&res.index), Some(Tile::Loading)) {
                 continue; // evicted while in flight
             }
+            // Keep the focused item even if it scrolled out of the window (prev/next can move it).
+            let wanted = self.in_window(res.index) || Some(res.index) == self.focus;
             if res.rgba.is_empty() || res.w == 0 || res.h == 0 {
                 self.resident.insert(res.index, Tile::Failed);
-            } else if self.in_window(res.index) {
+            } else if wanted {
                 if let Some(layer) = self.free_layers.pop() {
                     self.upload_layer(layer, &res.rgba, res.w, res.h);
                     self.resident.insert(
@@ -842,6 +881,7 @@ impl State {
                             ],
                         },
                     );
+                    uploads += 1;
                 } else {
                     self.resident.remove(&res.index); // pool full (shouldn't happen) — retry later
                 }
@@ -870,8 +910,11 @@ impl State {
         }
 
         // Always keep the open (focused) item loaded — prev/next can move it outside the window.
+        // Dispatch it ahead of everything else and ignore the inflight cap, so navigating to a
+        // not-yet-loaded image starts decoding it this frame instead of showing "Loading…" while
+        // it waits behind window tiles.
         if let Some(f) = self.focus {
-            if !self.resident.contains_key(&f) && self.inflight < MAX_INFLIGHT {
+            if f < self.total && !self.resident.contains_key(&f) {
                 self.resident.insert(f, Tile::Loading);
                 self.inflight += 1;
                 let _ = self.job_tx.send(Job {
@@ -1147,12 +1190,18 @@ impl State {
         self.video = None;
         self.video_for = None;
         self.num_instances = 0;
+        self.scanning = false;
         log::info!("loaded {} tiles", self.total);
     }
 
     /// Whether the Open button was clicked since the last check (main opens the picker).
     pub fn take_open_request(&mut self) -> bool {
         std::mem::take(&mut self.open_requested)
+    }
+
+    /// Mark that a folder is being picked/scanned (shows a "Scanning folder…" indicator).
+    pub fn set_scanning(&mut self, b: bool) {
+        self.scanning = b;
     }
 
     /// Toolbar text: the Open label + a folder hint or the loaded/total readout.
@@ -1164,7 +1213,9 @@ impl State {
             size: 17.0,
             color: [235, 235, 240, 255],
         }];
-        let status = if self.current_folder.is_none() {
+        let status = if self.scanning {
+            "scanning folder…".to_string()
+        } else if self.current_folder.is_none() {
             "drop a folder here · click Open · press O".to_string()
         } else if self.inflight > 0 {
             format!("{} items · loading…", self.total)
@@ -1181,11 +1232,39 @@ impl State {
 
         let cx = self.config.width as f32 * 0.5;
         let cy = self.config.height as f32 * 0.5;
-        if let Some(idx) = self.focus {
-            // Lightbox: item position + prev/next hint, and "Loading…" until the image decodes.
+        if self.scanning {
             v.push(crate::ui::Line {
-                text: format!("{} / {}     ‹ ← →  ·  Esc ›", idx + 1, self.total),
-                x: cx - 120.0,
+                text: "Scanning folder…".into(),
+                x: cx - 92.0,
+                y: cy - 20.0,
+                size: 30.0,
+                color: [235, 235, 240, 255],
+            });
+        } else if let Some(idx) = self.focus {
+            // Lightbox: clickable prev/next chevrons (drawn only when a neighbour exists), the item
+            // position + hint, and "Loading…" until the image decodes.
+            let (prev, next) = self.arrow_rects();
+            if idx > 0 {
+                v.push(crate::ui::Line {
+                    text: "‹".into(),
+                    x: prev[0] + ARROW_W * 0.5 - 9.0,
+                    y: prev[1] + ARROW_H * 0.5 - 30.0,
+                    size: 46.0,
+                    color: [240, 240, 245, 240],
+                });
+            }
+            if idx + 1 < self.total {
+                v.push(crate::ui::Line {
+                    text: "›".into(),
+                    x: next[0] + ARROW_W * 0.5 - 9.0,
+                    y: next[1] + ARROW_H * 0.5 - 30.0,
+                    size: 46.0,
+                    color: [240, 240, 245, 240],
+                });
+            }
+            v.push(crate::ui::Line {
+                text: format!("{} / {}   ·   click ‹ › or ← →   ·   Esc", idx + 1, self.total),
+                x: cx - 140.0,
                 y: self.config.height as f32 - 40.0,
                 size: 16.0,
                 color: [225, 225, 230, 235],
@@ -1273,6 +1352,24 @@ impl State {
             rect: [nx(BTN_X), ny_top(BTN_Y + BTN_H), nw(BTN_W), nhh(BTN_H)],
             color: [1.0, 1.0, 1.0, 0.12],
         });
+
+        // Lightbox prev/next button backgrounds — fade in with the focus, hidden at the ends.
+        if let Some(f) = self.focus {
+            let to_ndc = |r: [f32; 4]| [nx(r[0]), ny_top(r[1] + r[3]), nw(r[2]), nhh(r[3])];
+            let (prev, next) = self.arrow_rects();
+            if f > 0 {
+                rects.push(OverlayRect {
+                    rect: to_ndc(prev),
+                    color: [1.0, 1.0, 1.0, 0.14 * s],
+                });
+            }
+            if f + 1 < self.total {
+                rects.push(OverlayRect {
+                    rect: to_ndc(next),
+                    color: [1.0, 1.0, 1.0, 0.14 * s],
+                });
+            }
+        }
 
         // Top loading bar — shown while tiles are actively decoding; grows as the visible window
         // fills in, then disappears. (A virtualized wall never loads the whole library at once.)
@@ -1403,19 +1500,27 @@ impl State {
 /// aspect; returns (rgba, w, h). Empty/zero == failure.
 fn decode(source: &Source) -> (Vec<u8>, u32, u32) {
     match source {
-        Source::File(p) => match image::open(p) {
-            Ok(img) => {
-                let t = img
-                    .resize(TILE_PX, TILE_PX, image::imageops::FilterType::Triangle)
-                    .to_rgba8();
-                let (w, h) = (t.width(), t.height());
-                (t.into_raw(), w, h)
+        Source::File(p) => {
+            // Decode by CONTENT, not extension — many files are mislabeled (a ".jpg" whose bytes
+            // are actually PNG, etc.). with_guessed_format() sniffs the magic bytes.
+            let decoded = image::ImageReader::open(p)
+                .and_then(|r| r.with_guessed_format())
+                .map_err(|e| e.to_string())
+                .and_then(|r| r.decode().map_err(|e| e.to_string()));
+            match decoded {
+                Ok(img) => {
+                    let t = img
+                        .resize(TILE_PX, TILE_PX, image::imageops::FilterType::Triangle)
+                        .to_rgba8();
+                    let (w, h) = (t.width(), t.height());
+                    (t.into_raw(), w, h)
+                }
+                Err(e) => {
+                    log::debug!("skip {p:?}: {e}");
+                    (Vec::new(), 0, 0)
+                }
             }
-            Err(e) => {
-                log::warn!("skip {p:?}: {e}");
-                (Vec::new(), 0, 0)
-            }
-        },
+        }
         Source::Video(_) => (video_placeholder(), TILE_PX, TILE_PX),
         Source::Placeholder(i) => (placeholder(*i), TILE_PX, TILE_PX),
     }
@@ -1510,6 +1615,11 @@ fn placeholder(i: usize) -> Vec<u8> {
 fn smoothstep(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Point-in-rect test for a pixel-space (x, y, w, h) rect.
+fn hit(rect: [f32; 4], x: f32, y: f32) -> bool {
+    x >= rect[0] && x <= rect[0] + rect[2] && y >= rect[1] && y <= rect[1] + rect[3]
 }
 
 fn hsv(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
