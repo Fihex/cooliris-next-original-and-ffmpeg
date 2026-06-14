@@ -14,6 +14,11 @@ mod state;
 mod ui;
 mod video;
 
+// Return freed memory (big image-decode buffers) to the OS instead of letting glibc retain the
+// high-water mark — keeps RSS from sitting hundreds of MB above what's actually live.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::Arc;
@@ -32,6 +37,7 @@ use state::State;
 /// Message from a picker/scan worker thread.
 enum LoadMsg {
     Library(PathBuf, Vec<state::Source>), // a scanned folder
+    ScanProgress(usize),                  // media files found so far (scan in progress)
     Cancelled,                            // the picker was dismissed
 }
 
@@ -56,7 +62,10 @@ fn spawn_picker(tx: &Sender<LoadMsg>) {
         {
             Some(dir) => {
                 log::info!("picked folder: {dir:?}");
-                let sources = state::gather_sources(Some(dir.clone()));
+                let sources =
+                    state::gather_sources(Some(dir.clone()), |n| {
+                        let _ = tx.send(LoadMsg::ScanProgress(n));
+                    });
                 let _ = tx.send(LoadMsg::Library(dir, sources));
             }
             None => {
@@ -67,11 +76,50 @@ fn spawn_picker(tx: &Sender<LoadMsg>) {
     });
 }
 
+/// Open the native FILE picker on a worker thread (multi-select: images, video, music, GIFs).
+/// The Open button uses this; the O key still opens a whole folder. Picked files become the
+/// library directly — handy for opening a single clip or a hand-picked set.
+fn spawn_file_picker(tx: &Sender<LoadMsg>) {
+    let tx = tx.clone();
+    log::info!("opening file picker…");
+    std::thread::spawn(move || {
+        match rfd::FileDialog::new()
+            .add_filter("All media", state::MEDIA_EXTS)
+            .add_filter("Images", state::IMAGE_EXTS)
+            .add_filter("Video", state::VIDEO_EXTS)
+            .add_filter("Music", state::AUDIO_EXTS)
+            .add_filter("All files", &["*"])
+            .set_title("Open image / video / music files")
+            .pick_files()
+        {
+            Some(files) if !files.is_empty() => {
+                let sources = state::gather_from_files(files.clone());
+                if sources.is_empty() {
+                    let _ = tx.send(LoadMsg::Cancelled);
+                } else {
+                    log::info!("picked {} media file(s)", sources.len());
+                    let folder = files[0]
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| files[0].clone());
+                    let _ = tx.send(LoadMsg::Library(folder, sources));
+                }
+            }
+            _ => {
+                log::info!("file picker cancelled / unavailable");
+                let _ = tx.send(LoadMsg::Cancelled);
+            }
+        }
+    });
+}
+
 /// Scan a folder (e.g. a drag-and-dropped one) on a worker thread.
 fn spawn_scan(tx: &Sender<LoadMsg>, dir: PathBuf) {
     let tx = tx.clone();
     std::thread::spawn(move || {
-        let sources = state::gather_sources(Some(dir.clone()));
+        let sources = state::gather_sources(Some(dir.clone()), |n| {
+            let _ = tx.send(LoadMsg::ScanProgress(n));
+        });
         let _ = tx.send(LoadMsg::Library(dir, sources));
     });
 }
@@ -142,9 +190,16 @@ impl ApplicationHandler for App {
                 let (cx, cy) = (self.cursor.0 as f32, self.cursor.1 as f32);
                 if btn_state == ElementState::Pressed {
                     state.pointer_down(code, cx, cy);
-                    if state.take_open_request() {
-                        state.set_scanning(true);
-                        spawn_picker(&self.folder_tx);
+                    match state.take_open_request() {
+                        Some(state::OpenKind::Files) => {
+                            state.set_scanning(true);
+                            spawn_file_picker(&self.folder_tx);
+                        }
+                        Some(state::OpenKind::Folder) => {
+                            state.set_scanning(true);
+                            spawn_picker(&self.folder_tx);
+                        }
+                        None => {}
                     }
                     if state.take_fullscreen_request() {
                         let fs = match state.window.fullscreen() {
@@ -157,17 +212,23 @@ impl ApplicationHandler for App {
                     state.pointer_up(code);
                 }
             }
-            // While the search box is focused, the keyboard edits it (not wall shortcuts).
+            // While a text field (search box or a Dates field) is focused, the keyboard edits it
+            // at the caret — arrows/Home/End move, Backspace/Delete edit, Enter/Esc leave.
             WindowEvent::KeyboardInput { event, .. }
-                if state.search_active() && event.state == ElementState::Pressed =>
+                if state.input_active() && event.state == ElementState::Pressed =>
             {
                 use winit::keyboard::{Key, NamedKey};
                 match &event.logical_key {
-                    Key::Named(NamedKey::Backspace) => state.search_backspace(),
-                    Key::Named(NamedKey::Enter | NamedKey::Escape) => state.search_done(),
+                    Key::Named(NamedKey::Backspace) => state.backspace(),
+                    Key::Named(NamedKey::Delete) => state.delete_forward(),
+                    Key::Named(NamedKey::ArrowLeft) => state.caret_left(),
+                    Key::Named(NamedKey::ArrowRight) => state.caret_right(),
+                    Key::Named(NamedKey::Home) => state.caret_home(),
+                    Key::Named(NamedKey::End) => state.caret_end(),
+                    Key::Named(NamedKey::Enter | NamedKey::Escape) => state.input_done(),
                     _ => {
                         if let Some(t) = &event.text {
-                            state.search_input(t);
+                            state.input_char(t);
                         }
                     }
                 }
@@ -175,11 +236,16 @@ impl ApplicationHandler for App {
             WindowEvent::KeyboardInput { event, .. } => {
                 let pressed = event.state == ElementState::Pressed;
                 match event.physical_key {
-                    // Arrows: prev/next in the lightbox, otherwise scroll the wall.
+                    // Arrows: on a focused video they seek ±10s; on a focused image they go
+                    // prev/next; on the wall they scroll.
                     PhysicalKey::Code(KeyCode::ArrowRight) => {
                         if state.is_focused() {
                             if pressed {
-                                state.navigate(1);
+                                if state.focused_is_video() {
+                                    state.video_command(&["seek", "10"]);
+                                } else {
+                                    state.navigate(1);
+                                }
                             }
                         } else {
                             state.set_dir(if pressed { 1.0 } else { 0.0 });
@@ -188,11 +254,22 @@ impl ApplicationHandler for App {
                     PhysicalKey::Code(KeyCode::ArrowLeft) => {
                         if state.is_focused() {
                             if pressed {
-                                state.navigate(-1);
+                                if state.focused_is_video() {
+                                    state.video_command(&["seek", "-10"]);
+                                } else {
+                                    state.navigate(-1);
+                                }
                             }
                         } else {
                             state.set_dir(if pressed { -1.0 } else { 0.0 });
                         }
+                    }
+                    // Up/Down adjust the playing video/audio volume.
+                    PhysicalKey::Code(KeyCode::ArrowUp) if pressed => {
+                        state.video_command(&["add", "volume", "5"]);
+                    }
+                    PhysicalKey::Code(KeyCode::ArrowDown) if pressed => {
+                        state.video_command(&["add", "volume", "-5"]);
                     }
                     // O opens a folder picker at runtime.
                     PhysicalKey::Code(KeyCode::KeyO) if pressed => {
@@ -237,6 +314,7 @@ impl ApplicationHandler for App {
                 while let Ok(msg) = self.folder_rx.try_recv() {
                     match msg {
                         LoadMsg::Library(folder, sources) => state.reload_with(Some(folder), sources),
+                        LoadMsg::ScanProgress(n) => state.set_scan_count(n),
                         LoadMsg::Cancelled => state.set_scanning(false),
                     }
                 }
@@ -260,7 +338,8 @@ fn main() {
     // Our logs at info; wgpu/naga are extremely chatty (info spam + benign startup warnings), so
     // silence them. Override anytime with RUST_LOG=…
     env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("warn,cooliris_rs=info,wgpu_hal=error"),
+        env_logger::Env::default()
+            .default_filter_or("warn,cooliris_rs=info,wgpu_hal=error,wgpu_core=error"),
     )
     .init();
 

@@ -41,13 +41,20 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 crossbeam-channel = "0.5"
 log = "0.4"
 env_logger = "0.11"
-# Native folder picker, so the app runs without a CLI path. xdg-portal backend on Linux avoids a
-# GTK build dependency; Windows/macOS use their native dialogs.
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 # GPU text (the Open button label + the loaded/total readout). Matches wgpu 22.
 glyphon = "0.6"
 # Recursive directory walk (folders usually nest images in subfolders).
 walkdir = "2"
+# Allocator that returns freed memory to the OS (glibc holds the decode high-water mark, so RSS
+# stayed multi-hundred-MB after big image decodes; mimalloc purges it back down).
+mimalloc = { version = "0.1", default-features = false }
+
+# Native folder/file picker. On Linux the xdg-portal backend avoids a GTK build dependency;
+# Windows/macOS use their native dialogs (rfd's default backends).
+[target.'cfg(target_os = "linux")'.dependencies]
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+rfd = "0.15"
 
 [build-dependencies]
 # Finds + links libmpv when the `video` feature is on.

@@ -6,7 +6,7 @@
 // main thread only assigns a free layer + uploads when pixels come back. Scroll a 16k-photo
 // library and GPU/CPU stay flat — by construction, not by fighting a garbage collector.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem::size_of;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,7 +15,9 @@ use std::time::Instant;
 use crossbeam_channel::{Receiver, Sender};
 use glam::{Mat4, Vec3, Vec4};
 
-use crate::components::{self, Filter, MenuKind, OverlayRect, SortMode, UiAction, UiCtx, VideoCtx};
+use crate::components::{
+    self, Filter, MenuKind, OverlayRect, SortMode, TrackMenu, UiAction, UiCtx, VideoCtx,
+};
 use wgpu::util::DeviceExt;
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
@@ -37,7 +39,7 @@ const BASE_DIST: f32 = 7.2; // default camera distance (wheel zooms between MIN.
 const MIN_DIST: f32 = 4.5;
 const MAX_DIST: f32 = 13.0;
 const FOCUS_DIST: f32 = 5.6; // distance when a tile is focused
-const CAM_Y: f32 = 0.3; // slight downward camera offset
+const CAM_Y: f32 = 0.0; // camera centred on the wall (rotation/bank pivots around the centre)
 const BANK_GAIN: f32 = 0.22; // sqrt(|vel|) → bank radians
 const BANK_MAX: f32 = 0.5;
 const PAN_Y_MAX: f32 = 1.7; // vertical grab-pan limit
@@ -55,7 +57,14 @@ const INSTANCE_CAP: u64 = POOL as u64 * 2; // photos + their reflections (bottom
 const KEEP_COLS: i64 = 16; // columns kept resident on each side of the camera
 const MAX_INFLIGHT: usize = 16; // concurrent decodes in flight (fills the wall faster on scroll)
 const MAX_UPLOADS_PER_FRAME: usize = 6; // GPU texture uploads/frame (spread bursts → smooth scroll)
-const WORKERS: usize = 6; // decode threads (≈ cores − 2, leaving room for render/UI)
+const WALL_GIF_PROV: u32 = 128; // provisional per-frame decode size before packing into the atlas
+const WALL_GIF_FRAMES: usize = 256; // cap frames (a 16×16 atlas grid in the 512 layer)
+const MAX_GIF_DECODES: usize = 3; // concurrent GIF decodes (decoding many at once stutters)
+const GIF_FAST_VEL: f32 = 4.0; // don't start new GIF decodes while scrolling faster than this
+// Wall GIFs are sampled at one global low rate (web wall: base 24fps − 20 skip = 4fps) — each
+// shows its time-correct frame, so the tempo is right while uploads stay cheap.
+const GIF_WALL_TICK_S: f32 = 1.0 / 4.0;
+const WORKERS: usize = 4; // decode threads — also caps the peak (WORKERS × full-image decode size)
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -72,6 +81,7 @@ struct Instance {
     layer: u32,
     uv_extent: [f32; 2],
     kind: u32, // 0 = photo, 1 = mirrored reflection (flips V + fades out)
+    uv_offset: [f32; 2], // sub-rect origin within the layer (animated GIFs sample one atlas cell)
 }
 
 #[repr(C)]
@@ -90,12 +100,12 @@ const INDICES: [u16; 6] = [0, 1, 2, 2, 1, 3];
 
 const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2];
-const INSTANCE_ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
-    2 => Float32x2, 3 => Float32x2, 4 => Uint32, 5 => Float32x2, 6 => Uint32];
+const INSTANCE_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
+    2 => Float32x2, 3 => Float32x2, 4 => Uint32, 5 => Float32x2, 6 => Uint32, 7 => Float32x2];
 
 const OVERLAY_ATTRS: [wgpu::VertexAttribute; 2] =
     wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
-const OVERLAY_CAP: u64 = 160; // wall overlay (dim/scrubber/arrows/ticks) + custom UI rects
+const OVERLAY_CAP: u64 = 320; // wall overlay (dim/scrubber/arrows/ticks/title boxes) + custom UI rects
 const OVERLAY_SHADER: &str = r#"
 struct In { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32> };
 struct V { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> };
@@ -182,12 +192,42 @@ struct GifMsg {
     gen: u64,
     frames: Vec<GifFrame>,
 }
-/// The currently-animating focused GIF: its frames + playback cursor.
+/// The focused (opened) GIF: full-res frames cycled into full_tex at full speed.
 struct GifAnim {
     index: usize,
     frames: Vec<GifFrame>,
     cur: usize,
     t: f32,
+}
+
+/// A GIF packed into one 512×512 atlas (a grid of frames) for the wall. Uploaded to the tile's
+/// layer once; animation is just a per-frame UV-offset change — so an animated wall GIF costs no
+/// extra RAM and no per-frame uploads (the frames live in the pool layer it already owns).
+struct GifAtlas {
+    rgba: Vec<u8>,    // 512×512×4 packed grid
+    grid: u32,        // cells per row/column
+    cell: u32,        // cell size in px (512 / grid)
+    fw: u32,          // frame size within a cell (≤ cell, preserves aspect)
+    fh: u32,
+    delays: Vec<f32>, // per-frame delay (seconds)
+    total: f32,       // loop duration
+}
+/// Decoded wall GIF delivered from a worker (atlas is None on failure).
+struct WallGifMsg {
+    index: usize,
+    gen: u64,
+    atlas: Option<GifAtlas>,
+}
+/// Live wall-GIF state — metadata only; the frames are packed in the tile's layer.
+struct GifAtlasAnim {
+    grid: u32,
+    cell: u32,
+    fw: u32,
+    fh: u32,
+    delays: Vec<f32>,
+    total: f32,
+    start: Instant,
+    cur: usize,
 }
 
 /// Which texture the lightbox pass should bind for the focused image.
@@ -208,6 +248,13 @@ enum Tile {
     Failed,
 }
 
+/// Which picker the Open menu asked for (polled by `main`, which owns the native dialog threads).
+#[derive(Clone, Copy, PartialEq)]
+pub enum OpenKind {
+    Files,
+    Folder,
+}
+
 /// What a held pointer is doing — matches the web wall: left-drag scrolls, right/middle-drag
 /// grab-pans, the bottom band scrubs.
 #[derive(Clone, Copy, PartialEq)]
@@ -216,6 +263,8 @@ enum DragMode {
     Scroll,
     Pan,
     Scrub,
+    VideoSeek, // dragging the timeline scrubber
+    VideoVol,  // dragging the volume slider
 }
 
 pub struct State {
@@ -248,7 +297,6 @@ pub struct State {
 
     camera_buf: wgpu::Buffer,
     camera_bg: wgpu::BindGroup,
-    camera_bgl: wgpu::BindGroupLayout,
     tex_bg: wgpu::BindGroup,
     tex: wgpu::Texture,
 
@@ -284,18 +332,28 @@ pub struct State {
     drag_last_x: f32,
     drag_last_y: f32,
     drag_moved: bool,
-    open_requested: bool,         // the Open button was clicked (main opens the picker)
+    open_request: Option<OpenKind>, // Open menu picked Files/Folder (main opens the native dialog)
     show_info: bool,              // info panel toggle (filename/path of the focused/hovered item)
     sort_mode: SortMode,          // current library sort order
     filter_kind: Filter,          // type filter (all / photos / videos / audio)
     open_menu: Option<MenuKind>,  // which toolbar dropdown is open
+    track_menu: Option<TrackMenu>, // which video track-selection menu is open
     search: String,               // search query (filters the wall by filename)
     search_active: bool,          // the search box has keyboard focus (typing edits it)
+    date_created: bool,           // Dates filter: false = Modified, true = Created
+    date_from: String,            // "YYYY-MM-DD" lower bound (empty = unbounded)
+    date_to: String,              // "YYYY-MM-DD" upper bound (empty = unbounded)
+    date_active: u8,              // which date field takes keyboard: 0 none, 1 From, 2 To
+    caret: usize,                 // caret char-index within the focused text field (search/date)
     view_dirty: bool,             // search/filter changed → rebuild the displayed view next frame
     gif_anim: bool,               // Settings: animate GIFs on focus
     reflections: bool,            // Settings: draw the glass reflections
+    show_titles: bool,            // Settings: filename label on every wall tile
+    show_mem: bool,               // Settings: show the memory-usage readout (+ periodic log)
+    mem_log: Instant,             // throttles the memory-usage log line
     wall_scroll_held: bool, // an on-screen wall scroll arrow is held down
     scanning: bool,         // a folder is being picked/scanned on a worker thread
+    scan_count: usize,      // media files found so far during a scan (progress readout)
     focus: Option<usize>,      // currently-focused tile
     focus_t: f32,              // 0 = wall, 1 = focused (animated)
     hover_index: Option<usize>,         // tile under the cursor (wall only)
@@ -304,22 +362,41 @@ pub struct State {
     lb_pan: [f32; 2],          // lightbox pan offset in NDC (drag moves a zoomed item)
     video: Option<crate::video::Player>, // playing the focused video tile, if any
     video_for: Option<usize>,            // which tile self.video belongs to
+    volume: f64,                         // last-set volume, carried to each new video/track
+    seek_preview: Option<f32>,           // scrubber fraction while dragging (knob tracks the cursor)
     gif: Option<GifAnim>,                // animating focused GIF (plays into full_tex)
     gif_pending: Option<usize>,          // GIF whose frames are being decoded on a worker
     gif_tx: Sender<GifMsg>,
     gif_rx: Receiver<GifMsg>,
+    wall_gifs: HashMap<usize, GifAtlasAnim>, // animated GIF thumbnails on the wall (atlas per tile)
+    wall_gif_pending: HashSet<usize>,    // wall GIFs whose atlas is being decoded
+    wall_gif_tx: Sender<WallGifMsg>,
+    wall_gif_rx: Receiver<WallGifMsg>,
+    gif_tick: Instant,                   // global low-rate sample tick for wall GIFs
     last_activity: Instant,              // last pointer activity — video controls auto-hide on idle
     fullscreen_requested: bool,          // a control asked to toggle fullscreen (main polls it)
     last_frame: Instant,
     frame: u64,
+    prev_inflight: usize, // to trim the heap when a decode burst finishes
 }
 
 impl State {
     pub async fn new(window: Arc<Window>, folder: Option<PathBuf>) -> State {
         let size = window.inner_size();
 
+        // Pick the backend. On Windows, default to DX12 — wgpu's Vulkan path is markedly slower on
+        // some NVIDIA setups (the GL path glitches D2Array textures), while DX12 is smooth and is
+        // the recommended native backend there. Elsewhere use the fast native set. Override with
+        // WGPU_BACKEND=(vulkan|dx12|gl) to compare.
+        let backends = match std::env::var("WGPU_BACKEND").ok().as_deref() {
+            Some("vulkan") => wgpu::Backends::VULKAN,
+            Some("dx12") => wgpu::Backends::DX12,
+            Some("gl") => wgpu::Backends::GL,
+            _ if cfg!(target_os = "windows") => wgpu::Backends::DX12,
+            _ => wgpu::Backends::PRIMARY,
+        };
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY,
+            backends,
             ..Default::default()
         });
         let surface = instance.create_surface(window.clone()).expect("create surface");
@@ -331,6 +408,12 @@ impl State {
             })
             .await
             .expect("no suitable GPU adapter found");
+        // Log the chosen GPU + backend — a software/integrated adapter is the usual cause of low fps.
+        let ai = adapter.get_info();
+        log::info!(
+            "GPU: {} | backend {:?} | type {:?} | driver {} {}",
+            ai.name, ai.backend, ai.device_type, ai.driver, ai.driver_info
+        );
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -364,8 +447,10 @@ impl State {
         surface.configure(&device, &config);
 
         // --- library (paths only — cheap, even for 16k) ---
-        let sources = Arc::new(sort_sources(gather_sources(folder.clone()), SortMode::NameAsc));
-        let all_sources = sources.clone(); // no filter at startup → view == full library
+        // all_sources keeps the original scan order ("Default (as loaded)"); the displayed `sources`
+        // is the filtered + sorted view, rebuilt on sort/filter/search. At startup: no filter/sort.
+        let all_sources = Arc::new(gather_sources(folder.clone(), |_| {}));
+        let sources = all_sources.clone();
         let total = sources.len();
         let total_cols = (total.div_ceil(ROWS)) as i64;
         let scroll_max = (total_cols - 1).max(0) as f32 * CELL_X;
@@ -375,12 +460,20 @@ impl State {
         let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
         let (result_tx, result_rx) = crossbeam_channel::unbounded::<Loaded>();
         let (gif_tx, gif_rx) = crossbeam_channel::unbounded::<GifMsg>();
+        let (wall_gif_tx, wall_gif_rx) = crossbeam_channel::unbounded::<WallGifMsg>();
+        // Cap total in-flight decode memory so opening a folder of very large images doesn't spike
+        // RSS to several GB (each full-res decode is w·h·4 bytes; 4 workers × a huge photo added up).
+        let budget = Arc::new(DecodeBudget::new(1_100_000_000)); // ~1.1 GB
         for _ in 0..WORKERS {
             let job_rx = job_rx.clone();
             let result_tx = result_tx.clone();
+            let budget = budget.clone();
             std::thread::spawn(move || {
                 while let Ok(job) = job_rx.recv() {
+                    let est = estimate_decode_bytes(&job.source);
+                    budget.acquire(est);
                     let (rgba, w, h) = decode(&job.source, job.full);
+                    budget.release(est);
                     if result_tx
                         .send(Loaded {
                             index: job.index,
@@ -731,7 +824,6 @@ impl State {
             ui,
             camera_buf,
             camera_bg,
-            camera_bgl,
             tex_bg,
             tex,
             all_sources,
@@ -761,18 +853,28 @@ impl State {
             drag_last_x: 0.0,
             drag_last_y: 0.0,
             drag_moved: false,
-            open_requested: false,
+            open_request: None,
             show_info: false,
-            sort_mode: SortMode::NameAsc,
+            sort_mode: SortMode::Default,
             filter_kind: Filter::All,
             open_menu: None,
+            track_menu: None,
             search: String::new(),
             search_active: false,
+            date_created: false,
+            date_from: String::new(),
+            date_to: String::new(),
+            date_active: 0,
+            caret: 0,
             view_dirty: false,
             gif_anim: true,
             reflections: true,
+            show_titles: false,
+            show_mem: false,
+            mem_log: Instant::now(),
             wall_scroll_held: false,
             scanning: false,
+            scan_count: 0,
             focus: None,
             focus_t: 0.0,
             hover_index: None,
@@ -781,14 +883,22 @@ impl State {
             lb_pan: [0.0, 0.0],
             video: None,
             video_for: None,
+            volume: 100.0,
+            seek_preview: None,
             gif: None,
             gif_pending: None,
             gif_tx,
             gif_rx,
+            wall_gifs: HashMap::new(),
+            wall_gif_pending: HashSet::new(),
+            wall_gif_tx,
+            wall_gif_rx,
+            gif_tick: Instant::now(),
             last_activity: Instant::now(),
             fullscreen_requested: false,
             last_frame: Instant::now(),
             frame: 0,
+            prev_inflight: 0,
         };
         state.upload_camera();
         // Test hook: auto-focus a tile on startup (e.g. COOLIRIS_FOCUS=0 to play a video tile).
@@ -884,23 +994,37 @@ impl State {
         Some([-qw / 2.0 + self.lb_pan[0], -qh / 2.0 + self.lb_pan[1], qw, qh])
     }
 
-    /// Hover tooltip: the hovered item's filename + where to draw it (above the cursor).
-    fn hover_label(&self) -> Option<(String, f32, f32)> {
-        if self.focus.is_some() {
+    /// Hover tooltip pill for the hovered tile — same look as the show-titles pills (centred on the
+    /// tile's bottom, solid black box). Returns (name, box_x, box_y, box_w) in pixels. Suppressed
+    /// when show-titles is on (every tile already has one).
+    fn hover_label(&self) -> Option<(String, f32, f32, f32)> {
+        if self.focus.is_some() || self.show_titles {
             return None;
         }
         let i = self.hover_index?;
-        let name = match self.sources.get(i)? {
+        let mut name = match self.sources.get(i)? {
             Source::File(p) | Source::Video(p) | Source::Audio(p) => {
                 p.file_name().map(|s| s.to_string_lossy().into_owned())?
             }
             Source::Placeholder(_) => return None,
         };
+        if name.chars().count() > 22 {
+            name = name.chars().take(21).collect::<String>() + "\u{2026}";
+        }
         let w = self.config.width as f32;
         let h = self.config.height as f32;
-        let px = (self.pointer_ndc[0] + 1.0) * 0.5 * w;
-        let py = (1.0 - self.pointer_ndc[1]) * 0.5 * h;
-        Some((name, px, py - 36.0))
+        // Project the tile's bottom-centre, then centre the pill on it (like wall_titles).
+        let vp = self.view_proj_matrix();
+        let (cx, _) = self.tile_center(i);
+        let by = row_baseline(i % ROWS);
+        let p = vp * Vec4::new(cx, by, 0.0, 1.0);
+        if p.w <= 0.05 {
+            return None;
+        }
+        let sx = (p.x / p.w * 0.5 + 0.5) * w;
+        let sy = (1.0 - (p.y / p.w * 0.5 + 0.5)) * h;
+        let bw = name.chars().count() as f32 * 7.0 + 16.0;
+        Some((name, sx - bw * 0.5, sy - 28.0, bw))
     }
 
     /// True if a screen-space pixel falls on the focused image (vs the empty/dim area).
@@ -920,17 +1044,32 @@ impl State {
         self.drag_last_y = y;
         self.drag_moved = false;
         self.last_activity = Instant::now();
-        // The custom UI (top bar, dropdowns, search, video controls) gets the click first.
+        // The custom UI (top bar, dropdowns, search, video controls) gets the click first. The
+        // seek/volume sliders begin a drag so you can hold-and-scrub them.
         if button == 0 {
             if let Some(action) = components::hit_test(&self.ui_ctx(), x, y) {
-                self.apply_ui_action(action);
-                self.drag_mode = DragMode::None;
+                match action {
+                    UiAction::VideoSeekFrac(f) => {
+                        // Begin a scrub — the knob tracks the cursor; the seek lands on release.
+                        self.drag_mode = DragMode::VideoSeek;
+                        self.seek_preview = Some(f);
+                    }
+                    UiAction::VideoVolume(_) => {
+                        self.drag_mode = DragMode::VideoVol;
+                        self.apply_ui_action(action);
+                    }
+                    other => {
+                        self.drag_mode = DragMode::None;
+                        self.apply_ui_action(other);
+                    }
+                }
                 return;
             }
         }
-        // A click anywhere else dismisses an open menu / search focus.
+        // A click anywhere else dismisses an open menu / search / date focus.
         self.open_menu = None;
         self.search_active = false;
+        self.date_active = 0;
         // Edge arrow buttons. Focused: prev/next item. On the wall: hold to scroll left/right.
         if button == 0 && (self.focus.is_some() || self.scroll_max > 0.0) {
             let (prev, next) = self.arrow_rects();
@@ -948,6 +1087,13 @@ impl State {
                 }
                 return;
             }
+        }
+        // A left-click on a focused video toggles pause instantly (controls bar + edge arrows were
+        // handled above; the video is full-bleed, so there's no click-to-close to confuse it with).
+        if button == 0 && self.focused_is_video() {
+            self.video_command(&["cycle", "pause"]);
+            self.drag_mode = DragMode::None;
+            return;
         }
         let h = self.config.height as f32;
         if self.focus.is_none() && self.scroll_max > 0.0 && y > h - SCRUB_ZONE_PX {
@@ -1018,6 +1164,16 @@ impl State {
                     // velocity (for bank + release fling) is measured from real motion in update().
                 }
             }
+            DragMode::VideoSeek => {
+                // Only move the knob while dragging; the (blocking) seek happens once on release,
+                // so scrubbing stays smooth.
+                let f = components::video_seek_frac(self.config.width as f32, self.config.height as f32, x);
+                self.seek_preview = Some(f);
+            }
+            DragMode::VideoVol => {
+                let f = components::video_vol_frac(self.config.width as f32, self.config.height as f32, x);
+                self.set_volume_frac(f);
+            }
             DragMode::None => {}
         }
     }
@@ -1030,11 +1186,22 @@ impl State {
         }
         let mode = self.drag_mode;
         self.drag_mode = DragMode::None;
+        // End of a scrub: land an exact seek on the final position, then drop the preview.
+        if mode == DragMode::VideoSeek {
+            if let Some(f) = self.seek_preview.take() {
+                self.seek_to_frac(f);
+            }
+        }
         if mode == DragMode::Scroll && !self.drag_moved {
             if self.focus.is_some() {
-                // Like the web: a click closes only on the empty/dim area — clicking the image
-                // itself does nothing (so you can't accidentally close while interacting with it).
-                if !self.click_on_lightbox_image(self.drag_last_x, self.drag_last_y) {
+                // A click on the playing media toggles pause (video is full-bleed; audio's cover
+                // is the lightbox image). A click on the empty/dim area closes — clicking a still
+                // image does nothing (so you can't accidentally close while interacting with it).
+                let on_media =
+                    self.focused_is_video() || self.click_on_lightbox_image(self.drag_last_x, self.drag_last_y);
+                if self.video.is_some() && on_media {
+                    self.video_command(&["cycle", "pause"]);
+                } else if !on_media {
                     self.recenter_on_focus(); // leave the wall on the photo you were viewing
                     self.focus = None;
                 }
@@ -1071,18 +1238,11 @@ impl State {
         2.0 * (FOV_Y * 0.5).tan() * self.cam_dist
     }
 
-    /// World-space size for the focused video quad: a 16:9 rect (mpv renders into 1280×720) fitted
-    /// to the viewport at FOCUS_DIST, so a focused video fills the view like a focused photo.
-    fn video_fill_size(&self) -> [f32; 2] {
-        let screen_aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-        let vph = 2.0 * (FOV_Y * 0.5).tan() * FOCUS_DIST;
-        let vpw = vph * screen_aspect;
-        let va = 16.0 / 9.0;
-        if va > screen_aspect {
-            [vpw, vpw / va] // fill width
-        } else {
-            [vph * va, vph] // fill height
-        }
+    /// Screen-space NDC rect for the focused video — full-bleed (the mpv surface already matches
+    /// the display aspect, letterboxing the clip and placing subtitles), with wheel zoom + pan.
+    fn video_rect_ndc(&self) -> [f32; 4] {
+        let z = self.lb_zoom;
+        [-z + self.lb_pan[0], -z + self.lb_pan[1], 2.0 * z, 2.0 * z]
     }
 
     /// Pixel layout of the video controls bar.
@@ -1099,7 +1259,13 @@ impl State {
             return false;
         }
         let paused = self.video_state().map(|(_, _, p)| p).unwrap_or(false);
-        self.last_activity.elapsed().as_secs_f32() < 2.5 || paused
+        self.track_menu.is_some() || paused || self.last_activity.elapsed().as_secs_f32() < 2.5
+    }
+
+    /// Whether the lightbox controls (close/info/arrows) should show. A focused video hides them
+    /// with its controls bar when idle; a focused photo/audio always shows them.
+    fn lightbox_controls_visible(&self) -> bool {
+        !self.focused_is_video() || self.video_controls_visible()
     }
 
     pub fn take_fullscreen_request(&mut self) -> bool {
@@ -1111,10 +1277,7 @@ impl State {
     }
 
     fn apply_sort(&mut self) {
-        if self.all_sources.is_empty() {
-            return;
-        }
-        self.all_sources = Arc::new(sort_sources((*self.all_sources).clone(), self.sort_mode));
+        // Sort is applied when building the view (so "Default" can restore the scan order).
         self.rebuild_view();
     }
 
@@ -1130,10 +1293,36 @@ impl State {
                 if let Some(Source::File(p) | Source::Video(p) | Source::Audio(p)) =
                     self.sources.get(i)
                 {
-                    Some((
-                        p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-                        p.parent().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-                    ))
+                    let filename =
+                        p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    let title = p
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| filename.clone());
+                    // Second line = the file's full path (left-ellipsised so the filename end stays).
+                    let full = p.to_string_lossy();
+                    let n = full.chars().count();
+                    let path = if n > 70 {
+                        let tail: String = full.chars().skip(n - 69).collect();
+                        format!("\u{2026}{tail}")
+                    } else {
+                        full.into_owned()
+                    };
+                    // Show the date that matches the active selection (Dates "Created" tab, or a
+                    // Created sort), else the modified date.
+                    let use_created = self.date_created
+                        || matches!(self.sort_mode, SortMode::CreatedNew | SortMode::CreatedOld);
+                    let md = std::fs::metadata(p).ok();
+                    let (when, time) = if use_created {
+                        ("Created", md.and_then(|m| m.created().or_else(|_| m.modified()).ok()))
+                    } else {
+                        ("Modified", md.and_then(|m| m.modified().ok()))
+                    };
+                    let meta = match time {
+                        Some(t) => format!("{} / {}  ·  {} {}", i + 1, self.total, when, fmt_date(t)),
+                        None => format!("{} / {}", i + 1, self.total),
+                    };
+                    Some((title, path, meta))
                 } else {
                     None
                 }
@@ -1148,15 +1337,23 @@ impl State {
                 .as_ref()
                 .map(|v| (v.volume(), v.aid(), v.sid()))
                 .unwrap_or((100.0, 0, 0));
-            let title = self
-                .focus
-                .and_then(|i| self.sources.get(i))
-                .and_then(|s| match s {
-                    Source::Video(p) | Source::Audio(p) | Source::File(p) => p.file_name(),
-                    _ => None,
-                })
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            // Only query mpv's track list while a track menu is open (it's an FFI round-trip).
+            let (audio_tracks, sub_tracks) = if self.track_menu.is_some() {
+                let mut a = Vec::new();
+                let mut s = Vec::new();
+                if let Some(v) = &self.video {
+                    for t in v.tracks() {
+                        if t.audio {
+                            a.push((t.id, t.label, t.selected));
+                        } else {
+                            s.push((t.id, t.label, t.selected));
+                        }
+                    }
+                }
+                (a, s)
+            } else {
+                (Vec::new(), Vec::new())
+            };
             Some(VideoCtx {
                 pos,
                 dur,
@@ -1164,8 +1361,11 @@ impl State {
                 vol,
                 aid,
                 sid,
-                title,
                 visible: self.video_controls_visible(),
+                scrub: self.seek_preview,
+                track_menu: self.track_menu,
+                audio_tracks,
+                sub_tracks,
             })
         } else {
             None
@@ -1180,10 +1380,19 @@ impl State {
             search_active: self.search_active,
             gif_anim: self.gif_anim,
             reflections: self.reflections,
+            date_created: self.date_created,
+            date_from: self.date_from.clone(),
+            date_to: self.date_to.clone(),
+            date_active: self.date_active,
+            caret: self.caret,
+            show_titles: self.show_titles,
+            show_mem: self.show_mem,
+            mem_mb: if self.show_mem { process_rss_mb() } else { None },
             show_info: self.show_info,
             total: self.total,
             ready,
             inflight: self.inflight,
+            focused: self.focus.is_some(),
             info,
             video,
             pointer: [
@@ -1196,14 +1405,26 @@ impl State {
     /// Apply a click on the UI (returned by components::hit_test).
     fn apply_ui_action(&mut self, a: UiAction) {
         match a {
-            UiAction::Open => self.open_requested = true,
+            UiAction::OpenFiles => {
+                self.open_menu = None;
+                self.open_request = Some(OpenKind::Files);
+            }
+            UiAction::OpenFolder => {
+                self.open_menu = None;
+                self.open_request = Some(OpenKind::Folder);
+            }
+            UiAction::Back => self.back(),
             UiAction::Fullscreen => self.fullscreen_requested = true,
             UiAction::ToggleInfo => self.show_info = !self.show_info,
             UiAction::ToggleMenu(m) => {
                 self.open_menu = if self.open_menu == Some(m) { None } else { Some(m) };
                 self.search_active = false;
+                self.date_active = 0;
             }
-            UiAction::CloseMenu => self.open_menu = None,
+            UiAction::CloseMenu => {
+                self.open_menu = None;
+                self.date_active = 0;
+            }
             UiAction::SetSort(m) => {
                 self.open_menu = None;
                 if self.sort_mode != m {
@@ -1218,51 +1439,166 @@ impl State {
                     self.view_dirty = true;
                 }
             }
+            UiAction::Noop => {}
             UiAction::ToggleGifAnim => self.gif_anim = !self.gif_anim,
             UiAction::ToggleReflections => self.reflections = !self.reflections,
+            UiAction::ToggleShowTitles => self.show_titles = !self.show_titles,
+            UiAction::ToggleMem => {
+                self.show_mem = !self.show_mem;
+                if self.show_mem {
+                    self.log_memory();
+                }
+            }
             UiAction::ActivateSearch => {
                 self.search_active = true;
+                self.date_active = 0;
                 self.open_menu = None;
+                let x0 = components::search_text_x0(self.config.width as f32);
+                self.caret = caret_from_x(self.drag_last_x, x0, 7.3, self.search.chars().count());
             }
             UiAction::ClearSearch => {
                 self.search.clear();
                 self.view_dirty = true;
             }
+            UiAction::SetDateBy(created) => {
+                self.date_created = created;
+                self.view_dirty = true;
+            }
+            UiAction::ActivateDate(which) => {
+                self.date_active = which;
+                self.search_active = false;
+                let len = if which == 1 {
+                    self.date_from.chars().count()
+                } else {
+                    self.date_to.chars().count()
+                };
+                let x0 = components::date_text_x0(self.config.width as f32, which);
+                self.caret = caret_from_x(self.drag_last_x, x0, 7.0, len);
+            }
+            UiAction::ClearDates => {
+                self.date_from.clear();
+                self.date_to.clear();
+                self.date_active = 0;
+                self.view_dirty = true;
+            }
             UiAction::VideoPause => self.video_command(&["cycle", "pause"]),
             UiAction::VideoSeekRel(s) => self.video_command(&["seek", &s.to_string()]),
-            UiAction::VideoSeekFrac(f) => {
-                if let (Some(v), Some((_, dur, _))) = (self.video.as_ref(), self.video_state()) {
-                    if dur > 0.0 {
-                        v.seek(f as f64 * dur);
-                    }
-                }
-            }
+            UiAction::VideoSeekFrac(f) => self.seek_to_frac(f),
             UiAction::VideoVolume(vol) => {
                 self.video_command(&["set", "volume", &format!("{vol:.0}")])
             }
-            UiAction::VideoAudio => self.video_command(&["cycle", "aid"]),
-            UiAction::VideoSub => self.video_command(&["cycle", "sid"]),
+            UiAction::ToggleTrackMenu(m) => {
+                self.track_menu = if self.track_menu == Some(m) { None } else { Some(m) };
+            }
+            UiAction::SetAudio(id) => {
+                if id > 0 {
+                    self.video_command(&["set", "aid", &id.to_string()]);
+                } else {
+                    self.video_command(&["set", "aid", "no"]);
+                }
+                self.track_menu = None;
+            }
+            UiAction::SetSub(id) => {
+                if id > 0 {
+                    self.video_command(&["set", "sid", &id.to_string()]);
+                } else {
+                    self.video_command(&["set", "sid", "no"]);
+                }
+                self.track_menu = None;
+            }
         }
     }
 
-    /// Type a character / edit the search box (called from main when the search box is active).
-    pub fn search_active(&self) -> bool {
-        self.search_active
+    /// Any text field (search box or a Dates field) has focus → the keyboard edits it.
+    pub fn input_active(&self) -> bool {
+        self.search_active || self.date_active != 0
     }
-    pub fn search_input(&mut self, ch: &str) {
-        for c in ch.chars() {
-            if !c.is_control() {
-                self.search.push(c);
-            }
+
+    /// Char count of the focused field (for caret clamping).
+    fn active_len(&self) -> usize {
+        if self.search_active {
+            self.search.chars().count()
+        } else if self.date_active == 1 {
+            self.date_from.chars().count()
+        } else if self.date_active == 2 {
+            self.date_to.chars().count()
+        } else {
+            0
         }
-        self.view_dirty = true;
     }
-    pub fn search_backspace(&mut self) {
-        self.search.pop();
-        self.view_dirty = true;
+
+    /// Insert typed text at the caret (Dates fields take only digits/dashes, capped at 10).
+    pub fn input_char(&mut self, ch: &str) {
+        let c = self.caret;
+        let (new_caret, edited) = if self.search_active {
+            (insert_into(&mut self.search, c, ch, false), true)
+        } else if self.date_active == 1 {
+            (insert_into(&mut self.date_from, c, ch, true), true)
+        } else if self.date_active == 2 {
+            (insert_into(&mut self.date_to, c, ch, true), true)
+        } else {
+            (c, false)
+        };
+        if edited {
+            self.caret = new_caret;
+            self.view_dirty = true;
+        }
     }
-    pub fn search_done(&mut self) {
+
+    /// Delete the char before the caret (Backspace).
+    pub fn backspace(&mut self) {
+        if self.caret == 0 {
+            return;
+        }
+        let i = self.caret - 1;
+        let edited = if self.search_active {
+            remove_at(&mut self.search, i)
+        } else if self.date_active == 1 {
+            remove_at(&mut self.date_from, i)
+        } else if self.date_active == 2 {
+            remove_at(&mut self.date_to, i)
+        } else {
+            false
+        };
+        if edited {
+            self.caret -= 1;
+            self.view_dirty = true;
+        }
+    }
+
+    /// Delete the char at the caret (Delete).
+    pub fn delete_forward(&mut self) {
+        let i = self.caret;
+        let edited = if self.search_active {
+            remove_at(&mut self.search, i)
+        } else if self.date_active == 1 {
+            remove_at(&mut self.date_from, i)
+        } else if self.date_active == 2 {
+            remove_at(&mut self.date_to, i)
+        } else {
+            false
+        };
+        if edited {
+            self.view_dirty = true;
+        }
+    }
+
+    pub fn caret_left(&mut self) {
+        self.caret = self.caret.saturating_sub(1);
+    }
+    pub fn caret_right(&mut self) {
+        self.caret = (self.caret + 1).min(self.active_len());
+    }
+    pub fn caret_home(&mut self) {
+        self.caret = 0;
+    }
+    pub fn caret_end(&mut self) {
+        self.caret = self.active_len();
+    }
+    /// Leave the focused field (Enter / Escape).
+    pub fn input_done(&mut self) {
         self.search_active = false;
+        self.date_active = 0;
     }
 
     /// Lightbox prev/next button rects (x, y, w, h, in pixels): (prev on the left, next on the
@@ -1314,14 +1650,18 @@ impl State {
                 }
             } else {
                 match self.drag_mode {
-                    // Left-drag and grab-pan move scroll_x directly; measure the real speed so the
-                    // wall leans into the motion (and keeps leaning through a pan, not snapping flat).
-                    DragMode::Scroll | DragMode::Pan => {
+                    // Left-drag moves scroll_x directly; measure the real speed so the wall leans
+                    // into the motion (and flings on release).
+                    DragMode::Scroll => {
                         let measured = (self.scroll_x - self.prev_scroll_x) / dt.max(1e-4);
                         self.velocity += (measured - self.velocity) * 0.35; // low-pass → stable bank
                         self.velocity = self.velocity.clamp(-MAX_SPEED, MAX_SPEED);
                     }
-                    DragMode::Scrub => self.velocity = 0.0,
+                    // Middle/right grab-pan is a flat 2D move — no lean, no fling.
+                    DragMode::Pan => self.velocity = 0.0,
+                    DragMode::Scrub | DragMode::VideoSeek | DragMode::VideoVol => {
+                        self.velocity = 0.0
+                    }
                     DragMode::None => {
                         if self.input_dir != 0.0 {
                             self.velocity = (self.velocity + self.input_dir * ACCEL * dt)
@@ -1553,28 +1893,36 @@ impl State {
         if self.focus != self.video_for {
             self.video = None; // dropping the player stops mpv
             self.video_for = self.focus;
+            self.track_menu = None; // close any track menu from the previous item
             if let Some(idx) = self.focus {
                 // Play videos and music (audio) through mpv on focus.
                 if let Source::Video(path) | Source::Audio(path) = self.sources[idx].clone() {
                     self.video = Some(crate::video::Player::start(
                         &self.device,
                         &self.queue,
-                        &self.camera_bgl,
                         self.config.format,
                         &path,
                     ));
+                    // Carry the last-set volume to the new clip (a new mpv starts at 100).
+                    self.video_command(&["set", "volume", &format!("{:.0}", self.volume)]);
                 }
             }
         }
         if let Some(v) = &mut self.video {
-            v.update(&self.device, &self.queue);
+            v.update(&self.device, &self.queue, self.config.width, self.config.height);
+        }
+        // Remember the current volume so the next clip opens at the same level.
+        if let Some(v) = &self.video {
+            self.volume = v.volume();
         }
 
         // --- focused GIF animation (Settings → Animate GIFs): decode frames off-thread, then
         // cycle them into full_tex (which the lightbox samples) on their per-frame delays ---
-        let gif_target = self.focus.filter(|&i| {
-            self.gif_anim && matches!(self.sources.get(i), Some(Source::File(p)) if is_gif(p))
-        });
+        // A focused (opened) GIF always animates. The "Animate GIFs" setting governs only the
+        // wall thumbnails, like the web wall.
+        let gif_target = self
+            .focus
+            .filter(|&i| matches!(self.sources.get(i), Some(Source::File(p)) if is_gif(p)));
         match gif_target {
             Some(i) => {
                 let have = self.gif.as_ref().map(|g| g.index) == Some(i);
@@ -1584,7 +1932,7 @@ impl State {
                         self.gif_pending = Some(i);
                         let (tx, gen) = (self.gif_tx.clone(), self.generation);
                         std::thread::spawn(move || {
-                            let frames = decode_gif(&p);
+                            let frames = decode_gif(&p, FULL_PX, 400);
                             let _ = tx.send(GifMsg { index: i, gen, frames });
                         });
                     }
@@ -1622,6 +1970,96 @@ impl State {
         }
         if let Some(c) = advance {
             self.upload_gif_frame(c);
+        }
+
+        // --- wall GIF thumbnails (Settings → Animate GIFs): each GIF is decoded once into a packed
+        // atlas in its own tile layer, then animated purely by a UV-offset change — no per-frame
+        // uploads and ~no extra memory. Sampled at one low global tick, time-correct, like the web.
+        self.wall_gifs.retain(|i, _| self.resident.contains_key(i)); // drop evicted tiles
+        if self.gif_anim && self.focus.is_none() && self.velocity.abs() <= GIF_FAST_VEL {
+            // Resident GIF tiles without an atlas yet, nearest the view centre first.
+            let center = self.view_center();
+            let mut cands: Vec<usize> = self
+                .resident
+                .iter()
+                .filter(|(&i, t)| {
+                    matches!(t, Tile::Ready { .. })
+                        && !self.wall_gifs.contains_key(&i)
+                        && !self.wall_gif_pending.contains(&i)
+                        && matches!(self.sources.get(i), Some(Source::File(p)) if is_gif(p))
+                })
+                .map(|(&i, _)| i)
+                .collect();
+            cands.sort_by_key(|&i| ((i / ROWS) as i64 - center).abs());
+            for i in cands {
+                if self.wall_gif_pending.len() >= MAX_GIF_DECODES {
+                    break;
+                }
+                if let Some(Source::File(p)) = self.sources.get(i).cloned() {
+                    self.wall_gif_pending.insert(i);
+                    let (tx, gen) = (self.wall_gif_tx.clone(), self.generation);
+                    std::thread::spawn(move || {
+                        let atlas = decode_gif_atlas(&p);
+                        let _ = tx.send(WallGifMsg { index: i, gen, atlas });
+                    });
+                }
+            }
+        }
+        while let Ok(msg) = self.wall_gif_rx.try_recv() {
+            self.wall_gif_pending.remove(&msg.index);
+            if let Some(a) = msg.atlas {
+                if msg.gen == self.generation {
+                    if let Some(&Tile::Ready { layer, .. }) = self.resident.get(&msg.index) {
+                        // Upload the packed grid into the tile's layer once.
+                        self.upload_layer(layer, &a.rgba, 512, 512);
+                        self.wall_gifs.insert(
+                            msg.index,
+                            GifAtlasAnim {
+                                grid: a.grid,
+                                cell: a.cell,
+                                fw: a.fw,
+                                fh: a.fh,
+                                delays: a.delays,
+                                total: a.total,
+                                start: Instant::now(),
+                                cur: 0,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        // Single low global tick (web wall's ~4fps): pick each GIF's time-correct frame. This only
+        // moves a cursor — rebuild_instances samples the matching atlas cell, no uploads.
+        if self.gif_anim && self.gif_tick.elapsed().as_secs_f32() >= GIF_WALL_TICK_S {
+            self.gif_tick = Instant::now();
+            for g in self.wall_gifs.values_mut() {
+                if g.delays.len() <= 1 {
+                    continue;
+                }
+                let elapsed = g.start.elapsed().as_secs_f32() % g.total;
+                let mut acc = 0.0;
+                g.cur = g.delays.len() - 1;
+                for (i, &d) in g.delays.iter().enumerate() {
+                    acc += d;
+                    if elapsed < acc {
+                        g.cur = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // A decode burst just finished — hand the freed decode buffers back to the OS.
+        if self.prev_inflight > 0 && self.inflight == 0 {
+            trim_heap();
+        }
+        self.prev_inflight = self.inflight;
+
+        // Memory-usage log (Settings → Memory usage): a detailed snapshot to a file every ~2s.
+        if self.show_mem && self.mem_log.elapsed().as_secs_f32() >= 2.0 {
+            self.mem_log = Instant::now();
+            self.log_memory();
         }
 
         // Opt-in streaming readout: RUST_LOG=cooliris_rs=debug
@@ -1777,12 +2215,25 @@ impl State {
                     // Hover zoom-in-place (scales about the tile's center); the actively hovered
                     // tile draws last so it sits above its neighbours.
                     let sc = self.hover_scales.get(&i).copied().unwrap_or(1.0);
+                    // Animated GIF: sample its current atlas cell; otherwise the whole image.
+                    let (uv_off, uv_ext) = match self.wall_gifs.get(&i) {
+                        Some(a) if a.grid > 0 => {
+                            let cw = a.cell as f32 / TILE_PX as f32;
+                            let (gx, gy) = (a.cur % a.grid as usize, a.cur / a.grid as usize);
+                            (
+                                [gx as f32 * cw, gy as f32 * cw],
+                                [a.fw as f32 / TILE_PX as f32, a.fh as f32 / TILE_PX as f32],
+                            )
+                        }
+                        _ => ([0.0, 0.0], *uv),
+                    };
                     let inst = Instance {
                         offset: [cx, baseline + h * 0.5],
                         size: [w * sc, h * sc],
                         layer: *layer,
-                        uv_extent: *uv,
+                        uv_extent: uv_ext,
                         kind: 0,
+                        uv_offset: uv_off,
                     };
                     if self.hover_index == Some(i) {
                         hovered = Some(inst);
@@ -1795,8 +2246,9 @@ impl State {
                             offset: [cx, baseline - REFLECT_GAP - h * 0.5],
                             size: [w, h],
                             layer: *layer,
-                            uv_extent: *uv,
+                            uv_extent: uv_ext,
                             kind: 1,
+                            uv_offset: uv_off,
                         });
                     }
                 } else {
@@ -1808,6 +2260,7 @@ impl State {
                         layer: 0,
                         uv_extent: [1.0, 1.0],
                         kind: 2,
+                        uv_offset: [0.0, 0.0],
                     });
                 }
             }
@@ -1846,27 +2299,28 @@ impl State {
         (x, y)
     }
 
-    fn upload_camera(&self) {
+    /// The current camera view-projection (perspective · view · bank), blended toward the focused
+    /// tile. Shared by the GPU upload and by show-titles screen projection.
+    fn view_proj_matrix(&self) -> Mat4 {
         let aspect = self.config.width as f32 / self.config.height.max(1) as f32;
         let proj = Mat4::perspective_rh(FOV_Y, aspect, 0.1, 100.0);
-        let s = {
-            let t = self.focus_t.clamp(0.0, 1.0);
-            t * t * (3.0 - 2.0 * t)
-        };
+        let s = smoothstep(self.focus_t);
         let (ex, ey) = self.eye_target(s);
         let eye = Vec3::new(ex, ey, self.cam_dist);
         let tgt = Vec3::new(ex, ey, 0.0);
         let view = Mat4::look_at_rh(eye, tgt, Vec3::Y);
-
         // Bank: the eased lean (set in update from velocity), faded out as a tile is focused.
         let bank = self.bank * (1.0 - s);
         let pivot = Vec3::new(ex, 0.0, 0.0);
         let model = Mat4::from_translation(pivot)
             * Mat4::from_rotation_y(bank)
             * Mat4::from_translation(-pivot);
+        proj * view * model
+    }
 
+    fn upload_camera(&self) {
         let u = CameraUniform {
-            view_proj: (proj * view * model).to_cols_array_2d(),
+            view_proj: self.view_proj_matrix().to_cols_array_2d(),
         };
         self.queue
             .write_buffer(&self.camera_buf, 0, bytemuck::cast_slice(&[u]));
@@ -1931,12 +2385,33 @@ impl State {
         self.focus.is_some()
     }
 
+    /// True when the focused item is a video (full-bleed playback). Audio also plays via mpv but
+    /// shows its cover art in the photo lightbox, so it's not "a video" for input purposes.
+    pub fn focused_is_video(&self) -> bool {
+        matches!(self.focus.and_then(|i| self.sources.get(i)), Some(Source::Video(_)))
+    }
+
     /// Forward an mpv command to the playing video (no-op when nothing is playing or the `video`
     /// feature is off). e.g. ["cycle","pause"], ["cycle","aid"], ["cycle","sid"].
     pub fn video_command(&self, args: &[&str]) {
         if let Some(v) = &self.video {
             v.command(args);
         }
+    }
+
+    /// Seek the playing video to a fraction (0..1) of its duration (exact).
+    fn seek_to_frac(&self, f: f32) {
+        if let (Some(v), Some((_, dur, _))) = (self.video.as_ref(), self.video_state()) {
+            if dur > 0.0 {
+                v.seek(f as f64 * dur);
+            }
+        }
+    }
+
+    /// Set the playing video/audio volume from a fraction (0..1).
+    fn set_volume_frac(&self, f: f32) {
+        let vol = (f * 100.0).clamp(0.0, 100.0);
+        self.video_command(&["set", "volume", &format!("{vol:.0}")]);
     }
 
     /// Prev/next item in the lightbox (dir = -1 / +1).
@@ -1955,6 +2430,50 @@ impl State {
         }
     }
 
+    /// True while a focused video/track is opening — mpv reports no duration until the file is
+    /// loaded (~1s), so we show "Loading…" instead of a black screen.
+    fn media_starting(&self) -> bool {
+        self.video.is_some() && self.video_state().map(|(_, dur, _)| dur <= 0.0).unwrap_or(true)
+    }
+
+    /// Append a detailed memory snapshot to <temp>/cooliris-memory.log (Settings → Memory usage).
+    /// Kept OUT of the terminal — it's for diagnosing what holds memory, not user-facing noise.
+    fn log_memory(&self) {
+        let Some(mb) = process_rss_mb() else { return };
+        let ready = self
+            .resident
+            .values()
+            .filter(|t| matches!(t, Tile::Ready { .. }))
+            .count();
+        let gif_frames = self.gif.as_ref().map(|g| g.frames.len()).unwrap_or(0);
+        // Wall GIFs are packed into their tile layers (no extra RAM); report count + total frames.
+        let wall_gif_frames: usize = self.wall_gifs.values().map(|g| g.delays.len()).sum();
+        let wall_gif_mb = 0; // atlas lives in the pool layer, not the heap
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let line = format!(
+            "{secs} | RSS {mb} MB | resident {} (ready {}) | free_layers {}/{} | inflight {} | \
+             full_for {:?} gif_frames {} video {} | wall_gifs {} ({wall_gif_frames}f, {wall_gif_mb}MB) | total {}\n",
+            self.resident.len(),
+            ready,
+            self.free_layers.len(),
+            POOL,
+            self.inflight,
+            self.full_for,
+            gif_frames,
+            self.video.is_some(),
+            self.wall_gifs.len(),
+            self.total,
+        );
+        let path = std::env::temp_dir().join("cooliris-memory.log");
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = f.write_all(line.as_bytes());
+        }
+    }
+
     pub fn current_folder(&self) -> Option<&std::path::Path> {
         self.current_folder.as_deref()
     }
@@ -1963,7 +2482,7 @@ impl State {
     /// a big/slow folder doesn't freeze the window). The generation bump drops in-flight decodes
     /// from the old library; the texture pool, pipelines and worker threads are all reused.
     pub fn reload_with(&mut self, folder: Option<PathBuf>, sources: Vec<Source>) {
-        self.all_sources = Arc::new(sort_sources(sources, self.sort_mode));
+        self.all_sources = Arc::new(sources); // original order; rebuild_view sorts the view
         self.current_folder = folder;
         self.scanning = false;
         self.rebuild_view();
@@ -1975,12 +2494,22 @@ impl State {
     fn rebuild_view(&mut self) {
         let q = self.search.to_lowercase();
         let kind = self.filter_kind;
+        // Date range (Dates filter): only enforced once a bound parses to a full date.
+        let from = parse_ymd_days(&self.date_from);
+        let to = parse_ymd_days(&self.date_to);
+        let date_created = self.date_created;
         let name_of = |s: &Source| match s {
             Source::File(p) | Source::Video(p) | Source::Audio(p) => {
                 p.file_name().map(|n| n.to_string_lossy().to_lowercase())
             }
             Source::Placeholder(_) => None,
         };
+        fn path_of(s: &Source) -> Option<&std::path::Path> {
+            match s {
+                Source::File(p) | Source::Video(p) | Source::Audio(p) => Some(p.as_path()),
+                Source::Placeholder(_) => None,
+            }
+        }
         let filtered: Vec<Source> = self
             .all_sources
             .iter()
@@ -1992,17 +2521,27 @@ impl State {
                     Source::Audio(_) => matches!(kind, Filter::All | Filter::Audio),
                 };
                 let search_ok = q.is_empty() || name_of(s).map(|n| n.contains(&q)).unwrap_or(true);
-                kind_ok && search_ok
+                let date_ok = if from.is_none() && to.is_none() {
+                    true
+                } else {
+                    match path_of(s).and_then(|p| file_days(p, date_created)) {
+                        Some(d) => from.map_or(true, |f| d >= f) && to.map_or(true, |t| d <= t),
+                        None => path_of(s).is_none(), // placeholders pass; unreadable dates drop
+                    }
+                };
+                kind_ok && search_ok && date_ok
             })
             .cloned()
             .collect();
 
         self.generation += 1;
-        self.sources = Arc::new(filtered);
+        self.sources = Arc::new(sort_sources(filtered, self.sort_mode));
         self.total = self.sources.len();
         self.total_cols = self.total.div_ceil(ROWS) as i64;
         self.scroll_max = (self.total_cols - 1).max(0) as f32 * CELL_X;
         self.resident.clear();
+        self.wall_gifs.clear();
+        self.wall_gif_pending.clear();
         self.free_layers = (0..POOL).rev().collect();
         self.inflight = 0;
         self.scroll_x = 0.0;
@@ -2015,14 +2554,73 @@ impl State {
         self.num_instances = 0;
     }
 
-    /// Whether the Open button was clicked since the last check (main opens the picker).
-    pub fn take_open_request(&mut self) -> bool {
-        std::mem::take(&mut self.open_requested)
+    /// Which picker the Open menu requested since the last check (main opens the native dialog).
+    pub fn take_open_request(&mut self) -> Option<OpenKind> {
+        self.open_request.take()
     }
 
     /// Mark that a folder is being picked/scanned (shows a "Scanning folder…" indicator).
     pub fn set_scanning(&mut self, b: bool) {
         self.scanning = b;
+        if b {
+            self.scan_count = 0;
+        }
+    }
+
+    /// Update the scan progress (media files found so far), shown while scanning.
+    pub fn set_scan_count(&mut self, n: usize) {
+        self.scan_count = n;
+    }
+
+    /// Show-titles (Settings): for each on-screen wall tile, the title pill anchored to the tile's
+    /// bottom-left — returns (name, box_x, box_y, box_w) in pixels (box height is fixed). The black
+    /// box is drawn by overlay_rects, the white text by ui_lines, both from this list.
+    fn wall_titles(&self) -> Vec<(String, f32, f32, f32)> {
+        let mut out = Vec::new();
+        if !self.show_titles || self.focus.is_some() || self.scanning || self.open_menu.is_some() {
+            return out;
+        }
+        let vp = self.view_proj_matrix();
+        let w = self.config.width as f32;
+        let h = self.config.height as f32;
+        for (&i, tile) in &self.resident {
+            if !matches!(tile, Tile::Ready { .. }) {
+                continue;
+            }
+            let (cx, _) = self.tile_center(i);
+            let by = row_baseline(i % ROWS); // tile bottom
+            // Project the tile's bottom-centre → screen, then centre the pill on it.
+            let p = vp * Vec4::new(cx, by, 0.0, 1.0);
+            if p.w <= 0.05 {
+                continue;
+            }
+            let (nx, ny) = (p.x / p.w, p.y / p.w);
+            if !(-1.1..=1.1).contains(&nx) || !(-1.1..=1.1).contains(&ny) {
+                continue;
+            }
+            let sx = (nx * 0.5 + 0.5) * w;
+            let sy = (1.0 - (ny * 0.5 + 0.5)) * h;
+            let Some(name) = (match self.sources.get(i) {
+                Some(Source::File(p) | Source::Video(p) | Source::Audio(p)) => {
+                    p.file_name().map(|n| n.to_string_lossy().into_owned())
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            let name = if name.chars().count() > 22 {
+                name.chars().take(21).collect::<String>() + "\u{2026}"
+            } else {
+                name
+            };
+            let bw = name.chars().count() as f32 * 7.0 + 16.0;
+            // Pill centred on the tile's bottom, overlapping the lower image.
+            out.push((name, sx - bw * 0.5, sy - 28.0, bw));
+            if out.len() >= 80 {
+                break;
+            }
+        }
+        out
     }
 
     /// Toolbar text: the Open label + a folder hint or the loaded/total readout.
@@ -2033,46 +2631,44 @@ impl State {
         let cx = self.config.width as f32 * 0.5;
         let cy = self.config.height as f32 * 0.5;
         if self.scanning {
+            let text = if self.scan_count > 0 {
+                format!("Scanning folder…  {} found", self.scan_count)
+            } else {
+                "Scanning folder…".into()
+            };
+            let half = text.chars().count() as f32 * 8.0 * 0.5;
             v.push(crate::ui::Line {
-                text: "Scanning folder…".into(),
-                x: cx - 92.0,
+                text,
+                x: cx - half,
                 y: cy - 20.0,
                 size: 30.0,
                 color: [235, 235, 240, 255],
             });
         } else if let Some(idx) = self.focus {
-            // Lightbox: clickable prev/next chevrons (drawn only when a neighbour exists), the item
-            // position + hint, and "Loading…" until the image decodes.
+            // Lightbox: clickable prev/next chevrons (drawn only when a neighbour exists; hidden
+            // with the rest of the controls when a video goes idle), and "Loading…" until decoded.
             let (prev, next) = self.arrow_rects();
-            if idx > 0 {
-                v.push(crate::ui::Line {
-                    text: "‹".into(),
-                    x: prev[0] + ARROW_W * 0.5 - 9.0,
-                    y: prev[1] + ARROW_H * 0.5 - 30.0,
-                    size: 46.0,
-                    color: [240, 240, 245, 240],
-                });
+            if self.lightbox_controls_visible() {
+                if idx > 0 {
+                    v.push(crate::ui::Line {
+                        text: "‹".into(),
+                        x: prev[0] + ARROW_W * 0.5 - 9.0,
+                        y: prev[1] + ARROW_H * 0.5 - 30.0,
+                        size: 46.0,
+                        color: [240, 240, 245, 240],
+                    });
+                }
+                if idx + 1 < self.total {
+                    v.push(crate::ui::Line {
+                        text: "›".into(),
+                        x: next[0] + ARROW_W * 0.5 - 9.0,
+                        y: next[1] + ARROW_H * 0.5 - 30.0,
+                        size: 46.0,
+                        color: [240, 240, 245, 240],
+                    });
+                }
             }
-            if idx + 1 < self.total {
-                v.push(crate::ui::Line {
-                    text: "›".into(),
-                    x: next[0] + ARROW_W * 0.5 - 9.0,
-                    y: next[1] + ARROW_H * 0.5 - 30.0,
-                    size: 46.0,
-                    color: [240, 240, 245, 240],
-                });
-            }
-            // Position/help hint at the bottom — hidden for a playing video (its controls bar
-            // occupies that space instead).
-            if !(self.video.is_some() && self.video_controls_visible()) {
-                v.push(crate::ui::Line {
-                    text: format!("{} / {}   ·   click ‹ › or ← →   ·   Esc", idx + 1, self.total),
-                    x: cx - 140.0,
-                    y: self.config.height as f32 - 40.0,
-                    size: 16.0,
-                    color: [225, 225, 230, 235],
-                });
-            }
+            // (Position / total now lives in the Info card; no bottom hint here.)
             if matches!(self.sources.get(idx), Some(Source::Video(_))) && !cfg!(feature = "video") {
                 // This build has no libmpv linked — explain why the clip isn't playing.
                 v.push(crate::ui::Line {
@@ -2082,7 +2678,9 @@ impl State {
                     size: 22.0,
                     color: [235, 235, 240, 255],
                 });
-            } else if self.focus_loading() {
+            } else if self.focus_loading() || self.media_starting() {
+                // Either the still image is still decoding, or a video/track is spinning up (mpv
+                // takes ~1s to open the file) — show progress so the open never feels frozen.
                 v.push(crate::ui::Line {
                     text: "Loading…".into(),
                     x: cx - 52.0,
@@ -2126,19 +2724,28 @@ impl State {
                     color: [235, 235, 240, 255],
                 });
             }
-            // Hover tooltip: the item's name (over the black bg pushed in overlay_rects).
-            if let Some((mut name, lx, ly)) = self.hover_label() {
-                if name.chars().count() > 48 {
-                    name = name.chars().take(47).collect::<String>() + "…";
-                }
+            // Hover tooltip: the item's name, centred in its black pill (same as show-titles).
+            if let Some((name, bx, by, _bw)) = self.hover_label() {
                 v.push(crate::ui::Line {
                     text: name,
-                    x: lx,
-                    y: ly,
-                    size: 15.0,
+                    x: bx + 8.0,
+                    y: by + 5.0,
+                    size: 12.0,
                     color: [240, 240, 245, 255],
                 });
             }
+        }
+
+        // Show-titles (Settings): white text inside each tile's bottom-left pill (boxes are pushed
+        // by overlay_rects, from the same wall_titles() list).
+        for (name, bx, by, _bw) in self.wall_titles() {
+            v.push(crate::ui::Line {
+                text: name,
+                x: bx + 8.0,
+                y: by + 5.0,
+                size: 12.0,
+                color: [240, 240, 245, 255],
+            });
         }
         v
     }
@@ -2203,7 +2810,7 @@ impl State {
         let s = smoothstep(self.focus_t);
         rects.push(OverlayRect {
             rect: [-1.0, -1.0, 2.0, 2.0],
-            color: [0.02, 0.02, 0.03, 0.93 * s],
+            color: [0.0, 0.0, 0.0, 0.93 * s],
         });
 
         // (Top bar, dropdowns, search and video controls are built by `components` and merged in
@@ -2214,17 +2821,19 @@ impl State {
         let to_ndc = |r: [f32; 4]| [nx(r[0]), ny_top(r[1] + r[3]), nw(r[2]), nhh(r[3])];
         let (prev, next) = self.arrow_rects();
         if let Some(f) = self.focus {
-            if f > 0 {
-                rects.push(OverlayRect {
-                    rect: to_ndc(prev),
-                    color: [1.0, 1.0, 1.0, 0.14 * s],
-                });
-            }
-            if f + 1 < self.total {
-                rects.push(OverlayRect {
-                    rect: to_ndc(next),
-                    color: [1.0, 1.0, 1.0, 0.14 * s],
-                });
+            if self.lightbox_controls_visible() {
+                if f > 0 {
+                    rects.push(OverlayRect {
+                        rect: to_ndc(prev),
+                        color: [1.0, 1.0, 1.0, 0.14 * s],
+                    });
+                }
+                if f + 1 < self.total {
+                    rects.push(OverlayRect {
+                        rect: to_ndc(next),
+                        color: [1.0, 1.0, 1.0, 0.14 * s],
+                    });
+                }
             }
         } else if self.scroll_max > 0.0 {
             rects.push(OverlayRect {
@@ -2270,13 +2879,20 @@ impl State {
             });
         }
 
-        // Hover tooltip background (the filename draws on top, in ui_lines).
-        if let Some((name, lx, ly)) = self.hover_label() {
-            let chars = name.chars().count().min(48) as f32;
-            let tw = (chars * 7.6 + 16.0).min(w - 16.0);
+        // Hover tooltip: a solid black pill centred on the hovered tile (text drawn in ui_lines),
+        // matching the show-titles style.
+        if let Some((_name, bx, by, bw)) = self.hover_label() {
             rects.push(OverlayRect {
-                rect: [nx(lx - 8.0), ny_top(ly + 21.0), nw(tw), nhh(24.0)],
-                color: [0.0, 0.0, 0.0, 0.72],
+                rect: [nx(bx), ny_top(by + 22.0), nw(bw), nhh(22.0)],
+                color: [0.0, 0.0, 0.0, 1.0],
+            });
+        }
+
+        // Show-titles: a solid black pill at each tile's bottom (text drawn in ui_lines).
+        for (_name, bx, by, bw) in self.wall_titles() {
+            rects.push(OverlayRect {
+                rect: [nx(bx), ny_top(by + 22.0), nw(bw), nhh(22.0)],
+                color: [0.0, 0.0, 0.0, 1.0],
             });
         }
         rects
@@ -2327,9 +2943,9 @@ impl State {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.02,
-                            g: 0.02,
-                            b: 0.03,
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -2365,9 +2981,9 @@ impl State {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.02,
-                            g: 0.02,
-                            b: 0.03,
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -2378,20 +2994,13 @@ impl State {
                 occlusion_query_set: None,
             });
             self.post.draw_composite(&mut rp);
-            // Playing video draws over its (focused) tile, sized to fill the focused view (16:9,
-            // the mpv render aspect). Audio has no video frame — it shows its cover in the lightbox
-            // and just plays in the background, so only draw the quad for actual videos.
+            // Playing video: a full-bleed, fading screen-space quad over the dimmed wall, exactly
+            // like the photo lightbox. Audio has no video frame (it shows its cover in the lightbox
+            // and just plays), so only draw the quad for actual videos.
             let is_video = matches!(self.focus.and_then(|i| self.sources.get(i)), Some(Source::Video(_)));
-            if let (Some(v), Some(idx)) = (&self.video, self.focus) {
-                if is_video {
-                let (cx, cy) = self.tile_center(idx);
-                let [sw, sh] = self.video_fill_size();
-                let screen_aspect = self.config.width as f32 / self.config.height.max(1) as f32;
-                let vph = 2.0 * (FOV_Y * 0.5).tan() * FOCUS_DIST;
-                let ox = cx + self.lb_pan[0] * vph * screen_aspect * 0.5;
-                let oy = cy + self.lb_pan[1] * vph * 0.5;
-                let size = [sw * self.lb_zoom, sh * self.lb_zoom];
-                v.draw(&mut rp, &self.camera_bg, [ox, oy], size, &self.queue);
+            if is_video {
+                if let Some(v) = &self.video {
+                    v.draw(&mut rp, self.video_rect_ndc(), smoothstep(self.focus_t), &self.queue);
                 }
             }
             // Lightbox: the focused image (full-res once ready, otherwise the streamed thumbnail).
@@ -2417,6 +3026,43 @@ impl State {
         self.queue.submit(std::iter::once(enc.finish()));
         frame.present();
         Ok(())
+    }
+}
+
+/// Caps total in-flight image-decode memory. A worker waits until its estimated decode fits the
+/// budget (a single oversized image may always proceed alone), and releases on completion — so
+/// several huge photos don't all decode at full resolution simultaneously and spike RSS.
+struct DecodeBudget {
+    used: std::sync::Mutex<usize>,
+    cv: std::sync::Condvar,
+    cap: usize,
+}
+impl DecodeBudget {
+    fn new(cap: usize) -> Self {
+        Self { used: std::sync::Mutex::new(0), cv: std::sync::Condvar::new(), cap }
+    }
+    fn acquire(&self, bytes: usize) {
+        let mut used = self.used.lock().unwrap();
+        while *used != 0 && *used + bytes > self.cap {
+            used = self.cv.wait(used).unwrap();
+        }
+        *used += bytes;
+    }
+    fn release(&self, bytes: usize) {
+        let mut used = self.used.lock().unwrap();
+        *used = used.saturating_sub(bytes);
+        self.cv.notify_all();
+    }
+}
+
+/// Rough peak decode size (w·h·4) via a cheap header read; small/zero for non-image sources
+/// (video/audio thumbnails go through a separate ffmpeg process; placeholders are tiny).
+fn estimate_decode_bytes(source: &Source) -> usize {
+    match source {
+        Source::File(p) => image::image_dimensions(p)
+            .map(|(w, h)| w as usize * h as usize * 4)
+            .unwrap_or(8 * 1024 * 1024),
+        _ => 0,
     }
 }
 
@@ -2463,14 +3109,36 @@ fn decode(source: &Source, full: bool) -> (Vec<u8>, u32, u32) {
 
 /// Extract a poster frame from a video via ffmpeg, scaled to fit `target`, with a play badge drawn
 /// on it. Returns None (→ fall back to the placeholder) if ffmpeg is missing or fails.
+///
+/// Tries a few seek points so more formats/clips yield a frame: ~1s in (skips black intros), then
+/// the very start (short clips), then the `thumbnail` filter (scans for a representative frame).
 fn video_thumb(p: &std::path::Path, target: u32) -> Option<(Vec<u8>, u32, u32)> {
-    let out = std::process::Command::new("ffmpeg")
-        .args(["-nostdin", "-loglevel", "error", "-i"])
-        .arg(p)
-        .args(["-frames:v", "1", "-vf"])
-        .arg(format!(
-            "scale={target}:{target}:force_original_aspect_ratio=decrease"
-        ))
+    for ss in ["1", "0"] {
+        if let Some(t) = ffmpeg_frame(p, target, Some(ss), false) {
+            return Some(t);
+        }
+    }
+    ffmpeg_frame(p, target, None, true)
+}
+
+/// One ffmpeg poster-frame attempt. `ss` = input seek seconds (None = no seek); `pick` = use the
+/// `thumbnail` filter to choose a representative (non-black) frame.
+fn ffmpeg_frame(
+    p: &std::path::Path,
+    target: u32,
+    ss: Option<&str>,
+    pick: bool,
+) -> Option<(Vec<u8>, u32, u32)> {
+    let mut cmd = std::process::Command::new("ffmpeg");
+    cmd.args(["-nostdin", "-loglevel", "error"]);
+    if let Some(s) = ss {
+        cmd.args(["-ss", s]);
+    }
+    cmd.arg("-i").arg(p);
+    let scale = format!("scale={target}:{target}:force_original_aspect_ratio=decrease");
+    let vf = if pick { format!("thumbnail,{scale}") } else { scale };
+    let out = cmd
+        .args(["-frames:v", "1", "-an", "-sn", "-vf", &vf])
         .args(["-f", "image2pipe", "-vcodec", "png", "pipe:1"])
         .output()
         .ok()?;
@@ -2576,22 +3244,35 @@ fn video_placeholder() -> Vec<u8> {
 }
 
 /// Build the tile library from a folder, scanning subfolders too. Placeholders if none.
-pub fn gather_sources(folder: Option<PathBuf>) -> Vec<Source> {
+pub fn gather_sources(folder: Option<PathBuf>, progress: impl Fn(usize)) -> Vec<Source> {
     let Some(dir) = folder else {
         log::info!("no folder chosen — showing placeholders");
         return (0..24).map(Source::Placeholder).collect();
     };
     // Recurse into subfolders to any depth — media is usually nested (a folder per product/album,
-    // and those may nest further). follow_links(false) means no symlink loops; the take() caps it.
-    let mut paths: Vec<PathBuf> = walkdir::WalkDir::new(&dir)
+    // and those may nest further). follow_links(false) means no symlink loops; the cap bounds it.
+    // `progress` reports the running media count so the UI can show "Scanning… N found".
+    let mut paths: Vec<PathBuf> = Vec::new();
+    for entry in walkdir::WalkDir::new(&dir)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .map(walkdir::DirEntry::into_path)
-        .filter(|p| classify(p).is_some())
-        .take(200_000)
-        .collect();
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let p = entry.into_path();
+        if classify(&p).is_some() {
+            paths.push(p);
+            if paths.len() % 200 == 0 {
+                progress(paths.len());
+            }
+            if paths.len() >= 200_000 {
+                break;
+            }
+        }
+    }
+    progress(paths.len());
     paths.sort();
     log::info!("folder {dir:?}: {} media files (incl. subfolders)", paths.len());
     if paths.is_empty() {
@@ -2608,6 +3289,29 @@ pub fn gather_sources(folder: Option<PathBuf>) -> Vec<Source> {
         .collect()
 }
 
+/// Build a library from an explicit set of picked files (the Open button's file picker). Non-media
+/// selections are dropped; the order picked is preserved (then the active sort applies on load).
+pub fn gather_from_files(files: Vec<PathBuf>) -> Vec<Source> {
+    files
+        .into_iter()
+        .filter_map(|p| match classify(&p) {
+            Some(Kind::Video) => Some(Source::Video(p)),
+            Some(Kind::Audio) => Some(Source::Audio(p)),
+            Some(Kind::Image) => Some(Source::File(p)),
+            None => None,
+        })
+        .collect()
+}
+
+// Extension groups for the Open file picker's type filters (kept in sync with `classify`).
+pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
+pub const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "m4v"];
+pub const AUDIO_EXTS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "wma"];
+pub const MEDIA_EXTS: &[&str] = &[
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "mp4", "mkv", "webm", "mov", "avi", "m4v", "mp3",
+    "flac", "m4a", "aac", "ogg", "opus", "wav", "wma",
+];
+
 enum Kind {
     Image,
     Video,
@@ -2622,9 +3326,11 @@ fn is_gif(p: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Decode every frame of a GIF (downscaled to fit FULL_PX) with its delay, for in-place animation.
+/// Decode a GIF's frames (downscaled to fit `target`) with their delays, for in-place animation.
+/// Streams one frame at a time — resize then drop the source frame — so peak memory is a single
+/// source frame plus the (small) resized frames, not the whole GIF decoded at full size at once.
 /// Runs on a worker thread; empty on failure.
-fn decode_gif(path: &std::path::Path) -> Vec<GifFrame> {
+fn decode_gif(path: &std::path::Path, target: u32, max_frames: usize) -> Vec<GifFrame> {
     use image::AnimationDecoder;
     let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
@@ -2632,28 +3338,99 @@ fn decode_gif(path: &std::path::Path) -> Vec<GifFrame> {
     let Ok(dec) = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(file)) else {
         return Vec::new();
     };
-    let Ok(frames) = dec.into_frames().collect_frames() else {
-        return Vec::new();
-    };
-    frames
-        .into_iter()
-        .take(400) // cap pathological GIFs
-        .map(|f| {
-            let (n, d) = f.delay().numer_denom_ms();
-            let delay = (n as f32 / d.max(1) as f32 / 1000.0).max(0.02);
-            let buf = f.into_buffer();
-            let (w, h) = (buf.width(), buf.height());
-            if w > FULL_PX || h > FULL_PX {
-                let img = image::DynamicImage::ImageRgba8(buf)
-                    .resize(FULL_PX, FULL_PX, image::imageops::FilterType::Triangle)
-                    .to_rgba8();
-                let (w, h) = (img.width(), img.height());
-                GifFrame { rgba: img.into_raw(), w, h, delay }
-            } else {
-                GifFrame { rgba: buf.into_raw(), w, h, delay }
-            }
-        })
-        .collect()
+    let mut out = Vec::new();
+    for frame in dec.into_frames() {
+        let Ok(f) = frame else { break };
+        let (n, d) = f.delay().numer_denom_ms();
+        // A 0 / very-small frame delay means "use the default" — browsers render those at ~10fps,
+        // not max speed. Clamping to 0.02 made such GIFs play ~5× too fast and skip frames on a
+        // 60Hz display; treat anything under 20ms as 100ms.
+        let raw = n as f32 / d.max(1) as f32 / 1000.0;
+        let delay = if raw < 0.02 { 0.1 } else { raw };
+        let buf = f.into_buffer();
+        let (w, h) = (buf.width(), buf.height());
+        let gf = if w > target || h > target {
+            let img = image::DynamicImage::ImageRgba8(buf)
+                .resize(target, target, image::imageops::FilterType::Triangle)
+                .to_rgba8();
+            let (w, h) = (img.width(), img.height());
+            GifFrame { rgba: img.into_raw(), w, h, delay }
+        } else {
+            GifFrame { rgba: buf.into_raw(), w, h, delay }
+        };
+        out.push(gf);
+        if out.len() >= max_frames {
+            break;
+        }
+    }
+    out
+}
+
+/// Decode a GIF and pack its frames into one 512×512 atlas (a grid of cells), for the wall. Streams
+/// frames at a provisional size, picks the grid from the count, blits each into its cell. The atlas
+/// is uploaded to the tile's layer once; animation is then just a UV shift — no per-frame uploads,
+/// no stored frames. None on failure.
+fn decode_gif_atlas(path: &std::path::Path) -> Option<GifAtlas> {
+    use image::AnimationDecoder;
+    let file = std::fs::File::open(path).ok()?;
+    let dec = image::codecs::gif::GifDecoder::new(std::io::BufReader::new(file)).ok()?;
+    let mut frames: Vec<image::RgbaImage> = Vec::new();
+    let mut delays: Vec<f32> = Vec::new();
+    for frame in dec.into_frames() {
+        let Ok(f) = frame else { break };
+        let (n, d) = f.delay().numer_denom_ms();
+        let raw = n as f32 / d.max(1) as f32 / 1000.0;
+        delays.push(if raw < 0.02 { 0.1 } else { raw });
+        let buf = f.into_buffer();
+        let img = if buf.width() > WALL_GIF_PROV || buf.height() > WALL_GIF_PROV {
+            image::DynamicImage::ImageRgba8(buf)
+                .resize(WALL_GIF_PROV, WALL_GIF_PROV, image::imageops::FilterType::Triangle)
+                .to_rgba8()
+        } else {
+            buf
+        };
+        frames.push(img);
+        if frames.len() >= WALL_GIF_FRAMES {
+            break;
+        }
+    }
+    let count = frames.len();
+    if count == 0 {
+        return None;
+    }
+    let grid = (count as f64).sqrt().ceil() as u32; // ≤16 (count ≤ 256)
+    let cell = (TILE_PX / grid).max(1);
+    let total: f32 = delays.iter().sum::<f32>().max(0.01);
+    let mut rgba = vec![0u8; (TILE_PX * TILE_PX * 4) as usize];
+    let (mut fw, mut fh) = (0u32, 0u32);
+    for (i, img) in frames.into_iter().enumerate() {
+        let img = if img.width() > cell || img.height() > cell {
+            image::DynamicImage::ImageRgba8(img)
+                .resize(cell, cell, image::imageops::FilterType::Triangle)
+                .to_rgba8()
+        } else {
+            img
+        };
+        if i == 0 {
+            (fw, fh) = (img.width(), img.height());
+        }
+        let ox = (i as u32 % grid) * cell;
+        let oy = (i as u32 / grid) * cell;
+        blit_into(&mut rgba, TILE_PX, &img, ox, oy);
+    }
+    Some(GifAtlas { rgba, grid, cell, fw, fh, delays, total })
+}
+
+/// Copy `img` into the `aw`-pixel-wide RGBA buffer at pixel (ox, oy).
+fn blit_into(dst: &mut [u8], aw: u32, img: &image::RgbaImage, ox: u32, oy: u32) {
+    let (w, h) = (img.width(), img.height());
+    let src = img.as_raw();
+    let row = (w * 4) as usize;
+    for y in 0..h {
+        let d0 = (((oy + y) * aw + ox) * 4) as usize;
+        let s0 = (y * w * 4) as usize;
+        dst[d0..d0 + row].copy_from_slice(&src[s0..s0 + row]);
+    }
 }
 
 /// Classify a path by extension (None = ignore / not media).
@@ -2694,19 +3471,136 @@ fn smoothstep(t: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
+/// Map a click x (pixels) to a caret char-index, given the field's text origin and ~char width.
+fn caret_from_x(x: f32, x0: f32, char_w: f32, len: usize) -> usize {
+    if x <= x0 {
+        return 0;
+    }
+    (((x - x0) / char_w).round() as usize).min(len)
+}
+
+/// Insert the (filtered) chars of `ch` into `s` at char-index `caret`; returns the new caret.
+/// Date fields accept only digits and '-' and are capped at 10 chars (YYYY-MM-DD).
+fn insert_into(s: &mut String, caret: usize, ch: &str, date: bool) -> usize {
+    let mut caret = caret.min(s.chars().count());
+    for c in ch.chars() {
+        if c.is_control() {
+            continue;
+        }
+        if date && !(c.is_ascii_digit() || c == '-') {
+            continue;
+        }
+        if date && s.chars().count() >= 10 {
+            break;
+        }
+        let byte = s.char_indices().nth(caret).map(|(b, _)| b).unwrap_or(s.len());
+        s.insert(byte, c);
+        caret += 1;
+    }
+    caret
+}
+
+/// Remove the char at char-index `idx` from `s`; returns whether anything was removed.
+fn remove_at(s: &mut String, idx: usize) -> bool {
+    if let Some((byte, _)) = s.char_indices().nth(idx) {
+        s.remove(byte);
+        true
+    } else {
+        false
+    }
+}
+
+/// Howard Hinnant's days_from_civil: a civil (y, m, d) date → days since 1970-01-01.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// Parse "YYYY-MM-DD" → days since the Unix epoch (None unless it's a complete, plausible date).
+fn parse_ymd_days(s: &str) -> Option<i64> {
+    let mut it = s.trim().split('-');
+    let y: i64 = it.next()?.parse().ok()?;
+    let m: i64 = it.next()?.parse().ok()?;
+    let d: i64 = it.next()?.parse().ok()?;
+    if it.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m, d))
+}
+
+/// A file's chosen date (modified, or created with a modified fallback) as days since the epoch.
+fn file_days(p: &std::path::Path, created: bool) -> Option<i64> {
+    let m = std::fs::metadata(p).ok()?;
+    let t = if created {
+        m.created().or_else(|_| m.modified()).ok()?
+    } else {
+        m.modified().ok()?
+    };
+    let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs() as i64;
+    Some(secs.div_euclid(86_400))
+}
+
+// glibc keeps memory freed by large transient allocations (full-size image decodes) instead of
+// returning it to the OS, so RSS sits at the decode high-water mark. Ask it to give the slack back
+// once a decode burst settles. No-op / absent off glibc.
+#[cfg(target_os = "linux")]
+extern "C" {
+    fn malloc_trim(pad: usize) -> std::os::raw::c_int;
+}
+fn trim_heap() {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+/// Resident set size (MB). Linux: the 2nd field of /proc/self/statm is resident pages × 4 KiB.
+/// None on platforms without /proc (the readout simply hides).
+fn process_rss_mb() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4096 / (1024 * 1024))
+}
+
+/// A file's modified time as "M/D/YYYY" (UTC). Uses Howard Hinnant's civil-from-days algorithm so
+/// we don't pull in a date crate just for the info card.
+fn fmt_date(t: std::time::SystemTime) -> String {
+    let secs = match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(_) => return "—".into(),
+    };
+    let z = secs.div_euclid(86_400) + 719_468; // days since 0000-03-01
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    let y = y + if m <= 2 { 1 } else { 0 };
+    format!("{m}/{d}/{y}")
+}
+
 /// Point-in-rect test for a pixel-space (x, y, w, h) rect.
 fn hit(rect: [f32; 4], x: f32, y: f32) -> bool {
     x >= rect[0] && x <= rect[0] + rect[2] && y >= rect[1] && y <= rect[1] + rect[3]
 }
 
-/// Sort a library by name or modified-date. Decorate–sort–undecorate so each file's name/date is
-/// read once, not on every comparison (matters for large libraries with the date modes).
+/// Sort a library by name or file date (modified/created). Decorate–sort–undecorate so each file's
+/// name/date is read once, not on every comparison. `Default` keeps the as-loaded (scan) order.
 fn sort_sources(srcs: Vec<Source>, mode: SortMode) -> Vec<Source> {
     let path = |s: &Source| match s {
         Source::File(p) | Source::Video(p) | Source::Audio(p) => Some(p.clone()),
         Source::Placeholder(_) => None,
     };
     match mode {
+        SortMode::Default => srcs,
         SortMode::NameAsc | SortMode::NameDesc => {
             let mut keyed: Vec<(String, Source)> = srcs
                 .into_iter()
@@ -2723,18 +3617,25 @@ fn sort_sources(srcs: Vec<Source>, mode: SortMode) -> Vec<Source> {
             }
             keyed.into_iter().map(|(_, s)| s).collect()
         }
-        SortMode::DateNew | SortMode::DateOld => {
+        _ => {
+            // Date modes. `created()` isn't supported on every filesystem — fall back to modified.
+            let created = matches!(mode, SortMode::CreatedNew | SortMode::CreatedOld);
+            let newest_first = matches!(mode, SortMode::ModifiedNew | SortMode::CreatedNew);
             let mut keyed: Vec<(Option<std::time::SystemTime>, Source)> = srcs
                 .into_iter()
                 .map(|s| {
-                    let k = path(&s)
-                        .and_then(|p| std::fs::metadata(p).ok())
-                        .and_then(|m| m.modified().ok());
+                    let k = path(&s).and_then(|p| std::fs::metadata(p).ok()).and_then(|m| {
+                        if created {
+                            m.created().or_else(|_| m.modified()).ok()
+                        } else {
+                            m.modified().ok()
+                        }
+                    });
                     (k, s)
                 })
                 .collect();
             keyed.sort_by(|a, b| a.0.cmp(&b.0));
-            if mode == SortMode::DateNew {
+            if newest_first {
                 keyed.reverse();
             }
             keyed.into_iter().map(|(_, s)| s).collect()

@@ -10,6 +10,14 @@ pub use stub::Player;
 #[cfg(feature = "video")]
 pub use real::Player;
 
+/// One audio or subtitle track, for the track-selection menus.
+pub struct Track {
+    pub id: i64,
+    pub audio: bool, // true = audio track, false = subtitle track
+    pub label: String,
+    pub selected: bool,
+}
+
 /// No-op player for builds without the `video` feature — focusing a video tile just shows the
 /// placeholder + camera zoom.
 #[cfg(not(feature = "video"))]
@@ -19,13 +27,12 @@ mod stub {
         pub fn start(
             _device: &wgpu::Device,
             _queue: &wgpu::Queue,
-            _camera_bgl: &wgpu::BindGroupLayout,
             _format: wgpu::TextureFormat,
             _path: &std::path::Path,
         ) -> Player {
             Player
         }
-        pub fn update(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue) {}
+        pub fn update(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue, _w: u32, _h: u32) {}
         pub fn command(&self, _args: &[&str]) {}
         pub fn position(&self) -> f64 {
             0.0
@@ -46,13 +53,14 @@ mod stub {
         pub fn sid(&self) -> i64 {
             0
         }
-        #[allow(clippy::too_many_arguments)]
+        pub fn tracks(&self) -> Vec<super::Track> {
+            Vec::new()
+        }
         pub fn draw<'a>(
             &'a self,
             _rp: &mut wgpu::RenderPass<'a>,
-            _camera_bg: &'a wgpu::BindGroup,
-            _offset: [f32; 2],
-            _size: [f32; 2],
+            _rect_ndc: [f32; 4],
+            _alpha: f32,
             _queue: &wgpu::Queue,
         ) {
         }
@@ -65,8 +73,61 @@ mod real {
     use std::path::Path;
     use std::ptr;
 
-    const VW: usize = 1280;
-    const VH: usize = 720;
+    // Initial SW-render surface; resized to the display aspect on the first `update` so mpv fits
+    // the clip (letterboxing) and places subtitles for the actual screen, not a fixed 16:9.
+    const INIT_W: u32 = 1280;
+    const INIT_H: u32 = 720;
+    const MAX_DIM: u32 = 1600; // cap the longer side (software render cost ∝ pixels)
+
+    /// Map an ISO-639 language code (e.g. "eng", "ja") to a full name. Unknown codes pass through,
+    /// so every track shows *something* real rather than a bare number.
+    fn lang_full_name(code: &str) -> String {
+        if code.is_empty() {
+            return String::new();
+        }
+        let name = match code.to_ascii_lowercase().as_str() {
+            "en" | "eng" => "English",
+            "ja" | "jpn" => "Japanese",
+            "es" | "spa" => "Spanish",
+            "fr" | "fre" | "fra" => "French",
+            "de" | "ger" | "deu" => "German",
+            "it" | "ita" => "Italian",
+            "ru" | "rus" => "Russian",
+            "zh" | "chi" | "zho" => "Chinese",
+            "ko" | "kor" => "Korean",
+            "pt" | "por" => "Portuguese",
+            "ar" | "ara" => "Arabic",
+            "hi" | "hin" => "Hindi",
+            "nl" | "dut" | "nld" => "Dutch",
+            "pl" | "pol" => "Polish",
+            "tr" | "tur" => "Turkish",
+            "sv" | "swe" => "Swedish",
+            "no" | "nor" => "Norwegian",
+            "da" | "dan" => "Danish",
+            "fi" | "fin" => "Finnish",
+            "cs" | "cze" | "ces" => "Czech",
+            "el" | "gre" | "ell" => "Greek",
+            "he" | "heb" => "Hebrew",
+            "th" | "tha" => "Thai",
+            "vi" | "vie" => "Vietnamese",
+            "uk" | "ukr" => "Ukrainian",
+            "hu" | "hun" => "Hungarian",
+            "ro" | "rum" | "ron" => "Romanian",
+            "id" | "ind" => "Indonesian",
+            _ => return code.to_string(),
+        };
+        name.to_string()
+    }
+
+    /// Clamp a display size to the render budget, preserving aspect (keeps subtitle placement and
+    /// letterboxing correct). Even dimensions keep the row stride tidy.
+    fn cap_dims(w: u32, h: u32) -> (u32, u32) {
+        let (w, h) = (w.max(16), h.max(16));
+        let scale = (MAX_DIM as f32 / w.max(h) as f32).min(1.0);
+        let cw = (((w as f32 * scale) as u32).max(16)) & !1;
+        let ch = (((h as f32 * scale) as u32).max(16)) & !1;
+        (cw, ch)
+    }
 
     /* ----------------------------- minimal libmpv FFI ----------------------------- */
     #[repr(C)]
@@ -102,7 +163,9 @@ mod real {
     extern "C" {
         fn mpv_create() -> *mut MpvHandle;
         fn mpv_initialize(ctx: *mut MpvHandle) -> c_int;
-        fn mpv_destroy(ctx: *mut MpvHandle);
+        // Fully shuts the player down (stops playback/audio) and waits — unlike mpv_destroy, which
+        // only detaches the handle and can leave the core (and its audio) running.
+        fn mpv_terminate_destroy(ctx: *mut MpvHandle);
         fn mpv_set_option_string(
             ctx: *mut MpvHandle,
             name: *const c_char,
@@ -115,6 +178,8 @@ mod real {
             format: c_int,
             data: *mut c_void,
         ) -> c_int;
+        fn mpv_get_property_string(ctx: *mut MpvHandle, name: *const c_char) -> *mut c_char;
+        fn mpv_free(data: *mut c_void);
         fn mpv_wait_event(ctx: *mut MpvHandle, timeout: f64) -> *mut MpvEvent;
         fn mpv_render_context_create(
             res: *mut *mut MpvRenderContext,
@@ -131,17 +196,17 @@ mod real {
     #[repr(C)]
     #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
     struct Rect {
-        offset: [f32; 2],
-        size: [f32; 2],
+        rect: [f32; 4],  // NDC: bottom-left x, y + width, height
+        alpha: [f32; 4], // .x = fade-in alpha (vec4 for 16-byte alignment)
     }
 
+    // Screen-space quad (no camera): the video is drawn like the photo lightbox — a fitted, fading
+    // NDC rect over the dimmed wall. mpv has already laid the frame (and subtitles) into the surface.
     const SHADER: &str = r#"
-struct Camera { view_proj: mat4x4<f32> };
-@group(0) @binding(0) var<uniform> camera: Camera;
-@group(1) @binding(0) var vid: texture_2d<f32>;
-@group(1) @binding(1) var samp: sampler;
-struct Rect { offset: vec2<f32>, size: vec2<f32> };
-@group(2) @binding(0) var<uniform> rect: Rect;
+@group(0) @binding(0) var vid: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+struct U { rect: vec4<f32>, alpha: vec4<f32> };
+@group(1) @binding(0) var<uniform> u: U;
 
 struct V { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32> };
 
@@ -150,17 +215,16 @@ fn vs(@builtin(vertex_index) i: u32) -> V {
     var corners = array<vec2<f32>, 6>(
         vec2(0.,0.), vec2(1.,0.), vec2(0.,1.), vec2(0.,1.), vec2(1.,0.), vec2(1.,1.));
     let c = corners[i];
-    let local = (c - vec2(0.5, 0.5)) * rect.size;
-    let world = vec3(rect.offset + local, 0.01); // just in front of the tile
+    let p = u.rect.xy + c * u.rect.zw; // bottom-left + size, in NDC
     var out: V;
-    out.clip = camera.view_proj * vec4(world, 1.0);
+    out.clip = vec4(p, 0.0, 1.0);
     out.uv = vec2(c.x, 1.0 - c.y);
     return out;
 }
 
 @fragment
 fn fs(in: V) -> @location(0) vec4<f32> {
-    return vec4(textureSample(vid, samp, in.uv).rgb, 1.0);
+    return vec4(textureSample(vid, samp, in.uv).rgb, u.alpha.x);
 }
 "#;
 
@@ -168,7 +232,11 @@ fn fs(in: V) -> @location(0) vec4<f32> {
         mpv: *mut MpvHandle,
         render: *mut MpvRenderContext,
         buf: Vec<u32>,
+        tw: u32, // current render-surface size (resized to the display aspect)
+        th: u32,
         tex: wgpu::Texture,
+        tex_bgl: wgpu::BindGroupLayout, // kept to rebuild tex_bg when the surface resizes
+        sampler: wgpu::Sampler,
         pipeline: wgpu::RenderPipeline,
         tex_bg: wgpu::BindGroup,
         rect_buf: wgpu::Buffer,
@@ -179,7 +247,6 @@ fn fs(in: V) -> @location(0) vec4<f32> {
         pub fn start(
             device: &wgpu::Device,
             _queue: &wgpu::Queue,
-            camera_bgl: &wgpu::BindGroupLayout,
             format: wgpu::TextureFormat,
             path: &Path,
         ) -> Player {
@@ -189,6 +256,9 @@ fn fs(in: V) -> @location(0) vec4<f32> {
                 mpv_set_option_string(h, c"vo".as_ptr(), c"libmpv".as_ptr());
                 mpv_set_option_string(h, c"terminal".as_ptr(), c"no".as_ptr());
                 mpv_set_option_string(h, c"loop".as_ptr(), c"inf".as_ptr());
+                // Auto-load every external subtitle in the video's folder (not just exact/likely
+                // name matches), so a same-folder .srt/.ass always shows up and is selectable.
+                mpv_set_option_string(h, c"sub-auto".as_ptr(), c"all".as_ptr());
                 mpv_initialize(h);
                 h
             };
@@ -210,12 +280,12 @@ fn fs(in: V) -> @location(0) vec4<f32> {
                 mpv_command(mpv, cmd.as_ptr());
             }
 
-            // wgpu side: video texture + sampler + pipeline (shares the wall camera at group 0).
+            // wgpu side: video texture + sampler + screen-space pipeline.
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("video"),
                 size: wgpu::Extent3d {
-                    width: VW as u32,
-                    height: VH as u32,
+                    width: INIT_W,
+                    height: INIT_H,
                     depth_or_array_layers: 1,
                 },
                 mip_level_count: 1,
@@ -277,7 +347,8 @@ fn fs(in: V) -> @location(0) vec4<f32> {
                 label: None,
                 entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    // Read in both stages: vs uses u.rect, fs uses u.alpha.
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -301,7 +372,7 @@ fn fs(in: V) -> @location(0) vec4<f32> {
             });
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: None,
-                bind_group_layouts: &[camera_bgl, &tex_bgl, &rect_bgl],
+                bind_group_layouts: &[&tex_bgl, &rect_bgl],
                 push_constant_ranges: &[],
             });
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -316,7 +387,11 @@ fn fs(in: V) -> @location(0) vec4<f32> {
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
                     entry_point: "fs",
-                    targets: &[Some(format.into())],
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
                     compilation_options: Default::default(),
                 }),
                 primitive: wgpu::PrimitiveState::default(),
@@ -329,8 +404,12 @@ fn fs(in: V) -> @location(0) vec4<f32> {
             Player {
                 mpv,
                 render,
-                buf: vec![0u32; VW * VH],
+                buf: vec![0u32; (INIT_W * INIT_H) as usize],
+                tw: INIT_W,
+                th: INIT_H,
                 tex,
+                tex_bgl,
+                sampler,
                 pipeline,
                 tex_bg,
                 rect_buf,
@@ -394,7 +473,7 @@ fn fs(in: V) -> @location(0) vec4<f32> {
             out != 0
         }
 
-        /// Seek to an absolute time in seconds.
+        /// Seek to an absolute time in seconds (exact).
         pub fn seek(&self, secs: f64) {
             let s = format!("{secs:.3}");
             self.command(&["seek", &s, "absolute"]);
@@ -420,7 +499,68 @@ fn fs(in: V) -> @location(0) vec4<f32> {
             self.get_int(b"sid\0")
         }
 
-        pub fn update(&mut self, _device: &wgpu::Device, queue: &wgpu::Queue) {
+        /// A property read by a runtime-built name (e.g. "track-list/3/title").
+        fn prop_int(&self, name: &str) -> i64 {
+            let Ok(c) = CString::new(name) else { return 0 };
+            let mut out: i64 = 0;
+            unsafe {
+                mpv_get_property(self.mpv, c.as_ptr(), FORMAT_INT64, &mut out as *mut i64 as *mut c_void);
+            }
+            out
+        }
+        fn prop_flag(&self, name: &str) -> bool {
+            let Ok(c) = CString::new(name) else { return false };
+            let mut out: c_int = 0;
+            unsafe {
+                mpv_get_property(self.mpv, c.as_ptr(), FORMAT_FLAG, &mut out as *mut c_int as *mut c_void);
+            }
+            out != 0
+        }
+        fn prop_str(&self, name: &str) -> String {
+            let Ok(c) = CString::new(name) else { return String::new() };
+            unsafe {
+                let p = mpv_get_property_string(self.mpv, c.as_ptr());
+                if p.is_null() {
+                    return String::new();
+                }
+                let s = std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned();
+                mpv_free(p as *mut c_void);
+                s
+            }
+        }
+
+        /// All audio + subtitle tracks (for the selection menus), each with a readable label.
+        pub fn tracks(&self) -> Vec<super::Track> {
+            let count = self.prop_int("track-list/count").max(0);
+            let mut out = Vec::new();
+            for i in 0..count {
+                let kind = self.prop_str(&format!("track-list/{i}/type"));
+                let audio = kind == "audio";
+                if !audio && kind != "sub" {
+                    continue; // skip video tracks
+                }
+                let id = self.prop_int(&format!("track-list/{i}/id"));
+                let selected = self.prop_flag(&format!("track-list/{i}/selected"));
+                let title = self.prop_str(&format!("track-list/{i}/title"));
+                let lang = self.prop_str(&format!("track-list/{i}/lang"));
+                let codec = self.prop_str(&format!("track-list/{i}/codec"));
+                // Show the track's real name, whatever the format provides: its own title, else the
+                // full language name, else the codec, else a numbered fallback. (We list every
+                // audio/subtitle track — better a redundant one than a missing one.)
+                let lang_name = lang_full_name(&lang);
+                let label = match (title.as_str(), lang_name.as_str(), codec.as_str()) {
+                    ("", "", "") => format!("{} {id}", if audio { "Audio" } else { "Subtitle" }),
+                    ("", "", c) => c.to_uppercase(),
+                    ("", l, _) => l.to_string(),
+                    (t, "", _) => t.to_string(),
+                    (t, l, _) => format!("{t} ({l})"),
+                };
+                out.push(super::Track { id, audio, label, selected });
+            }
+            out
+        }
+
+        pub fn update(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, disp_w: u32, disp_h: u32) {
             // Pump mpv events so the core keeps progressing.
             unsafe {
                 loop {
@@ -430,9 +570,48 @@ fn fs(in: V) -> @location(0) vec4<f32> {
                     }
                 }
             }
-            // Render the current frame into our buffer.
-            let mut size = [VW as c_int, VH as c_int];
-            let mut stride: usize = VW * 4;
+
+            // Match the render surface to the display aspect so mpv letterboxes the clip and lays
+            // out subtitles for the real screen. Rebuild the texture + bind group on a size change.
+            let (tw, th) = cap_dims(disp_w, disp_h);
+            if (tw, th) != (self.tw, self.th) {
+                self.tw = tw;
+                self.th = th;
+                self.buf = vec![0u32; (tw * th) as usize];
+                self.tex = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("video"),
+                    size: wgpu::Extent3d {
+                        width: tw,
+                        height: th,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let view = self.tex.create_view(&Default::default());
+                self.tex_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.tex_bgl,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: wgpu::BindingResource::TextureView(&view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::Sampler(&self.sampler),
+                        },
+                    ],
+                });
+            }
+
+            // Render the current frame into our buffer at the surface size.
+            let mut size = [self.tw as c_int, self.th as c_int];
+            let mut stride: usize = self.tw as usize * 4;
             let mut params = [
                 MpvRenderParam {
                     type_: SW_SIZE,
@@ -468,36 +647,36 @@ fn fs(in: V) -> @location(0) vec4<f32> {
                 bytemuck::cast_slice(&self.buf),
                 wgpu::ImageDataLayout {
                     offset: 0,
-                    bytes_per_row: Some(VW as u32 * 4),
-                    rows_per_image: Some(VH as u32),
+                    bytes_per_row: Some(self.tw * 4),
+                    rows_per_image: Some(self.th),
                 },
                 wgpu::Extent3d {
-                    width: VW as u32,
-                    height: VH as u32,
+                    width: self.tw,
+                    height: self.th,
                     depth_or_array_layers: 1,
                 },
             );
         }
 
-        /// Draw the video on a quad at `offset` with `size` (world units), via the wall camera.
-        #[allow(clippy::too_many_arguments)]
+        /// Draw the video as a screen-space NDC rect (x, y bottom-left, w, h) at the given fade alpha.
         pub fn draw<'a>(
             &'a self,
             rp: &mut wgpu::RenderPass<'a>,
-            camera_bg: &'a wgpu::BindGroup,
-            offset: [f32; 2],
-            size: [f32; 2],
+            rect_ndc: [f32; 4],
+            alpha: f32,
             queue: &wgpu::Queue,
         ) {
             queue.write_buffer(
                 &self.rect_buf,
                 0,
-                bytemuck::cast_slice(&[Rect { offset, size }]),
+                bytemuck::cast_slice(&[Rect {
+                    rect: rect_ndc,
+                    alpha: [alpha, 0.0, 0.0, 0.0],
+                }]),
             );
             rp.set_pipeline(&self.pipeline);
-            rp.set_bind_group(0, camera_bg, &[]);
-            rp.set_bind_group(1, &self.tex_bg, &[]);
-            rp.set_bind_group(2, &self.rect_bg, &[]);
+            rp.set_bind_group(0, &self.tex_bg, &[]);
+            rp.set_bind_group(1, &self.rect_bg, &[]);
             rp.draw(0..6, 0..1);
         }
     }
@@ -506,7 +685,7 @@ fn fs(in: V) -> @location(0) vec4<f32> {
         fn drop(&mut self) {
             unsafe {
                 mpv_render_context_free(self.render);
-                mpv_destroy(self.mpv);
+                mpv_terminate_destroy(self.mpv); // stop playback + audio synchronously
             }
         }
     }

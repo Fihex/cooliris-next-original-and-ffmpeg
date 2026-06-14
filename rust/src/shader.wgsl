@@ -23,6 +23,7 @@ struct VsIn {
     // so a 3:2 photo only fills the top ~0.67 of a square layer).
     @location(5) uv_extent: vec2<f32>,
     @location(6) kind: u32, // 0 = photo, 1 = mirrored reflection
+    @location(7) uv_offset: vec2<f32>, // sub-rect origin (animated GIFs sample one atlas cell)
 };
 
 struct VsOut {
@@ -52,9 +53,9 @@ fn vs_main(in: VsIn) -> VsOut {
     if (in.kind == 1u) {
         // Reflection: mirror the image vertically (the top edge, which touches the photo, samples
         // the photo's bottom edge). The fade is computed per-pixel in the fragment shader.
-        out.uv = vec2<f32>(in.uv.x * e.x, (1.0 - in.uv.y) * e.y);
+        out.uv = in.uv_offset + vec2<f32>(in.uv.x * e.x, (1.0 - in.uv.y) * e.y);
     } else {
-        out.uv = in.uv * e; // sample only the used sub-rect of the layer
+        out.uv = in.uv_offset + in.uv * e; // sample the used sub-rect (+ atlas-cell offset) of the layer
     }
     return out;
 }
@@ -66,10 +67,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
     let c = textureSample(atlas, atlas_sampler, in.uv, i32(in.layer));
     var a = c.a;
+    var rgb = c.rgb;
     if (in.kind == 1u) {
-        // Reflection spans the top half of the photo height (hard cutoff at vy = 0.5). A sqrt
-        // fade keeps the whole half visibly a reflection instead of dimming to nothing too early.
-        a = a * sqrt(clamp((in.vy - 0.5) * 2.0, 0.0, 1.0)) * 0.30;
+        // Reflection: brightest right at the seam (vy = 1, touching the photo) and falling off
+        // fast downward, so it reads as a glassy reflection rather than a second, flat half-image.
+        // (A squared falloff fades much quicker than the old sqrt, which over-brightened the body.)
+        let t = clamp((in.vy - 0.5) * 2.0, 0.0, 1.0);
+        a = a * t * t * 0.28;
+        rgb = rgb * 0.85; // reflections are dimmer than the original
     }
-    return vec4<f32>(c.rgb, a);
+    return vec4<f32>(rgb, a);
 }
