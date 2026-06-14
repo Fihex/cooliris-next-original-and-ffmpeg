@@ -175,13 +175,13 @@ fn hit(r: [f32; 4], x: f32, y: f32) -> bool {
     x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3]
 }
 
-/// Lightbox close (✕) button rect — top-right, shown for any focused item.
-fn lightbox_close(w: f32) -> [f32; 4] {
-    [w - 50.0, 14.0, 36.0, 36.0]
+/// Lightbox "← Back" button rect — top-left, for any focused item.
+fn lightbox_back(_w: f32) -> [f32; 4] {
+    [16.0, 14.0, 92.0, 36.0]
 }
-/// Lightbox Info toggle rect — just left of the close button.
+/// Lightbox Info toggle rect — a circular ⓘ at the top-right.
 fn lightbox_info(w: f32) -> [f32; 4] {
-    [w - 50.0 - 8.0 - 56.0, 14.0, 56.0, 36.0]
+    [w - 16.0 - 36.0, 14.0, 36.0, 36.0]
 }
 
 /// The field's text with a caret bar inserted at `caret` (only when the field is focused).
@@ -407,8 +407,6 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
             r[3] / h * 2.0,
         ]
     };
-    let chip = [1.0, 1.0, 1.0, 0.12];
-    let chip_on = [1.0, 1.0, 1.0, 0.24];
     let white_rect = [1.0, 1.0, 1.0, 0.95];
     macro_rules! rect {
         ($r:expr, $c:expr $(,)?) => {
@@ -432,52 +430,39 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
     // Top bar — hidden while an item is open (the lightbox is uncluttered).
     let b = bar(w);
     if !c.focused {
-    // Top bar: a black gradient strip (from-black to transparent), approximated by two stacked
-    // translucent bands.
-    rect!([0.0, 0.0, w, BAR_H], [0.0, 0.0, 0.0, 0.50]);
-    rect!([0.0, 0.0, w, BAR_H * 0.55], [0.0, 0.0, 0.0, 0.22]);
+    // Top bar — a flat translucent black strip.
+    rect!([0.0, 0.0, w, BAR_H], [0.0, 0.0, 0.0, 0.55]);
     let pill_off = [1.0, 1.0, 1.0, 0.10]; // bg-white/10
     let pill_on = [1.0, 1.0, 1.0, 1.0]; // active = white pill, black text
     let txt_on = [14, 14, 16, 255];
-    let rad = BTN_H * 0.5; // rounded-full
+    let rad = 8.0; // slightly-rounded buttons (rounded-md), like the reference
+    // A pill button with its label centred.
+    macro_rules! btn {
+        ($rect:expr, $text:expr, $on:expr) => {{
+            let br = $rect;
+            let on: bool = $on;
+            let t: String = $text;
+            pill!(br, if on { pill_on } else { pill_off }, rad);
+            let tw = t.chars().count() as f32 * 7.3;
+            label!(t, br[0] + (br[2] - tw) * 0.5, br[1] + 9.0, 14.0, if on { txt_on } else { white });
+        }};
+    }
     // Wordmark.
-    label!("Cooliris".into(), 14.0, BTN_Y + 7.0, 17.0, white);
-    label!("Next".into(), 90.0, BTN_Y + 8.0, 16.0, [150, 150, 160, 220]);
-    // Open ▾
-    let a = c.menu == Some(MenuKind::Open);
-    pill!(b.open, if a { pill_on } else { pill_off }, rad);
-    label!("Open \u{25be}".into(), b.open[0] + 12.0, b.open[1] + 8.0, 14.0, if a { txt_on } else { white });
+    label!("Cooliris".into(), 14.0, BTN_Y + 8.0, 17.0, white);
+    label!("Next".into(), 92.0, BTN_Y + 9.0, 15.0, [150, 150, 160, 220]);
+    btn!(b.open, "Open \u{25be}".into(), c.menu == Some(MenuKind::Open));
     // divider between Open and Slideshow
-    rect!([b.open[0] + b.open[2] + 9.0, BTN_Y + 4.0, 1.5, BTN_H - 8.0], [1.0, 1.0, 1.0, 0.16]);
-    // Slideshow / Stop
-    let a = c.slideshow;
-    pill!(b.slideshow, if a { pill_on } else { pill_off }, rad);
-    label!(
-        if a { "Stop".into() } else { "Slideshow".into() },
-        b.slideshow[0] + 16.0, b.slideshow[1] + 8.0, 14.0, if a { txt_on } else { white },
-    );
-    // Fullscreen
-    pill!(b.full, pill_off, rad);
-    label!("Fullscreen".into(), b.full[0] + 16.0, b.full[1] + 8.0, 14.0, white);
-    // Settings
-    let a = c.menu == Some(MenuKind::Settings);
-    pill!(b.settings, if a { pill_on } else { pill_off }, rad);
-    label!("Settings".into(), b.settings[0] + 16.0, b.settings[1] + 8.0, 14.0, if a { txt_on } else { white });
-    // Sort ▾
-    let a = c.menu == Some(MenuKind::Sort);
-    pill!(b.sort, if a { pill_on } else { pill_off }, rad);
-    label!("Sort \u{25be}".into(), b.sort[0] + 12.0, b.sort[1] + 8.0, 14.0, if a { txt_on } else { white });
-    // Filter ▾
-    let a = c.menu == Some(MenuKind::Filter);
-    pill!(b.filter, if a { pill_on } else { pill_off }, rad);
-    label!(format!("{} \u{25be}", c.filter.label()), b.filter[0] + 12.0, b.filter[1] + 8.0, 14.0, if a { txt_on } else { white });
-    // Dates ▾  (active when a range is set or the menu is open)
+    rect!([b.open[0] + b.open[2] + 9.0, BTN_Y + 5.0, 1.0, BTN_H - 10.0], [1.0, 1.0, 1.0, 0.15]);
+    btn!(b.slideshow, if c.slideshow { "Stop".into() } else { "Slideshow".into() }, c.slideshow);
+    btn!(b.full, "Fullscreen".into(), false);
+    btn!(b.settings, "Settings".into(), c.menu == Some(MenuKind::Settings));
+    btn!(b.sort, "Sort \u{25be}".into(), c.menu == Some(MenuKind::Sort));
+    btn!(b.filter, "Filter \u{25be}".into(), c.menu == Some(MenuKind::Filter));
     let dates_set = !c.date_from.is_empty() || !c.date_to.is_empty();
-    let a = c.menu == Some(MenuKind::Dates) || dates_set;
-    pill!(b.dates, if a { pill_on } else { pill_off }, rad);
-    label!(
+    btn!(
+        b.dates,
         if dates_set { "Dates \u{2022}".into() } else { "Dates \u{25be}".into() },
-        b.dates[0] + 12.0, b.dates[1] + 8.0, 14.0, if a { txt_on } else { white },
+        c.menu == Some(MenuKind::Dates) || dates_set
     );
     // Search (input pill)
     pill!(b.search, if c.search_active { [1.0, 1.0, 1.0, 0.16] } else { pill_off }, rad);
@@ -513,11 +498,12 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
         for (i, (lbl, desc)) in SETTINGS_ROWS.iter().enumerate() {
             let sw = su.switches[i];
             if hit(su.rows[i], c.pointer[0], c.pointer[1]) {
-                rect!(su.rows[i], [1.0, 1.0, 1.0, 0.05]);
+                pill!(su.rows[i], [1.0, 1.0, 1.0, 0.05], 10.0);
             }
-            rect!(sw, if on[i] { [0.30, 0.62, 0.45, 1.0] } else { [1.0, 1.0, 1.0, 0.16] }); // track
+            // Toggle switch: a rounded track + a circular knob.
+            pill!(sw, if on[i] { [0.30, 0.62, 0.45, 1.0] } else { [1.0, 1.0, 1.0, 0.16] }, sw[3] * 0.5);
             let kx = if on[i] { sw[0] + sw[2] - 22.0 } else { sw[0] + 2.0 };
-            rect!([kx, sw[1] + 2.0, 20.0, sw[3] - 4.0], white_rect); // knob
+            pill!([kx, sw[1] + 2.0, 20.0, sw[3] - 4.0], white_rect, (sw[3] - 4.0) * 0.5); // knob
             let tx = sw[0] + sw[2] + 16.0;
             label!((*lbl).into(), tx, sw[1] - 4.0, 15.0, white);
             label!((*desc).into(), tx, sw[1] + 16.0, 12.0, [160, 160, 170, 210]);
@@ -528,14 +514,16 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
         let field_bg = [1.0, 1.0, 1.0, 0.08];
         pill!(du.panel, [0.09, 0.09, 0.10, 0.99], 14.0);
         label!("Filter by".into(), du.panel[0] + 12.0, du.panel[1] + 8.0, 13.0, dim);
-        // Modified / Created tabs.
-        rect!(du.modified, if !c.date_created { chip_on } else { chip });
-        label!("Modified".into(), du.modified[0] + 16.0, du.modified[1] + 7.0, 13.0, white);
-        rect!(du.created, if c.date_created { chip_on } else { chip });
-        label!("Created".into(), du.created[0] + 20.0, du.created[1] + 7.0, 13.0, white);
+        // Modified / Created tabs (active = white pill + black text).
+        let on = !c.date_created;
+        pill!(du.modified, if on { white_rect } else { [1.0, 1.0, 1.0, 0.10] }, 8.0);
+        label!("Modified".into(), du.modified[0] + 16.0, du.modified[1] + 7.0, 13.0, if on { txt_on } else { white });
+        let on = c.date_created;
+        pill!(du.created, if on { white_rect } else { [1.0, 1.0, 1.0, 0.10] }, 8.0);
+        label!("Created".into(), du.created[0] + 20.0, du.created[1] + 7.0, 13.0, if on { txt_on } else { white });
         // From field.
         label!("From".into(), du.from[0], du.from[1] - 16.0, 12.0, dim);
-        rect!(du.from, if c.date_active == 1 { chip_on } else { field_bg });
+        pill!(du.from, if c.date_active == 1 { [1.0, 1.0, 1.0, 0.16] } else { field_bg }, 8.0);
         if c.date_from.is_empty() && c.date_active != 1 {
             label!("YYYY-MM-DD".into(), du.from[0] + 8.0, du.from[1] + 9.0, 13.0, dim);
         } else {
@@ -543,17 +531,17 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
         }
         // To field.
         label!("To".into(), du.to[0], du.to[1] - 16.0, 12.0, dim);
-        rect!(du.to, if c.date_active == 2 { chip_on } else { field_bg });
+        pill!(du.to, if c.date_active == 2 { [1.0, 1.0, 1.0, 0.16] } else { field_bg }, 8.0);
         if c.date_to.is_empty() && c.date_active != 2 {
             label!("YYYY-MM-DD".into(), du.to[0] + 8.0, du.to[1] + 9.0, 13.0, dim);
         } else {
             label!(caret_str(&c.date_to, c.caret, c.date_active == 2), du.to[0] + 8.0, du.to[1] + 9.0, 13.0, white);
         }
-        // Clear / Done.
-        rect!(du.clear, chip);
+        // Clear / Done (Done = white pill + black text).
+        pill!(du.clear, [1.0, 1.0, 1.0, 0.10], 8.0);
         label!("Clear dates".into(), du.clear[0] + 12.0, du.clear[1] + 8.0, 13.0, white);
-        rect!(du.done, chip_on);
-        label!("Done".into(), du.done[0] + 26.0, du.done[1] + 8.0, 13.0, white);
+        pill!(du.done, white_rect, 8.0);
+        label!("Done".into(), du.done[0] + 26.0, du.done[1] + 8.0, 13.0, txt_on);
     } else if let Some(kind) = c.menu {
         let (anchor, items): ([f32; 4], Vec<(String, bool)>) = match kind {
             MenuKind::Open => (
@@ -592,19 +580,24 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
     }
     } // end top bar (hidden while an item is focused)
 
-    // Info card — centred near the top: title · filename · "index / total · Modified date".
-    if c.show_info {
-        if let Some((title, file, meta)) = &c.info {
-            let cw = 460.0_f32;
-            let cx0 = (w - cw) * 0.5;
-            // Near the top when focused (top bar is hidden); below the bar otherwise.
-            let cy0 = if c.focused { 26.0 } else { BAR_H + 10.0 };
-            rect!([cx0, cy0, cw, 78.0], [0.04, 0.04, 0.06, 0.84]);
-            // Approximate centring (variable-width font): width ≈ chars × per-glyph estimate.
-            let centre = |text: &str, per: f32| (w - text.chars().count() as f32 * per) * 0.5;
-            label!(title.clone(), centre(title, 7.7), cy0 + 13.0, 15.0, white);
-            label!(file.clone(), centre(file, 6.2), cy0 + 38.0, 12.0, [180, 180, 190, 220]);
-            label!(meta.clone(), centre(meta, 6.2), cy0 + 56.0, 12.0, [150, 150, 160, 210]);
+    // Info pill — bottom-centre while focused (above the video controls bar): title + position,
+    // plus filename + date when Info is on. Hidden with a video's controls when it goes idle.
+    let info_hidden = c.video.as_ref().map_or(false, |v| !v.visible);
+    if !info_hidden {
+        if let Some((title, line2, line3)) = &c.info {
+            let three = !line3.is_empty();
+            let ph = if three { 66.0 } else { 46.0 };
+            let bottom = if c.video.is_some() { h - 44.0 - 14.0 } else { h - 18.0 };
+            let py = bottom - ph;
+            let pw = 480.0_f32.min(w - 40.0);
+            let px = (w - pw) * 0.5;
+            pill!([px, py, pw, ph], [0.0, 0.0, 0.0, 0.66], 10.0);
+            let centre = |t: &str, per: f32| (w - t.chars().count() as f32 * per) * 0.5;
+            label!(title.clone(), centre(title, 7.4), py + 9.0, 14.0, white);
+            label!(line2.clone(), centre(line2, 6.0), py + 28.0, 12.0, [175, 175, 185, 225]);
+            if three {
+                label!(line3.clone(), centre(line3, 6.0), py + 46.0, 12.0, [150, 150, 160, 210]);
+            }
         }
     }
 
@@ -701,13 +694,16 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
     // it goes idle, so nothing is left floating over the picture.
     let controls_hidden = c.video.as_ref().map_or(false, |v| !v.visible);
     if c.focused && !controls_hidden {
+        // "← Back" pill, top-left.
+        let bk = lightbox_back(w);
+        let hov = hit(bk, c.pointer[0], c.pointer[1]);
+        pill!(bk, if hov { [0.0, 0.0, 0.0, 0.8] } else { [0.0, 0.0, 0.0, 0.55] }, 8.0);
+        label!("\u{2190} Back".into(), bk[0] + 16.0, bk[1] + 10.0, 14.0, white);
+        // Circular Info (ⓘ) toggle, top-right.
         let ib = lightbox_info(w);
-        rect!(ib, if c.show_info { chip_on } else { [0.0, 0.0, 0.0, 0.55] });
-        label!("Info".into(), ib[0] + 14.0, ib[1] + 10.0, 14.0, white);
-        let cb = lightbox_close(w);
-        let hov = hit(cb, c.pointer[0], c.pointer[1]);
-        rect!(cb, if hov { [0.0, 0.0, 0.0, 0.8] } else { [0.0, 0.0, 0.0, 0.55] });
-        label!("\u{2715}".into(), cb[0] + 10.0, cb[1] + 9.0, 18.0, white);
+        let on = c.show_info;
+        pill!(ib, if on { white_rect } else { [0.0, 0.0, 0.0, 0.55] }, ib[3] * 0.5);
+        label!("i".into(), ib[0] + 15.0, ib[1] + 8.0, 17.0, if on { [14, 14, 16, 255] } else { white });
     }
 
     (rects, lines)
@@ -816,7 +812,7 @@ pub fn hit_test(c: &UiCtx, x: f32, y: f32) -> Option<UiAction> {
     // idle, matching what's drawn).
     let controls_hidden = c.video.as_ref().map_or(false, |v| !v.visible);
     if c.focused && !controls_hidden {
-        if hit(lightbox_close(c.w), x, y) {
+        if hit(lightbox_back(c.w), x, y) {
             return Some(UiAction::Back);
         }
         if hit(lightbox_info(c.w), x, y) {

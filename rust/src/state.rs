@@ -1309,48 +1309,39 @@ impl State {
             .values()
             .filter(|t| matches!(t, Tile::Ready { .. }))
             .count();
-        let info = if self.show_info {
-            self.focus.or(self.hover_index).and_then(|i| {
-                if let Some(Source::File(p) | Source::Video(p) | Source::Audio(p)) =
-                    self.sources.get(i)
-                {
-                    let filename =
-                        p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                    let title = p
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| filename.clone());
-                    // Second line = the file's full path (left-ellipsised so the filename end stays).
-                    let full = p.to_string_lossy();
-                    let n = full.chars().count();
-                    let path = if n > 70 {
-                        let tail: String = full.chars().skip(n - 69).collect();
-                        format!("\u{2026}{tail}")
-                    } else {
-                        full.into_owned()
-                    };
-                    // Show the date that matches the active selection (Dates "Created" tab, or a
-                    // Created sort), else the modified date.
-                    let use_created = self.date_created
-                        || matches!(self.sort_mode, SortMode::CreatedNew | SortMode::CreatedOld);
-                    let md = std::fs::metadata(p).ok();
-                    let (when, time) = if use_created {
-                        ("Created", md.and_then(|m| m.created().or_else(|_| m.modified()).ok()))
-                    } else {
-                        ("Modified", md.and_then(|m| m.modified().ok()))
-                    };
-                    let meta = match time {
-                        Some(t) => format!("{} / {}  ·  {} {}", i + 1, self.total, when, fmt_date(t)),
-                        None => format!("{} / {}", i + 1, self.total),
-                    };
-                    Some((title, path, meta))
+        // Bottom-of-lightbox info pill (only while an item is open). Always: title + "N / total".
+        // With Info on, also the filename and the chosen date — (title, line2, line3).
+        let info = self.focus.and_then(|i| {
+            let p = match self.sources.get(i)? {
+                Source::File(p) | Source::Video(p) | Source::Audio(p) => p,
+                Source::Placeholder(_) => return None,
+            };
+            let filename =
+                p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            let title = p
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| filename.clone());
+            let pos = format!("{} / {}", i + 1, self.total);
+            if self.show_info {
+                // Date matching the active selection (Dates "Created" tab or a Created sort).
+                let use_created = self.date_created
+                    || matches!(self.sort_mode, SortMode::CreatedNew | SortMode::CreatedOld);
+                let md = std::fs::metadata(p).ok();
+                let (when, time) = if use_created {
+                    ("Created", md.and_then(|m| m.created().or_else(|_| m.modified()).ok()))
                 } else {
-                    None
-                }
-            })
-        } else {
-            None
-        };
+                    ("Modified", md.and_then(|m| m.modified().ok()))
+                };
+                let line3 = match time {
+                    Some(t) => format!("{pos}  ·  {when} {}", fmt_date(t)),
+                    None => pos.clone(),
+                };
+                Some((title, filename, line3))
+            } else {
+                Some((title, pos, String::new()))
+            }
+        });
         let video = if self.video.is_some() {
             let (pos, dur, paused) = self.video_state().unwrap_or((0.0, 0.0, false));
             let (vol, aid, sid) = self
@@ -2802,6 +2793,11 @@ impl State {
         if matches!(self.sources.get(idx), Some(Source::Video(_))) {
             return LbDraw::None; // videos play via the video layer, not the lightbox
         }
+        // An animated GIF's tile layer holds a packed atlas (a grid of frames) — sampling it as a
+        // full thumbnail would show the whole grid. Wait for the full-res GIF (full_tex) instead.
+        if self.full_for != Some(idx) && self.wall_gifs.contains_key(&idx) {
+            return LbDraw::None;
+        }
         // (aspect, uv extent, layer, which bind group) — full-res if ready, else the thumb.
         let (aspect, uv, layer, draw) = if self.full_for == Some(idx) {
             let e = self.full_extent;
@@ -2910,22 +2906,22 @@ impl State {
             let thumb_x = pad + (track_w - thumb_w) * frac;
             rects.push(OverlayRect {
                 rect: [nx(thumb_x), by, nw(thumb_w), bh],
-                color: [0.95, 0.96, 1.0, 0.9], round: [0.0; 4] });
+                color: [0.95, 0.96, 1.0, 0.9], round: [4.0, thumb_w, 18.0, 0.0] });
         }
 
-        // Hover tooltip: a solid black pill centred on the hovered tile (text drawn in ui_lines),
+        // Hover tooltip: a rounded black pill centred on the hovered tile (text drawn in ui_lines),
         // matching the show-titles style.
         if let Some((_name, bx, by, bw)) = self.hover_label() {
             rects.push(OverlayRect {
                 rect: [nx(bx), ny_top(by + 22.0), nw(bw), nhh(22.0)],
-                color: [0.0, 0.0, 0.0, 1.0], round: [0.0; 4] });
+                color: [0.0, 0.0, 0.0, 1.0], round: [6.0, bw, 22.0, 0.0] });
         }
 
-        // Show-titles: a solid black pill at each tile's bottom (text drawn in ui_lines).
+        // Show-titles: a rounded black pill at each tile's bottom (text drawn in ui_lines).
         for (_name, bx, by, bw) in self.wall_titles() {
             rects.push(OverlayRect {
                 rect: [nx(bx), ny_top(by + 22.0), nw(bw), nhh(22.0)],
-                color: [0.0, 0.0, 0.0, 1.0], round: [0.0; 4] });
+                color: [0.0, 0.0, 0.0, 1.0], round: [6.0, bw, 22.0, 0.0] });
         }
         rects
     }
@@ -3591,12 +3587,46 @@ fn trim_heap() {
     }
 }
 
-/// Resident set size (MB). Linux: the 2nd field of /proc/self/statm is resident pages × 4 KiB.
-/// None on platforms without /proc (the readout simply hides).
+/// Resident set size (MB). Linux reads /proc/self/statm; Windows queries the working-set size.
+/// None on other platforms (the readout simply hides).
+#[cfg(target_os = "linux")]
 fn process_rss_mb() -> Option<u64> {
     let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
     let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
     Some(pages * 4096 / (1024 * 1024))
+}
+#[cfg(target_os = "windows")]
+fn process_rss_mb() -> Option<u64> {
+    #[repr(C)]
+    struct Pmc {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool: usize,
+        quota_paged_pool: usize,
+        quota_peak_nonpaged_pool: usize,
+        quota_nonpaged_pool: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+    }
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn K32GetProcessMemoryInfo(process: isize, counters: *mut Pmc, cb: u32) -> i32;
+    }
+    unsafe {
+        let mut pmc: Pmc = std::mem::zeroed();
+        pmc.cb = std::mem::size_of::<Pmc>() as u32;
+        if K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) != 0 {
+            Some(pmc.working_set_size as u64 / (1024 * 1024))
+        } else {
+            None
+        }
+    }
+}
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+fn process_rss_mb() -> Option<u64> {
+    None
 }
 
 /// A file's modified time as "M/D/YYYY" (UTC). Uses Howard Hinnant's civil-from-days algorithm so
