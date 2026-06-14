@@ -8,6 +8,22 @@
 
 use crate::icons::IconReq;
 use crate::ui::Line;
+use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// Measured pixel widths of the (static) toolbar labels, populated once at startup from the real
+/// font, so buttons size + centre their text exactly instead of estimating per-character.
+static LABEL_W: OnceLock<HashMap<String, f32>> = OnceLock::new();
+pub fn set_label_widths(m: HashMap<String, f32>) {
+    let _ = LABEL_W.set(m);
+}
+/// Measured width of `text` (falls back to a per-char estimate before the cache is populated).
+fn label_w(text: &str) -> f32 {
+    LABEL_W
+        .get()
+        .and_then(|m| m.get(text).copied())
+        .unwrap_or_else(|| text.chars().count() as f32 * 7.6)
+}
 
 /// A screen-space coloured rectangle in NDC (x, y bottom-left, w, h) — the overlay pipeline's vertex.
 /// `round` = [corner_radius_px, width_px, height_px, _]; radius 0 = a plain sharp rect.
@@ -166,6 +182,7 @@ pub struct UiCtx {
     pub video: Option<VideoCtx>,
     pub pointer: [f32; 2], // pixel cursor (for hover highlight)
     pub fullscreen: bool,  // window is currently fullscreen (swaps the fullscreen icon)
+    pub caret_on: bool,    // text caret blink phase (true = show the caret this frame)
 }
 
 const BAR_H: f32 = 48.0;
@@ -173,17 +190,23 @@ const BTN_Y: f32 = 8.0;
 const BTN_H: f32 = 32.0;
 const ROW_H: f32 = 30.0;
 
-// Shared dark-blue UI theme (one palette so every button/panel matches).
+// Shared UI theme (one palette so every button/panel matches).
 // Change these to restyle every button / control / panel / border at once.
-pub const BTN_FILL: [f32; 4] = [0.055, 0.075, 0.14, 1.0]; // button fill (gradient lightens the top)
-pub const BTN_HOVER: [f32; 4] = [0.13, 0.17, 0.27, 1.0]; // button fill when hovered (a bit lighter)
-pub const BTN_BORDER: [f32; 4] = [0.30, 0.37, 0.52, 0.95]; // every button/control border
-pub const BTN_GRAD: f32 = 0.22; // vertical gradient strength
+pub const BTN_FILL: [f32; 4] = [0.20, 0.20, 0.20, 0.96]; // #333 gray — on-panel buttons / fields
+pub const BTN_HOVER: [f32; 4] = [0.27, 0.27, 0.27, 1.0]; // #454545 on hover
+pub const PANEL_BORDER: [f32; 4] = [1.0, 1.0, 1.0, 0.03]; // white @ 3% — panels only (buttons have no border)
+pub const BTN_GRAD: f32 = 0.0; // flat fill
 pub const BTN_TEXT: [u8; 4] = [235, 235, 240, 255]; // button label colour
-pub const BTN_ON: [f32; 4] = [1.0, 1.0, 1.0, 1.0]; // active/selected button fill
-pub const BTN_ON_TEXT: [u8; 4] = [14, 14, 16, 255]; // active/selected button text
-pub const PANEL_BG: [f32; 4] = [0.05, 0.065, 0.12, 0.99]; // dropdowns / settings / dates / info panel
-pub const HOVER_OVERLAY: [f32; 4] = [1.0, 1.0, 1.0, 0.12]; // subtle highlight over icon buttons / rows
+pub const BTN_ON: [f32; 4] = [1.0, 1.0, 1.0, 1.0]; // selected = light (white)
+pub const BTN_ON_TEXT: [u8; 4] = [14, 14, 16, 255]; // black text when selected
+pub const PANEL_BG: [f32; 4] = [0.118, 0.118, 0.118, 1.0]; // #1e1e1e, solid (dropdowns / panels / info)
+pub const HOVER_OVERLAY: [f32; 4] = [1.0, 1.0, 1.0, 0.10]; // subtle highlight over icon buttons / rows
+// Top-bar buttons — translucent black, so the wall shows through (the bar itself is transparent).
+pub const TOPBTN_FILL: [f32; 4] = [0.0, 0.0, 0.0, 0.40];
+pub const TOPBTN_HOVER: [f32; 4] = [0.0, 0.0, 0.0, 0.58];
+// The wall/lightbox prev-next arrows are transparent black glass (see-through), no border.
+pub const ARROW_FILL: [f32; 4] = [0.0, 0.0, 0.0, 0.45];
+pub const ARROW_HOVER: [f32; 4] = [0.0, 0.0, 0.0, 0.62];
 
 fn hit(r: [f32; 4], x: f32, y: f32) -> bool {
     x >= r[0] && x <= r[0] + r[2] && y >= r[1] && y <= r[1] + r[3]
@@ -229,16 +252,19 @@ struct Bar {
 }
 const BRAND_W: f32 = 128.0; // space reserved for the "Cooliris Next" wordmark on the left
 fn bar(w: f32) -> Bar {
+    // Each button is sized to its measured label width + 14px padding each side.
+    let bw = |label: &str| label_w(label) + 28.0;
     // Left group: [Cooliris Next]  Open  |  Slideshow  Fullscreen
-    let open = [12.0 + BRAND_W, BTN_Y, 64.0, BTN_H];
-    let slideshow = [open[0] + open[2] + 20.0, BTN_Y, 100.0, BTN_H]; // gap leaves room for a divider
-    let full = [slideshow[0] + slideshow[2] + 8.0, BTN_Y, 104.0, BTN_H];
+    let open = [12.0 + BRAND_W, BTN_Y, bw("Open"), BTN_H];
+    let slideshow = [open[0] + open[2] + 20.0, BTN_Y, bw("Slideshow"), BTN_H]; // gap leaves room for a divider
+    let full = [slideshow[0] + slideshow[2] + 8.0, BTN_Y, bw("Fullscreen"), BTN_H];
     // Right group, laid out right→left: Search  Dates  Filter  Sort  Settings  [count]
     let search = [w - 16.0 - 210.0, BTN_Y, 210.0, BTN_H];
-    let dates = [search[0] - 8.0 - 78.0, BTN_Y, 78.0, BTN_H];
-    let filter = [dates[0] - 8.0 - 92.0, BTN_Y, 92.0, BTN_H];
-    let sort = [filter[0] - 8.0 - 62.0, BTN_Y, 62.0, BTN_H];
-    let settings = [sort[0] - 8.0 - 86.0, BTN_Y, 86.0, BTN_H];
+    let (dw, fw, sw, stw) = (bw("Dates"), bw("Filter"), bw("Sort"), bw("Settings"));
+    let dates = [search[0] - 8.0 - dw, BTN_Y, dw, BTN_H];
+    let filter = [dates[0] - 8.0 - fw, BTN_Y, fw, BTN_H];
+    let sort = [filter[0] - 8.0 - sw, BTN_Y, sw, BTN_H];
+    let settings = [sort[0] - 8.0 - stw, BTN_Y, stw, BTN_H];
     Bar { open, slideshow, full, settings, sort, filter, dates, search }
 }
 
@@ -454,6 +480,14 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
             rects.push(OverlayRect { rect: nd(pr), color: $c, round: [$rad, pr[2], pr[3], $grad] })
         }};
     }
+    // A panel: a hairline border ring under the solid fill (borders are panel-only).
+    macro_rules! panel {
+        ($r:expr, $rad:expr $(,)?) => {{
+            let pr = $r;
+            pill!([pr[0] - 1.0, pr[1] - 1.0, pr[2] + 2.0, pr[3] + 2.0], PANEL_BORDER, $rad + 1.0);
+            pill!(pr, PANEL_BG, $rad);
+        }};
+    }
     macro_rules! label {
         ($t:expr, $x:expr, $y:expr, $s:expr, $col:expr $(,)?) => {
             lines.push(Line { text: $t, x: $x, y: $y, size: $s, color: $col })
@@ -474,57 +508,54 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
     // Top bar — hidden while an item is open (the lightbox is uncluttered).
     let b = bar(w);
     if !c.focused {
-    // Top bar — a flat translucent black strip.
-    rect!([0.0, 0.0, w, BAR_H], [0.0, 0.0, 0.0, 0.55]);
+    // Top bar — transparent: the wall shows through, only the translucent buttons sit on top.
     // DAW-style buttons: a dark-blue fill with a top-lighter vertical gradient, under a hairline
     // lighter border (shared dark-blue theme).
     let pill_off = BTN_FILL;
-    let pill_border = BTN_BORDER;
     let pill_on = BTN_ON; // active = white pill, black text
     let txt_on = BTN_ON_TEXT;
-    let rad = 4.0; // slightly-rounded buttons (rounded-md), like the reference
+    let rad = BTN_H * 0.5; // 100%-round — full pill
     let grad = BTN_GRAD; // vertical gradient strength for the dark buttons
-    // A pill button: a hairline border, the gradient fill (lighter when hovered), then a centred label.
+    // A pill button: a flat fill (white when active, lighter when hovered), then a centred label.
     macro_rules! btn {
         ($rect:expr, $text:expr, $on:expr) => {{
             let br = $rect;
             let on: bool = $on;
             let t: String = $text;
             let hov = hit(br, c.pointer[0], c.pointer[1]);
-            pill!([br[0] - 1.0, br[1] - 1.0, br[2] + 2.0, br[3] + 2.0], if on { pill_on } else { pill_border }, rad + 1.0);
             if on {
                 pill!(br, pill_on, rad);
             } else {
-                gpill!(br, if hov { BTN_HOVER } else { pill_off }, rad, grad);
+                gpill!(br, if hov { TOPBTN_HOVER } else { TOPBTN_FILL }, rad, grad);
             }
-            let tw = t.chars().count() as f32 * 7.3;
-            label!(t, br[0] + (br[2] - tw) * 0.5, br[1] + 9.0, 14.0, if on { txt_on } else { white });
+            let tw = label_w(&t); // measured width → exact horizontal centring
+            // Vertically centre the label in the button (the glyph sits ~2px low at +9).
+            label!(t, br[0] + (br[2] - tw) * 0.5, br[1] + br[3] * 0.5 - 9.0, 14.0, if on { txt_on } else { white });
         }};
     }
-    // Wordmark — "Cooliris" with a tucked-in "Next".
-    label!("Cooliris".into(), 14.0, BTN_Y + 8.0, 17.0, white);
-    label!("Next".into(), 84.0, BTN_Y + 9.0, 15.0, [150, 150, 160, 220]);
-    btn!(b.open, "Open \u{25be}".into(), c.menu == Some(MenuKind::Open));
+    // Wordmark — "Cooliris" with a tucked-in "Next", vertically centred like the buttons.
+    label!("Cooliris".into(), 14.0, BTN_Y + BTN_H * 0.5 - 17.0 * 0.64, 17.0, white);
+    label!("Next".into(), 84.0, BTN_Y + BTN_H * 0.5 - 15.0 * 0.64, 15.0, [150, 150, 160, 220]);
+    btn!(b.open, "Open".into(), c.menu == Some(MenuKind::Open));
     // divider between Open and Slideshow
     rect!([b.open[0] + b.open[2] + 9.0, BTN_Y + 5.0, 1.0, BTN_H - 10.0], [1.0, 1.0, 1.0, 0.15]);
     btn!(b.slideshow, if c.slideshow { "Stop".into() } else { "Slideshow".into() }, c.slideshow);
     btn!(b.full, "Fullscreen".into(), false);
     btn!(b.settings, "Settings".into(), c.menu == Some(MenuKind::Settings));
-    btn!(b.sort, "Sort \u{25be}".into(), c.menu == Some(MenuKind::Sort));
-    btn!(b.filter, "Filter \u{25be}".into(), c.menu == Some(MenuKind::Filter));
+    btn!(b.sort, "Sort".into(), c.menu == Some(MenuKind::Sort));
+    btn!(b.filter, "Filter".into(), c.menu == Some(MenuKind::Filter));
     let dates_set = !c.date_from.is_empty() || !c.date_to.is_empty();
     btn!(
         b.dates,
-        if dates_set { "Dates \u{2022}".into() } else { "Dates \u{25be}".into() },
+        if dates_set { "Dates \u{2022}".into() } else { "Dates".into() },
         c.menu == Some(MenuKind::Dates) || dates_set
     );
-    // Search (input pill) — same gradient + hairline border as the buttons.
-    pill!([b.search[0] - 1.0, b.search[1] - 1.0, b.search[2] + 2.0, b.search[3] + 2.0], pill_border, rad + 1.0);
-    gpill!(b.search, if c.search_active { [0.12, 0.16, 0.26, 1.0] } else { pill_off }, rad, grad);
+    // Search (input pill) — flat fill, no border (borders are panel-only now).
+    gpill!(b.search, if c.search_active { TOPBTN_HOVER } else { TOPBTN_FILL }, rad, grad);
     if c.search.is_empty() && !c.search_active {
         label!("Search\u{2026}".into(), b.search[0] + 14.0, b.search[1] + 8.0, 14.0, [160, 160, 170, 220]);
     } else {
-        label!(caret_str(&c.search, c.caret, c.search_active), b.search[0] + 14.0, b.search[1] + 8.0, 14.0, white);
+        label!(caret_str(&c.search, c.caret, c.search_active && c.caret_on), b.search[0] + 14.0, b.search[1] + 8.0, 14.0, white);
         if !c.search.is_empty() {
             label!("\u{2715}".into(), b.search[0] + b.search[2] - 22.0, b.search[1] + 8.0, 14.0, [200, 200, 210, 230]);
         }
@@ -535,7 +566,7 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
     if c.total > 0 {
         let t = format!("{}/{}", c.ready.min(c.total), c.total);
         let cw = t.chars().count() as f32 * 7.6;
-        label!(t, info_x - cw, BTN_Y + 9.0, 13.0, [185, 185, 195, 235]);
+        label!(t, info_x - cw, BTN_Y + BTN_H * 0.5 - 8.3, 13.0, [185, 185, 195, 235]);
         info_x -= cw + 8.0;
         if c.inflight > 0 {
             pill!([info_x - 9.0, BTN_Y + 12.0, 9.0, 9.0], [0.45, 0.75, 1.0, 0.95], 4.5);
@@ -545,7 +576,7 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
     if let Some(mb) = c.mem_mb {
         let m = format!("{mb} MB");
         let mw = m.chars().count() as f32 * 7.0;
-        label!(m, info_x - mw, BTN_Y + 9.0, 12.0, [150, 200, 160, 220]);
+        label!(m, info_x - mw, BTN_Y + BTN_H * 0.5 - 7.7, 12.0, [150, 200, 160, 220]);
     }
 
     // Dropdowns (Open / Sort / Filter) and the Settings modal.
@@ -553,7 +584,7 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
         let on = [c.show_titles, c.gif_anim, c.reflections, c.show_mem];
         let su = settings_layout(w, h, SETTINGS_ROWS.len());
         rect!([0.0, 0.0, w, h], [0.0, 0.0, 0.0, 0.5]); // scrim
-        pill!(su.panel, PANEL_BG, 16.0);
+        panel!(su.panel, 16.0);
         label!("Settings".into(), su.panel[0] + 22.0, su.panel[1] + 18.0, 18.0, white);
         label!("\u{2715}".into(), su.close[0] + 5.0, su.close[1] + 3.0, 17.0, [200, 200, 210, 230]);
         for (i, (lbl, desc)) in SETTINGS_ROWS.iter().enumerate() {
@@ -572,37 +603,37 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
     } else if c.menu == Some(MenuKind::Dates) {
         let du = dates_layout(b.dates);
         let dim = [170, 170, 180, 220];
-        let field_bg = [1.0, 1.0, 1.0, 0.08];
-        pill!(du.panel, PANEL_BG, 14.0);
+        let field_bg = BTN_FILL; // same fill as the buttons, so fields read on the panel
+        panel!(du.panel, 14.0);
         label!("Filter by".into(), du.panel[0] + 12.0, du.panel[1] + 8.0, 13.0, dim);
         // Modified / Created tabs (active = white pill + black text; inactive = gradient gray).
         let on = !c.date_created;
-        if on { pill!(du.modified, white_rect, 6.0); } else { gpill!(du.modified, pill_off, 6.0, grad); }
-        label!("Modified".into(), du.modified[0] + 16.0, du.modified[1] + 7.0, 13.0, if on { txt_on } else { white });
+        if on { pill!(du.modified, BTN_ON, 6.0); } else { gpill!(du.modified, pill_off, 6.0, grad); }
+        label!("Modified".into(), du.modified[0] + (du.modified[2] - label_w("Modified")) * 0.5, du.modified[1] + 6.0, 13.0, if on { txt_on } else { white });
         let on = c.date_created;
-        if on { pill!(du.created, white_rect, 6.0); } else { gpill!(du.created, pill_off, 6.0, grad); }
-        label!("Created".into(), du.created[0] + 20.0, du.created[1] + 7.0, 13.0, if on { txt_on } else { white });
+        if on { pill!(du.created, BTN_ON, 6.0); } else { gpill!(du.created, pill_off, 6.0, grad); }
+        label!("Created".into(), du.created[0] + (du.created[2] - label_w("Created")) * 0.5, du.created[1] + 6.0, 13.0, if on { txt_on } else { white });
         // From field.
         label!("From".into(), du.from[0], du.from[1] - 16.0, 12.0, dim);
-        pill!(du.from, if c.date_active == 1 { [1.0, 1.0, 1.0, 0.16] } else { field_bg }, 8.0);
+        pill!(du.from, if c.date_active == 1 { BTN_HOVER } else { field_bg }, 8.0);
         if c.date_from.is_empty() && c.date_active != 1 {
-            label!("YYYY-MM-DD".into(), du.from[0] + 8.0, du.from[1] + 9.0, 13.0, dim);
+            label!("YYYY-MM-DD".into(), du.from[0] + 8.0, du.from[1] + 7.0, 13.0, dim);
         } else {
-            label!(caret_str(&c.date_from, c.caret, c.date_active == 1), du.from[0] + 8.0, du.from[1] + 9.0, 13.0, white);
+            label!(caret_str(&c.date_from, c.caret, c.date_active == 1 && c.caret_on), du.from[0] + 8.0, du.from[1] + 7.0, 13.0, white);
         }
         // To field.
         label!("To".into(), du.to[0], du.to[1] - 16.0, 12.0, dim);
-        pill!(du.to, if c.date_active == 2 { [1.0, 1.0, 1.0, 0.16] } else { field_bg }, 8.0);
+        pill!(du.to, if c.date_active == 2 { BTN_HOVER } else { field_bg }, 8.0);
         if c.date_to.is_empty() && c.date_active != 2 {
-            label!("YYYY-MM-DD".into(), du.to[0] + 8.0, du.to[1] + 9.0, 13.0, dim);
+            label!("YYYY-MM-DD".into(), du.to[0] + 8.0, du.to[1] + 7.0, 13.0, dim);
         } else {
-            label!(caret_str(&c.date_to, c.caret, c.date_active == 2), du.to[0] + 8.0, du.to[1] + 9.0, 13.0, white);
+            label!(caret_str(&c.date_to, c.caret, c.date_active == 2 && c.caret_on), du.to[0] + 8.0, du.to[1] + 7.0, 13.0, white);
         }
-        // Clear (gradient gray) / Done (white pill + black text).
+        // Clear / Done — both black like the rest (Done a touch more opaque).
         gpill!(du.clear, pill_off, 6.0, grad);
-        label!("Clear dates".into(), du.clear[0] + 12.0, du.clear[1] + 8.0, 13.0, white);
-        pill!(du.done, white_rect, 6.0);
-        label!("Done".into(), du.done[0] + 26.0, du.done[1] + 8.0, 13.0, txt_on);
+        label!("Clear dates".into(), du.clear[0] + (du.clear[2] - label_w("Clear dates")) * 0.5, du.clear[1] + 7.0, 13.0, white);
+        pill!(du.done, BTN_ON, 6.0);
+        label!("Done".into(), du.done[0] + (du.done[2] - label_w("Done")) * 0.5, du.done[1] + 7.0, 13.0, txt_on);
     } else if let Some(kind) = c.menu {
         let (anchor, items): ([f32; 4], Vec<(String, bool)>) = match kind {
             MenuKind::Open => (
@@ -628,7 +659,7 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
         };
         let (panel, rows) = menu(anchor, items.len(), w);
         // rounded-xl neutral-900 panel
-        pill!(panel, PANEL_BG, 12.0);
+        panel!(panel, 12.0);
         for (r, (text, current)) in rows.iter().zip(items) {
             let hov = hit(*r, c.pointer[0], c.pointer[1]);
             if current {
@@ -636,7 +667,7 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
             } else if hov {
                 pill!(*r, [1.0, 1.0, 1.0, 0.10], 7.0);
             }
-            label!(text, r[0] + 10.0, r[1] + 7.0, 14.0, if current { white } else { [200, 200, 210, 235] });
+            label!(text, r[0] + 10.0, r[1] + 6.0, 14.0, if current { white } else { [200, 200, 210, 235] });
         }
     }
     } // end top bar (hidden while an item is focused)
@@ -656,7 +687,7 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
             let need = wpx(title, 7.8).max(wpx(line2, 6.6)).max(wpx(line3, 6.6)) + 40.0;
             let pw = need.clamp(360.0, maxw);
             let px = (w - pw) * 0.5;
-            pill!([px, py, pw, ph], PANEL_BG, 10.0);
+            panel!([px, py, pw, ph], 10.0);
             // Clip a line (end ellipsis) if it's still wider than the (capped) panel.
             let fit = |t: &str, per: f32| -> String {
                 let max_chars = ((pw - 28.0) / per).floor() as usize;
@@ -735,13 +766,13 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
                     TrackMenu::Sub => (vl.subs, &v.sub_tracks, v.sid <= 0),
                 };
                 let (panel, rows) = track_menu_layout(anchor, tracks.len() + 1, c.w);
-                pill!(panel, PANEL_BG, 12.0);
+                panel!(panel, 12.0);
                 if off_sel {
                     rect!(rows[0], [1.0, 1.0, 1.0, 0.22]);
                 } else if hit(rows[0], c.pointer[0], c.pointer[1]) {
                     rect!(rows[0], [1.0, 1.0, 1.0, 0.12]);
                 }
-                label!("Off".into(), rows[0][0] + 8.0, rows[0][1] + 7.0, 13.0, white);
+                label!("Off".into(), rows[0][0] + 8.0, rows[0][1] + 6.0, 13.0, white);
                 for (r, (_id, lbl, sel)) in rows[1..].iter().zip(tracks.iter()) {
                     if *sel {
                         rect!(*r, [1.0, 1.0, 1.0, 0.22]);
@@ -752,7 +783,7 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
                     if t.chars().count() > 30 {
                         t = t.chars().take(29).collect::<String>() + "\u{2026}";
                     }
-                    label!(t, r[0] + 8.0, r[1] + 7.0, 13.0, white);
+                    label!(t, r[0] + 8.0, r[1] + 6.0, 13.0, white);
                 }
             }
         }
@@ -763,17 +794,15 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
     // it goes idle, so nothing is left floating over the picture.
     let controls_hidden = c.video.as_ref().map_or(false, |v| !v.visible);
     if c.focused && !controls_hidden {
-        // "← Back" button, top-left — same dark-blue look as the toolbar buttons (border + fill).
+        // "← Back" button, top-left — flat gray fill, no border (borders are panel-only now).
         let bk = lightbox_back(w);
         let hov = hit(bk, c.pointer[0], c.pointer[1]);
-        pill!([bk[0] - 1.0, bk[1] - 1.0, bk[2] + 2.0, bk[3] + 2.0], BTN_BORDER, 9.0);
         gpill!(bk, if hov { BTN_HOVER } else { BTN_FILL }, 8.0, BTN_GRAD);
         label!("\u{2190} Back".into(), bk[0] + 16.0, bk[1] + 10.0, 14.0, white);
-        // Circular Info (ⓘ) toggle, top-right — same look (white when on).
+        // Circular Info (ⓘ) toggle, top-right (white when on).
         let ib = lightbox_info(w);
         let on = c.show_info;
         let hov = hit(ib, c.pointer[0], c.pointer[1]);
-        pill!([ib[0] - 1.0, ib[1] - 1.0, ib[2] + 2.0, ib[3] + 2.0], if on { BTN_ON } else { BTN_BORDER }, (ib[3] + 2.0) * 0.5);
         if on {
             pill!(ib, BTN_ON, ib[3] * 0.5);
         } else {

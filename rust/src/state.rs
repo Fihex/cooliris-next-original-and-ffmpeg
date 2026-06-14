@@ -45,8 +45,8 @@ const BANK_MAX: f32 = 0.5;
 const PAN_Y_MAX: f32 = 1.7; // vertical grab-pan limit
 const DRAG_GAIN: f32 = 0.6; // left-drag scroll sensitivity
 const SCRUB_ZONE_PX: f32 = 44.0; // bottom band that acts as the scrubber
-const ARROW_W: f32 = 54.0; // lightbox prev/next buttons (vertically centered on each edge)
-const ARROW_H: f32 = 84.0;
+const ARROW_W: f32 = 68.0; // lightbox prev/next buttons (vertically centered on each edge)
+const ARROW_H: f32 = 104.0;
 const ARROW_MARGIN: f32 = 18.0;
 const ACCEL: f32 = 22.0; // arrow-key acceleration (world units / s²)
 const MAX_SPEED: f32 = 11.0;
@@ -127,20 +127,26 @@ fn vs(@builtin(vertex_index) vi: u32, in: In) -> V {
     out.round = in.round;
     return out;
 }
+// Colours are authored in sRGB (hex), but the swapchain is an sRGB format that re-encodes the
+// shader output — so convert sRGB→linear here, otherwise mid-tones render washed-out/gray.
+fn s2l(c: vec3<f32>) -> vec3<f32> {
+    let low = c / 12.92;
+    let high = pow((c + vec3<f32>(0.055)) / 1.055, vec3<f32>(2.4));
+    return select(high, low, c <= vec3<f32>(0.04045));
+}
 @fragment
 fn fs(in: V) -> @location(0) vec4<f32> {
     let r = in.round.x;            // corner radius (px)
-    if (r <= 0.0) { return in.color; }
+    if (r <= 0.0) { return vec4<f32>(s2l(in.color.rgb), in.color.a); }
     let size = in.round.yz;        // rect size (px)
     let p = in.uv * size - size * 0.5;            // position from the rect centre
     let q = abs(p) - (size * 0.5 - vec2<f32>(r)); // rounded-box SDF
     let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
     let alpha = in.color.a * (1.0 - smoothstep(-0.75, 0.75, d)); // 1.5px edge AA
-    // Vertical gradient (round.w = strength, 0 = flat): lighter at the top, darker at the bottom —
-    // the DAW button look. uv.y is 0 at the bottom, 1 at the top.
+    // Vertical gradient (round.w = strength, 0 = flat): lighter at the top, darker at the bottom.
     let g = in.round.w;
     let col = in.color.rgb * mix(1.0 - g, 1.0 + g, in.uv.y);
-    return vec4<f32>(col, alpha);
+    return vec4<f32>(s2l(col), alpha);
 }
 "#;
 
@@ -387,6 +393,7 @@ pub struct State {
     lb_pan: [f32; 2],          // lightbox pan offset in NDC (drag moves a zoomed item)
     video: Option<crate::video::Player>, // playing the focused video tile, if any
     video_for: Option<usize>,            // which tile self.video belongs to
+    video_pending: Option<usize>,        // a focused video/audio whose mpv start is deferred one frame
     volume: f64,                         // last-set volume, carried to each new video/track
     seek_preview: Option<f32>,           // scrubber fraction while dragging (knob tracks the cursor)
     gif: Option<GifAnim>,                // animating focused GIF (plays into full_tex)
@@ -721,7 +728,17 @@ impl State {
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let ui = crate::ui::Ui::new(&device, &queue, config.format);
+        let mut ui = crate::ui::Ui::new(&device, &queue, config.format);
+        // Measure the (static) toolbar labels once so buttons size + centre their text exactly.
+        let mut label_w = std::collections::HashMap::new();
+        for l in ["Open", "Slideshow", "Stop", "Fullscreen", "Settings", "Sort", "Filter", "Dates", "Dates \u{2022}"] {
+            label_w.insert(l.to_string(), ui.text_width(l, 14.0));
+        }
+        // Dates-panel buttons render at size 13.
+        for l in ["Modified", "Created", "Done", "Clear dates"] {
+            label_w.insert(l.to_string(), ui.text_width(l, 13.0));
+        }
+        components::set_label_widths(label_w);
         let icons = crate::icons::Icons::new(&device, &queue, config.format);
         let post = crate::post::Post::new(&device, &queue, config.format, size.width, size.height);
 
@@ -912,6 +929,7 @@ impl State {
             lb_pan: [0.0, 0.0],
             video: None,
             video_for: None,
+            video_pending: None,
             volume: 100.0,
             seek_preview: None,
             gif: None,
@@ -1027,7 +1045,9 @@ impl State {
     /// tile's bottom, solid black box). Returns (name, box_x, box_y, box_w) in pixels. Suppressed
     /// when show-titles is on (every tile already has one).
     fn hover_label(&self) -> Option<(String, f32, f32, f32)> {
-        if self.focus.is_some() || self.show_titles {
+        // No hover pill while focused, while show-titles is on, or during a scan (the title text is
+        // suppressed then, so the box would otherwise show empty).
+        if self.focus.is_some() || self.show_titles || self.scanning {
             return None;
         }
         let i = self.hover_index?;
@@ -1353,7 +1373,9 @@ impl State {
         } else {
             None
         };
-        let video = if self.video.is_some() {
+        // Hide the controls bar while the clip is still opening — otherwise the play/pause button
+        // shows a "resume" (▶) icon during load. Only the "Loading…" card shows until it's ready.
+        let video = if self.video.is_some() && !self.media_starting() {
             let (pos, dur, paused) = self.video_state().unwrap_or((0.0, 0.0, false));
             let (vol, aid, sid) = self
                 .video
@@ -1424,6 +1446,8 @@ impl State {
                 (1.0 - self.pointer_ndc[1]) * 0.5 * self.config.height as f32,
             ],
             fullscreen: self.window.fullscreen().is_some(),
+            // Blink the text caret ~every 530ms (solid right after activity, then blinking).
+            caret_on: self.last_activity.elapsed().as_secs_f32() % 1.06 < 0.53,
         }
     }
 
@@ -1576,6 +1600,7 @@ impl State {
         if edited {
             self.caret = new_caret;
             self.view_dirty = true;
+            self.last_activity = Instant::now(); // keep the caret solid while typing, then blink
         }
     }
 
@@ -1653,7 +1678,7 @@ impl State {
         let (prev, next) = self.arrow_rects();
         let tint = [235, 235, 240, 235];
         let centre = |r: [f32; 4], name: &'static str| {
-            let s = 28.0_f32;
+            let s = 32.0_f32;
             crate::icons::IconReq {
                 rect: [r[0] + (r[2] - s) * 0.5, r[1] + (r[3] - s) * 0.5, s, s],
                 name,
@@ -1790,13 +1815,23 @@ impl State {
         });
 
         // --- focus in/out transition ---
+        // Video/audio open instantly (they sit on solid black — nothing to animate); photos keep the
+        // eased zoom/dim. Closing always eases back.
+        let opening_media = matches!(
+            self.focus.and_then(|i| self.sources.get(i)),
+            Some(Source::Video(_) | Source::Audio(_))
+        );
         let target_t = if self.focus.is_some() { 1.0 } else { 0.0 };
-        let step = ANIM_SPEED * dt;
-        self.focus_t = if self.focus_t < target_t {
-            (self.focus_t + step).min(target_t)
+        if opening_media {
+            self.focus_t = 1.0;
         } else {
-            (self.focus_t - step).max(target_t)
-        };
+            let step = ANIM_SPEED * dt;
+            self.focus_t = if self.focus_t < target_t {
+                (self.focus_t + step).min(target_t)
+            } else {
+                (self.focus_t - step).max(target_t)
+            };
+        }
 
         // --- camera zoom smoothing (wheel target, or pull-in when focused) ---
         let target_dist = if self.focus.is_some() {
@@ -1909,12 +1944,15 @@ impl State {
         // Request a full-resolution decode of the focused photo for a crisp lightbox (the thumb
         // shows immediately; the full image swaps in when it arrives). Dropped on deselect.
         match self.focus {
-            // Skip the static full-res decode for an animated GIF — its frames own full_tex.
-            Some(f)
-                if matches!(self.sources.get(f), Some(Source::File(p))
-                    if !(self.gif_anim && is_gif(p))) =>
-            {
-                if self.full_pending != Some(f) && self.full_for != Some(f) {
+            Some(f) => {
+                // Decode a crisp full-res image for the lightbox: photos, the video poster (clean,
+                // no badge), and the audio cover art. Skip animated GIFs — their frames own full_tex.
+                let want = match self.sources.get(f) {
+                    Some(Source::File(p)) => !(self.gif_anim && is_gif(p)),
+                    Some(Source::Audio(_)) => true, // crisp cover art (videos draw via their own quad)
+                    _ => false,
+                };
+                if want && self.full_pending != Some(f) && self.full_for != Some(f) {
                     self.full_pending = Some(f);
                     let _ = self.job_tx.send(Job {
                         index: f,
@@ -1922,9 +1960,12 @@ impl State {
                         gen: self.generation,
                         full: true,
                     });
+                } else if !want {
+                    self.full_pending = None;
+                    self.full_for = None;
                 }
             }
-            _ => {
+            None => {
                 self.full_pending = None;
                 self.full_for = None;
             }
@@ -1968,18 +2009,21 @@ impl State {
             self.video = None; // dropping the player stops mpv
             self.video_for = self.focus;
             self.track_menu = None; // close any track menu from the previous item
-            if let Some(idx) = self.focus {
-                // Play videos and music (audio) through mpv on focus.
-                if let Source::Video(path) | Source::Audio(path) = self.sources[idx].clone() {
-                    self.video = Some(crate::video::Player::start(
-                        &self.device,
-                        &self.queue,
-                        self.config.format,
-                        &path,
-                    ));
-                    // Carry the last-set volume to the new clip (a new mpv starts at 100).
-                    self.video_command(&["set", "volume", &format!("{:.0}", self.volume)]);
-                }
+            // Defer the mpv start one frame so the poster thumbnail paints first — mpv's init blocks
+            // the thread ~100ms+, which otherwise shows as a hitch the instant you open a clip.
+            self.video_pending = self
+                .focus
+                .filter(|&i| matches!(self.sources.get(i), Some(Source::Video(_) | Source::Audio(_))));
+        } else if let Some(idx) = self.video_pending.take() {
+            if let Source::Video(path) | Source::Audio(path) = self.sources[idx].clone() {
+                self.video = Some(crate::video::Player::start(
+                    &self.device,
+                    &self.queue,
+                    self.config.format,
+                    &path,
+                ));
+                // Carry the last-set volume to the new clip (a new mpv starts at 100).
+                self.video_command(&["set", "volume", &format!("{:.0}", self.volume)]);
             }
         }
         if let Some(v) = &mut self.video {
@@ -2500,19 +2544,31 @@ impl State {
         }
     }
 
-    /// True while the open item's image hasn't finished decoding yet.
-    fn focus_loading(&self) -> bool {
-        match self.focus {
-            Some(i) => !matches!(self.resident.get(&i), Some(Tile::Ready { .. })),
-            None => false,
+    /// True while a focused video/audio is opening (deferred mpv start, or mpv still loading) —
+    /// so we show a "Loading…" card instead of a black/blank centre. A video loads until its first
+    /// frame; audio until mpv reports a duration.
+    fn media_starting(&self) -> bool {
+        let Some(i) = self.focus else { return false };
+        let is_video = matches!(self.sources.get(i), Some(Source::Video(_)));
+        let is_audio = matches!(self.sources.get(i), Some(Source::Audio(_)));
+        if !is_video && !is_audio {
+            return false;
+        }
+        if self.video_pending.is_some() {
+            return true; // start deferred a frame
+        }
+        match &self.video {
+            Some(v) if is_video => !v.has_frame(),
+            // Audio: stay loading until mpv has a duration AND the crisp cover art is decoded, so it
+            // opens to the cover on black (like a video opens to its frame) — not over the laggy wall.
+            Some(_) => {
+                let dur_ok = self.video_state().map(|(_, dur, _)| dur > 0.0).unwrap_or(false);
+                !dur_ok || self.full_for != self.focus
+            }
+            None => true, // focused but the player isn't up yet
         }
     }
 
-    /// True while a focused video/track is opening — mpv reports no duration until the file is
-    /// loaded (~1s), so we show "Loading…" instead of a black screen.
-    fn media_starting(&self) -> bool {
-        self.video.is_some() && self.video_state().map(|(_, dur, _)| dur <= 0.0).unwrap_or(true)
-    }
 
     /// Append a detailed memory snapshot to <temp>/cooliris-memory.log (Settings → Memory usage).
     /// Kept OUT of the terminal — it's for diagnosing what holds memory, not user-facing noise.
@@ -2734,18 +2790,9 @@ impl State {
                     size: 22.0,
                     color: [235, 235, 240, 255],
                 });
-            } else if self.focus_loading() || self.media_starting() {
-                // Either the still image is still decoding, or a video/track is spinning up (mpv
-                // takes ~1s to open the file) — show progress so the open never feels frozen.
-                v.push(crate::ui::Line {
-                    text: "Loading…".into(),
-                    x: cx - 52.0,
-                    y: cy - 20.0,
-                    size: 30.0,
-                    color: [235, 235, 240, 255],
-                });
             }
-            // (Video controls — play/pause, seek, time, tracks — are drawn by `components`.)
+            // (No "Loading…" card — video/audio open onto plain black and the content swaps in when
+            // ready; video controls are drawn by `components`.)
         } else {
             // On-screen left/right scroll arrows (SVG icons now; see icon_reqs).
             // Big centered "Loading…" right after opening a folder, while the first tiles decode.
@@ -2796,8 +2843,15 @@ impl State {
         let Some(idx) = self.focus else {
             return LbDraw::None;
         };
+        // Videos never use the lightbox image path: the playing frame is drawn by the video quad
+        // (only once mpv has a frame), and the centred "Loading…" card covers the spin-up — so no
+        // poster/badge flashes before it opens.
         if matches!(self.sources.get(idx), Some(Source::Video(_))) {
-            return LbDraw::None; // videos play via the video layer, not the lightbox
+            return LbDraw::None;
+        }
+        // Audio: show nothing (the black Loading screen) until its cover art is ready, then the cover.
+        if matches!(self.sources.get(idx), Some(Source::Audio(_))) && self.media_starting() {
+            return LbDraw::None;
         }
         // (aspect, uv extent, uv offset, layer, which bind group) — full-res if ready, else the
         // thumb. An animated GIF's tile layer holds a packed atlas (a grid of frames): until the
@@ -2872,22 +2926,18 @@ impl State {
         // wall: left/right scroll buttons (when scrollable).
         let to_ndc = |r: [f32; 4]| [nx(r[0]), ny_top(r[1] + r[3]), nw(r[2]), nhh(r[3])];
         let (prev, next) = self.arrow_rects();
-        // A rounded arrow button centred in the arrow's (taller) hit region — the same dark-blue
-        // fill + border + hover as the top-bar buttons (lighter when the cursor is over it).
-        let bd = components::BTN_BORDER;
+        // A rounded, transparent black "glass" arrow button centred in the arrow's (taller) hit
+        // region (lighter when the cursor is over it). No border — borders are panel-only now.
         let (mx, my) = ((self.pointer_ndc[0] + 1.0) * 0.5 * w, (1.0 - self.pointer_ndc[1]) * 0.5 * h);
         let mut arrow_btn = |r: [f32; 4], a: f32| {
-            let (bw, bh) = (46.0_f32, 64.0_f32);
+            let (bw, bh) = (62.0_f32, 92.0_f32);
             let bx = r[0] + (r[2] - bw) * 0.5;
             let by = r[1] + (r[3] - bh) * 0.5;
             let hov = mx >= r[0] && mx <= r[0] + r[2] && my >= r[1] && my <= r[1] + r[3];
-            let fl = if hov { components::BTN_HOVER } else { components::BTN_FILL };
-            rects.push(OverlayRect {
-                rect: to_ndc([bx - 1.0, by - 1.0, bw + 2.0, bh + 2.0]),
-                color: [bd[0], bd[1], bd[2], bd[3] * a], round: [15.0, bw + 2.0, bh + 2.0, 0.0] });
+            let fl = if hov { components::ARROW_HOVER } else { components::ARROW_FILL };
             rects.push(OverlayRect {
                 rect: to_ndc([bx, by, bw, bh]),
-                color: [fl[0], fl[1], fl[2], fl[3] * a], round: [14.0, bw, bh, components::BTN_GRAD] });
+                color: [fl[0], fl[1], fl[2], fl[3] * a], round: [30.0, bw, bh, 0.0] });
         };
         if let Some(f) = self.focus {
             if self.lightbox_controls_visible() {
@@ -2911,19 +2961,20 @@ impl State {
             let by = -1.0 + nhh(14.0);
             rects.push(OverlayRect {
                 rect: [nx(pad), by, nw(track_w), bh],
-                color: [1.0, 1.0, 1.0, 0.14], round: [0.0; 4] });
-            // Tick lines across the track (one per column step, capped so we never overflow).
-            let ticks = (self.total_cols.max(1) as usize).min(40);
+                color: [1.0, 1.0, 1.0, 0.14], round: [9.0, track_w, 18.0, 0.0] }); // rounded (pill) ends
+            // Evenly-spaced tick lines across the track — denser now (min 24, capped so we never overflow).
+            let ticks = (self.total_cols.max(1) as usize).clamp(24, 96);
             if ticks > 1 {
                 let tw = nw(1.5);
                 let th = nhh(10.0);
                 let ty = -1.0 + nhh(18.0);
-                for k in 0..=ticks {
+                // Interior ticks only — skip the first/last so they don't sit on the rounded ends.
+                for k in 1..ticks {
                     let fx = k as f32 / ticks as f32;
                     let x = pad + (track_w - 1.5) * fx;
                     rects.push(OverlayRect {
                         rect: [nx(x), ty, tw, th],
-                        color: [1.0, 1.0, 1.0, 0.18], round: [0.0; 4] });
+                        color: [1.0, 1.0, 1.0, 0.18], round: [0.75, 1.5, 10.0, 0.0] });
                 }
             }
             let frac = (self.scroll_x / self.scroll_max).clamp(0.0, 1.0);
@@ -2947,6 +2998,7 @@ impl State {
                 rect: [nx(bx), ny_top(by + 22.0), nw(bw), nhh(22.0)],
                 color: [0.0, 0.0, 0.0, 1.0], round: [6.0, bw, 22.0, 0.0] });
         }
+
         rects
     }
 
@@ -2977,9 +3029,14 @@ impl State {
             &lines,
         );
 
-        // Lightbox backdrop: fade the wall to plain black as an item is focused (dark factor 0 →
-        // the blurred scene is multiplied to black, so the focused item sits on solid black).
-        let mix = smoothstep(self.focus_t);
+        // Lightbox backdrop: a focused photo dims the wall to a blurred backdrop (mix → smoothstep).
+        // A focused video/audio always sits on SOLID BLACK instead — no wall render, no blur, no
+        // open animation — so the clip/cover never flashes the wall behind it (and opening is fast).
+        let focused_media = matches!(
+            self.focus.and_then(|i| self.sources.get(i)),
+            Some(Source::Video(_) | Source::Audio(_))
+        );
+        let mix = if focused_media { 1.0 } else { smoothstep(self.focus_t) };
         self.post.set_params(&self.queue, mix, 0.0);
 
         let mut enc = self
@@ -2988,8 +3045,10 @@ impl State {
                 label: Some("frame-encoder"),
             });
 
-        // Pass 1: the wall (tiles + reflections) → the offscreen scene texture.
-        {
+        // Pass 1: the wall (tiles + reflections) → the offscreen scene texture. Skipped whenever a
+        // video/audio is focused (the backdrop is solid black then), so the wall isn't re-rendered
+        // behind a clip/cover — that also kept the wall from flashing in after loading.
+        if !focused_media {
             let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("scene-pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -3020,8 +3079,9 @@ impl State {
             }
         }
 
-        // Passes 2–3: blur the scene for the backdrop (only while the lightbox is open).
-        if mix > 0.001 {
+        // Passes 2–3: blur the scene for the backdrop (only for a focused photo — video/audio sit
+        // on plain black, so the blur would be wasted work).
+        if mix > 0.001 && !focused_media {
             self.post.record_blur(&mut enc);
         }
 
@@ -3054,7 +3114,11 @@ impl State {
             let is_video = matches!(self.focus.and_then(|i| self.sources.get(i)), Some(Source::Video(_)));
             if is_video {
                 if let Some(v) = &self.video {
-                    v.draw(&mut rp, self.video_rect_ndc(), smoothstep(self.focus_t), &self.queue);
+                    // Only draw the video once it has a real frame; before that the poster thumb
+                    // (drawn below as the lightbox) stands in, so there's no black flash on open.
+                    if v.has_frame() {
+                        v.draw(&mut rp, self.video_rect_ndc(), smoothstep(self.focus_t), &self.queue);
+                    }
                 }
             }
             // Lightbox: the focused image (full-res once ready, otherwise the streamed thumbnail).
@@ -3128,6 +3192,83 @@ fn estimate_decode_bytes(source: &Source) -> usize {
     }
 }
 
+/// The reference website's sample tiles (assets/samples/01.svg…18.svg), shown when no folder is
+/// open — rasterised with resvg in place of the procedural placeholders.
+const SAMPLES: [&str; 18] = [
+    include_str!("../assets/samples/01.svg"),
+    include_str!("../assets/samples/02.svg"),
+    include_str!("../assets/samples/03.svg"),
+    include_str!("../assets/samples/04.svg"),
+    include_str!("../assets/samples/05.svg"),
+    include_str!("../assets/samples/06.svg"),
+    include_str!("../assets/samples/07.svg"),
+    include_str!("../assets/samples/08.svg"),
+    include_str!("../assets/samples/09.svg"),
+    include_str!("../assets/samples/10.svg"),
+    include_str!("../assets/samples/11.svg"),
+    include_str!("../assets/samples/12.svg"),
+    include_str!("../assets/samples/13.svg"),
+    include_str!("../assets/samples/14.svg"),
+    include_str!("../assets/samples/15.svg"),
+    include_str!("../assets/samples/16.svg"),
+    include_str!("../assets/samples/17.svg"),
+    include_str!("../assets/samples/18.svg"),
+];
+
+/// usvg options with the system fonts loaded once (so SVG `<text>`, e.g. the sample numbers, renders).
+/// The generic "sans-serif" family is mapped to a real installed font, else usvg can't resolve it.
+fn svg_options() -> resvg::usvg::Options<'static> {
+    use resvg::usvg::fontdb;
+    static DB: std::sync::OnceLock<std::sync::Arc<fontdb::Database>> = std::sync::OnceLock::new();
+    let db = DB
+        .get_or_init(|| {
+            let mut db = fontdb::Database::new();
+            db.load_system_fonts();
+            let names: Vec<String> = db
+                .faces()
+                .flat_map(|f| f.families.iter().map(|(n, _)| n.clone()))
+                .collect();
+            // A Latin text font — skip CJK/symbol/mono faces (e.g. "Droid Sans Japanese" has no digits).
+            let ok = |n: &str| {
+                let l = n.to_lowercase();
+                !["cjk", "japanese", "korean", "chinese", "thai", "arabic", "hebrew", "devanagari", "emoji", "symbol", "math", "mono"]
+                    .iter()
+                    .any(|k| l.contains(k))
+            };
+            let prefer = ["dejavu sans", "liberation sans", "noto sans", "carlito", "arimo", "arial", "roboto", "cantarell", "ubuntu", "open sans", "helvetica"];
+            let fam = prefer
+                .iter()
+                .find_map(|p| names.iter().find(|n| { let l = n.to_lowercase(); l == *p || (l.starts_with(p) && ok(n)) }).cloned())
+                .or_else(|| names.iter().find(|n| n.to_lowercase().contains("sans") && ok(n)).cloned())
+                .or_else(|| names.into_iter().find(|n| ok(n)));
+            if let Some(fam) = fam {
+                db.set_sans_serif_family(fam);
+            }
+            std::sync::Arc::new(db)
+        })
+        .clone();
+    let mut opt = resvg::usvg::Options::default();
+    opt.fontdb = db;
+    opt
+}
+
+/// Rasterise an SVG to fit `target` px (preserving aspect). Returns (rgba, w, h); empty on failure.
+fn rasterize_svg(svg: &str, target: u32) -> (Vec<u8>, u32, u32) {
+    let opt = svg_options();
+    let Ok(tree) = resvg::usvg::Tree::from_str(svg, &opt) else {
+        return (Vec::new(), 0, 0);
+    };
+    let size = tree.size();
+    let scale = (target as f32 / size.width()).min(target as f32 / size.height());
+    let w = (size.width() * scale).round().max(1.0) as u32;
+    let h = (size.height() * scale).round().max(1.0) as u32;
+    let Some(mut pm) = resvg::tiny_skia::Pixmap::new(w, h) else {
+        return (Vec::new(), 0, 0);
+    };
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pm.as_mut());
+    (pm.data().to_vec(), w, h)
+}
+
 /// Decode + downscale one tile (runs on a worker thread). Resizes to fit TILE_PX preserving
 /// aspect; returns (rgba, w, h). Empty/zero == failure.
 fn decode(source: &Source, full: bool) -> (Vec<u8>, u32, u32) {
@@ -3159,13 +3300,22 @@ fn decode(source: &Source, full: bool) -> (Vec<u8>, u32, u32) {
             }
         }
         Source::Video(p) => {
-            video_thumb(p, target).unwrap_or_else(|| (video_placeholder(), TILE_PX, TILE_PX))
+            // Badge only on the wall thumbnail; the full-res lightbox poster is clean (no badge).
+            video_thumb(p, target, !full).unwrap_or_else(|| (video_placeholder(), TILE_PX, TILE_PX))
         }
         Source::Audio(p) => {
             // Embedded cover art (ffmpeg reads the attached picture); else a music-note tile.
             cover_thumb(p, target).unwrap_or_else(|| (music_placeholder(), TILE_PX, TILE_PX))
         }
-        Source::Placeholder(i) => (placeholder(*i), TILE_PX, TILE_PX),
+        Source::Placeholder(i) => {
+            // The website's sample tiles (rasterised SVG); fall back to a procedural tile on failure.
+            let (rgba, w, h) = rasterize_svg(SAMPLES[*i % SAMPLES.len()], target);
+            if rgba.is_empty() {
+                (placeholder(*i), TILE_PX, TILE_PX)
+            } else {
+                (rgba, w, h)
+            }
+        }
     }
 }
 
@@ -3174,13 +3324,13 @@ fn decode(source: &Source, full: bool) -> (Vec<u8>, u32, u32) {
 ///
 /// Tries a few seek points so more formats/clips yield a frame: ~1s in (skips black intros), then
 /// the very start (short clips), then the `thumbnail` filter (scans for a representative frame).
-fn video_thumb(p: &std::path::Path, target: u32) -> Option<(Vec<u8>, u32, u32)> {
+fn video_thumb(p: &std::path::Path, target: u32, badge: bool) -> Option<(Vec<u8>, u32, u32)> {
     for ss in ["1", "0"] {
-        if let Some(t) = ffmpeg_frame(p, target, Some(ss), false) {
+        if let Some(t) = ffmpeg_frame(p, target, Some(ss), false, badge) {
             return Some(t);
         }
     }
-    ffmpeg_frame(p, target, None, true)
+    ffmpeg_frame(p, target, None, true, badge)
 }
 
 /// One ffmpeg poster-frame attempt. `ss` = input seek seconds (None = no seek); `pick` = use the
@@ -3190,6 +3340,7 @@ fn ffmpeg_frame(
     target: u32,
     ss: Option<&str>,
     pick: bool,
+    badge: bool,
 ) -> Option<(Vec<u8>, u32, u32)> {
     let mut cmd = std::process::Command::new("ffmpeg");
     cmd.args(["-nostdin", "-loglevel", "error"]);
@@ -3209,7 +3360,9 @@ fn ffmpeg_frame(
     }
     let mut rgba = image::load_from_memory(&out.stdout).ok()?.to_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
-    draw_play_badge(&mut rgba, w, h);
+    if badge {
+        draw_play_badge(&mut rgba, w, h);
+    }
     Some((rgba.into_raw(), w, h))
 }
 
@@ -3309,7 +3462,7 @@ fn video_placeholder() -> Vec<u8> {
 pub fn gather_sources(folder: Option<PathBuf>, progress: impl Fn(usize)) -> Vec<Source> {
     let Some(dir) = folder else {
         log::info!("no folder chosen — showing placeholders");
-        return (0..24).map(Source::Placeholder).collect();
+        return (0..18).map(Source::Placeholder).collect();
     };
     // Recurse into subfolders to any depth — media is usually nested (a folder per product/album,
     // and those may nest further). jwalk reads directories in parallel, so a big tree scans fast.
@@ -3341,7 +3494,7 @@ pub fn gather_sources(folder: Option<PathBuf>, progress: impl Fn(usize)) -> Vec<
     log::info!("folder {dir:?}: {} media files (incl. subfolders)", items.len());
     if items.is_empty() {
         log::info!("no images/videos under {dir:?} — showing placeholders");
-        return (0..24).map(Source::Placeholder).collect();
+        return (0..18).map(Source::Placeholder).collect();
     }
     items
         .into_iter()

@@ -33,6 +33,9 @@ mod stub {
             Player
         }
         pub fn update(&mut self, _device: &wgpu::Device, _queue: &wgpu::Queue, _w: u32, _h: u32) {}
+        pub fn has_frame(&self) -> bool {
+            false
+        }
         pub fn command(&self, _args: &[&str]) {}
         pub fn position(&self) -> f64 {
             0.0
@@ -241,6 +244,7 @@ fn fs(in: V) -> @location(0) vec4<f32> {
         tex_bg: wgpu::BindGroup,
         rect_buf: wgpu::Buffer,
         rect_bg: wgpu::BindGroup,
+        has_frame: bool, // true once mpv has produced a real (non-black) frame
     }
 
     impl Player {
@@ -415,7 +419,14 @@ fn fs(in: V) -> @location(0) vec4<f32> {
                 tex_bg,
                 rect_buf,
                 rect_bg,
+                has_frame: false,
             }
+        }
+
+        /// True once mpv has rendered a real (non-black) frame — until then the lightbox shows the
+        /// poster thumbnail, so opening a video feels as instant as opening an image.
+        pub fn has_frame(&self) -> bool {
+            self.has_frame
         }
 
         /// Send an mpv command (NULL-terminated argv), e.g. ["cycle","pause"] / ["cycle","aid"].
@@ -533,6 +544,10 @@ fn fs(in: V) -> @location(0) vec4<f32> {
         /// All audio + subtitle tracks (for the selection menus), each with a readable label.
         pub fn tracks(&self) -> Vec<super::Track> {
             let count = self.prop_int("track-list/count").max(0);
+            // Count audio tracks so a lone one is labelled "Original" rather than its language.
+            let audio_total = (0..count)
+                .filter(|i| self.prop_str(&format!("track-list/{i}/type")) == "audio")
+                .count();
             let mut out = Vec::new();
             for i in 0..count {
                 let kind = self.prop_str(&format!("track-list/{i}/type"));
@@ -545,16 +560,19 @@ fn fs(in: V) -> @location(0) vec4<f32> {
                 let title = self.prop_str(&format!("track-list/{i}/title"));
                 let lang = self.prop_str(&format!("track-list/{i}/lang"));
                 let codec = self.prop_str(&format!("track-list/{i}/codec"));
-                // Show the track's real name, whatever the format provides: its own title, else the
-                // full language name, else the codec, else a numbered fallback. (We list every
-                // audio/subtitle track — better a redundant one than a missing one.)
+                // Show the track's real name: its own title, else the full language name, else the
+                // codec, else a numbered fallback. A lone, untitled audio track is the "Original".
                 let lang_name = lang_full_name(&lang);
-                let label = match (title.as_str(), lang_name.as_str(), codec.as_str()) {
-                    ("", "", "") => format!("{} {id}", if audio { "Audio" } else { "Subtitle" }),
-                    ("", "", c) => c.to_uppercase(),
-                    ("", l, _) => l.to_string(),
-                    (t, "", _) => t.to_string(),
-                    (t, l, _) => format!("{t} ({l})"),
+                let label = if audio && title.is_empty() && audio_total == 1 {
+                    "Original".to_string()
+                } else {
+                    match (title.as_str(), lang_name.as_str(), codec.as_str()) {
+                        ("", "", "") => format!("{} {id}", if audio { "Audio" } else { "Subtitle" }),
+                        ("", "", c) => c.to_uppercase(),
+                        ("", l, _) => l.to_string(),
+                        (t, "", _) => t.to_string(),
+                        (t, l, _) => format!("{t} ({l})"),
+                    }
                 };
                 out.push(super::Track { id, audio, label, selected });
             }
@@ -637,6 +655,11 @@ fn fs(in: V) -> @location(0) vec4<f32> {
             ];
             unsafe {
                 mpv_render_context_render(self.render, params.as_mut_ptr());
+            }
+            // First non-black frame → mpv has decoded the clip (the buffer is rgb0, so any non-zero
+            // pixel means content). `any` short-circuits; we only scan fully while still black.
+            if !self.has_frame && self.buf.iter().any(|&p| p != 0) {
+                self.has_frame = true;
             }
             queue.write_texture(
                 wgpu::ImageCopyTexture {

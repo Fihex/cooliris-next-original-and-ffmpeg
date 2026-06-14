@@ -39,6 +39,21 @@ impl Ui {
         }
     }
 
+    /// Measure the rendered pixel width of `text` at `size` (same font/shaping as prepare()), so the
+    /// toolbar can size + centre its button labels exactly instead of estimating per-character.
+    pub fn text_width(&mut self, text: &str, size: f32) -> f32 {
+        let mut b = Buffer::new(&mut self.font_system, Metrics::new(size, size * 1.25));
+        b.set_size(&mut self.font_system, Some(f32::INFINITY), Some(size * 2.0));
+        b.set_text(
+            &mut self.font_system,
+            text,
+            Attrs::new().family(Family::SansSerif),
+            Shaping::Advanced,
+        );
+        b.shape_until_scroll(&mut self.font_system, false);
+        b.layout_runs().map(|r| r.line_w).fold(0.0_f32, f32::max)
+    }
+
     pub fn prepare(
         &mut self,
         device: &wgpu::Device,
