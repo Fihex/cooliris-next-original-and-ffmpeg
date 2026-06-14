@@ -9,11 +9,13 @@
 use crate::ui::Line;
 
 /// A screen-space coloured rectangle in NDC (x, y bottom-left, w, h) — the overlay pipeline's vertex.
+/// `round` = [corner_radius_px, width_px, height_px, _]; radius 0 = a plain sharp rect.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct OverlayRect {
     pub rect: [f32; 4],
     pub color: [f32; 4],
+    pub round: [f32; 4],
 }
 
 /// Library sort order (matches the web wall's 7 options).
@@ -94,6 +96,7 @@ pub enum UiAction {
     OpenFolder,
     Back, // close the lightbox (✕)
     Fullscreen,
+    ToggleSlideshow,
     ToggleInfo,
     ToggleMenu(MenuKind),
     CloseMenu,
@@ -142,6 +145,7 @@ pub struct UiCtx {
     pub menu: Option<MenuKind>,
     pub search: String,
     pub search_active: bool,
+    pub slideshow: bool,
     pub gif_anim: bool,
     pub reflections: bool,
     pub date_created: bool,     // Dates filter: false = Modified, true = Created
@@ -198,46 +202,45 @@ fn caret_str(text: &str, caret: usize, active: bool) -> String {
     out
 }
 
-/// Top-bar button rects (pixels).
+/// Top-bar button rects (pixels). Layout mirrors the web Toolbar.
 struct Bar {
     open: [f32; 4],
+    slideshow: [f32; 4],
+    full: [f32; 4],
+    settings: [f32; 4],
     sort: [f32; 4],
     filter: [f32; 4],
     dates: [f32; 4],
     search: [f32; 4],
-    full: [f32; 4],
-    settings: [f32; 4],
-    info: [f32; 4],
 }
+const BRAND_W: f32 = 116.0; // space reserved for the "Cooliris Next" wordmark on the left
 fn bar(w: f32) -> Bar {
-    // Left group.
-    let open = [12.0, BTN_Y, 78.0, BTN_H];
-    let sort = [open[0] + open[2] + 8.0, BTN_Y, 78.0, BTN_H];
-    let filter = [sort[0] + sort[2] + 8.0, BTN_Y, 110.0, BTN_H];
-    let dates = [filter[0] + filter[2] + 8.0, BTN_Y, 82.0, BTN_H];
-    let search = [dates[0] + dates[2] + 8.0, BTN_Y, 190.0, BTN_H];
-    // Right group (right to left).
-    let full = [w - 12.0 - 116.0, BTN_Y, 116.0, BTN_H];
-    let settings = [full[0] - 8.0 - 104.0, BTN_Y, 104.0, BTN_H];
-    let info = [settings[0] - 8.0 - 60.0, BTN_Y, 60.0, BTN_H];
-    Bar {
-        open,
-        sort,
-        filter,
-        dates,
-        search,
-        full,
-        settings,
-        info,
-    }
+    // Left group: [Cooliris Next]  Open  |  Slideshow  Fullscreen
+    let open = [12.0 + BRAND_W, BTN_Y, 64.0, BTN_H];
+    let slideshow = [open[0] + open[2] + 20.0, BTN_Y, 100.0, BTN_H]; // gap leaves room for a divider
+    let full = [slideshow[0] + slideshow[2] + 8.0, BTN_Y, 104.0, BTN_H];
+    // Right group, laid out right→left: [count] Search  Dates  Filter  Sort  Settings
+    let count_w = 64.0;
+    let sr = w - 16.0 - count_w; // search's right edge
+    let search = [sr - 210.0, BTN_Y, 210.0, BTN_H];
+    let dates = [search[0] - 8.0 - 78.0, BTN_Y, 78.0, BTN_H];
+    let filter = [dates[0] - 8.0 - 92.0, BTN_Y, 92.0, BTN_H];
+    let sort = [filter[0] - 8.0 - 62.0, BTN_Y, 62.0, BTN_H];
+    let settings = [sort[0] - 8.0 - 86.0, BTN_Y, 86.0, BTN_H];
+    Bar { open, slideshow, full, settings, sort, filter, dates, search }
 }
 
 /// Dropdown panel + row rects under an anchor button. The width floor fits the longest label
-/// ("Default (as loaded)") so all dropdowns line up and never clip their text.
-fn menu(anchor: [f32; 4], n: usize) -> ([f32; 4], Vec<[f32; 4]>) {
-    let rw = anchor[2].max(200.0);
-    let px = anchor[0];
-    let py = anchor[1] + anchor[3] + 4.0;
+/// ("Default (as loaded)"). Right-side buttons drop their panel right-aligned (like the web), so it
+/// never runs off the screen edge.
+fn menu(anchor: [f32; 4], n: usize, w: f32) -> ([f32; 4], Vec<[f32; 4]>) {
+    let rw = anchor[2].max(208.0);
+    let px = if anchor[0] + anchor[2] * 0.5 > w * 0.5 {
+        (anchor[0] + anchor[2] - rw).max(8.0) // right-align to the button's right edge
+    } else {
+        anchor[0]
+    };
+    let py = anchor[1] + anchor[3] + 6.0;
     let panel = [px, py, rw, ROW_H * n as f32 + 8.0];
     let rows = (0..n)
         .map(|i| [px + 4.0, py + 4.0 + i as f32 * ROW_H, rw - 8.0, ROW_H])
@@ -280,8 +283,8 @@ struct DatesUi {
 }
 fn dates_layout(anchor: [f32; 4]) -> DatesUi {
     let pw = 244.0_f32;
-    let px = anchor[0].min(/* keep on-screen-ish */ anchor[0]);
-    let py = anchor[1] + anchor[3] + 4.0;
+    let px = (anchor[0] + anchor[2] - pw).max(8.0); // right-aligned to the Dates button
+    let py = anchor[1] + anchor[3] + 6.0;
     let pad = 12.0;
     let iw = pw - pad * 2.0;
     let tabw = (iw - 8.0) * 0.5;
@@ -407,114 +410,150 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
     let chip = [1.0, 1.0, 1.0, 0.12];
     let chip_on = [1.0, 1.0, 1.0, 0.24];
     let white_rect = [1.0, 1.0, 1.0, 0.95];
-    let mut rect = |r: [f32; 4], color: [f32; 4]| rects.push(OverlayRect { rect: nd(r), color });
-    let mut label = |t: String, x: f32, y: f32, size: f32, col: [u8; 4]| {
-        lines.push(Line {
-            text: t,
-            x,
-            y,
-            size,
-            color: col,
-        })
-    };
+    macro_rules! rect {
+        ($r:expr, $c:expr $(,)?) => {
+            rects.push(OverlayRect { rect: nd($r), color: $c, round: [0.0, 0.0, 0.0, 0.0] })
+        };
+    }
+    // Rounded pill: $rad px corner radius (pass a big radius for a fully-rounded pill).
+    macro_rules! pill {
+        ($r:expr, $c:expr, $rad:expr $(,)?) => {{
+            let pr = $r;
+            rects.push(OverlayRect { rect: nd(pr), color: $c, round: [$rad, pr[2], pr[3], 0.0] })
+        }};
+    }
+    macro_rules! label {
+        ($t:expr, $x:expr, $y:expr, $s:expr, $col:expr $(,)?) => {
+            lines.push(Line { text: $t, x: $x, y: $y, size: $s, color: $col })
+        };
+    }
     let white = [235, 235, 240, 255];
 
     // Top bar — hidden while an item is open (the lightbox is uncluttered).
     let b = bar(w);
     if !c.focused {
-    // Glass top bar.
-    rect([0.0, 0.0, w, BAR_H], [0.05, 0.05, 0.08, 0.66]);
-    rect(b.open, if c.menu == Some(MenuKind::Open) { chip_on } else { chip });
-    label("Open \u{25be}".into(), b.open[0] + 10.0, b.open[1] + 8.0, 15.0, white);
-    rect(b.sort, if c.menu == Some(MenuKind::Sort) { chip_on } else { chip });
-    label("Sort \u{25be}".into(), b.sort[0] + 12.0, b.sort[1] + 8.0, 14.0, white);
-    rect(b.filter, if c.menu == Some(MenuKind::Filter) { chip_on } else { chip });
-    label(format!("{} \u{25be}", c.filter.label()), b.filter[0] + 12.0, b.filter[1] + 8.0, 14.0, white);
-    rect(b.dates, if c.menu == Some(MenuKind::Dates) { chip_on } else { chip });
-    let dates_active = !c.date_from.is_empty() || !c.date_to.is_empty();
-    label(
-        "Dates \u{25be}".into(),
-        b.dates[0] + 12.0,
-        b.dates[1] + 8.0,
-        14.0,
-        if dates_active { [150, 200, 255, 255] } else { white },
+    // Top bar: a black gradient strip (from-black to transparent), approximated by two stacked
+    // translucent bands.
+    rect!([0.0, 0.0, w, BAR_H], [0.0, 0.0, 0.0, 0.50]);
+    rect!([0.0, 0.0, w, BAR_H * 0.55], [0.0, 0.0, 0.0, 0.22]);
+    let pill_off = [1.0, 1.0, 1.0, 0.10]; // bg-white/10
+    let pill_on = [1.0, 1.0, 1.0, 1.0]; // active = white pill, black text
+    let txt_on = [14, 14, 16, 255];
+    let rad = BTN_H * 0.5; // rounded-full
+    // Wordmark.
+    label!("Cooliris".into(), 14.0, BTN_Y + 7.0, 17.0, white);
+    label!("Next".into(), 90.0, BTN_Y + 8.0, 16.0, [150, 150, 160, 220]);
+    // Open ▾
+    let a = c.menu == Some(MenuKind::Open);
+    pill!(b.open, if a { pill_on } else { pill_off }, rad);
+    label!("Open \u{25be}".into(), b.open[0] + 12.0, b.open[1] + 8.0, 14.0, if a { txt_on } else { white });
+    // divider between Open and Slideshow
+    rect!([b.open[0] + b.open[2] + 9.0, BTN_Y + 4.0, 1.5, BTN_H - 8.0], [1.0, 1.0, 1.0, 0.16]);
+    // Slideshow / Stop
+    let a = c.slideshow;
+    pill!(b.slideshow, if a { pill_on } else { pill_off }, rad);
+    label!(
+        if a { "Stop".into() } else { "Slideshow".into() },
+        b.slideshow[0] + 16.0, b.slideshow[1] + 8.0, 14.0, if a { txt_on } else { white },
     );
-    // Search box.
-    rect(b.search, if c.search_active { chip_on } else { [1.0, 1.0, 1.0, 0.08] });
+    // Fullscreen
+    pill!(b.full, pill_off, rad);
+    label!("Fullscreen".into(), b.full[0] + 16.0, b.full[1] + 8.0, 14.0, white);
+    // Settings
+    let a = c.menu == Some(MenuKind::Settings);
+    pill!(b.settings, if a { pill_on } else { pill_off }, rad);
+    label!("Settings".into(), b.settings[0] + 16.0, b.settings[1] + 8.0, 14.0, if a { txt_on } else { white });
+    // Sort ▾
+    let a = c.menu == Some(MenuKind::Sort);
+    pill!(b.sort, if a { pill_on } else { pill_off }, rad);
+    label!("Sort \u{25be}".into(), b.sort[0] + 12.0, b.sort[1] + 8.0, 14.0, if a { txt_on } else { white });
+    // Filter ▾
+    let a = c.menu == Some(MenuKind::Filter);
+    pill!(b.filter, if a { pill_on } else { pill_off }, rad);
+    label!(format!("{} \u{25be}", c.filter.label()), b.filter[0] + 12.0, b.filter[1] + 8.0, 14.0, if a { txt_on } else { white });
+    // Dates ▾  (active when a range is set or the menu is open)
+    let dates_set = !c.date_from.is_empty() || !c.date_to.is_empty();
+    let a = c.menu == Some(MenuKind::Dates) || dates_set;
+    pill!(b.dates, if a { pill_on } else { pill_off }, rad);
+    label!(
+        if dates_set { "Dates \u{2022}".into() } else { "Dates \u{25be}".into() },
+        b.dates[0] + 12.0, b.dates[1] + 8.0, 14.0, if a { txt_on } else { white },
+    );
+    // Search (input pill)
+    pill!(b.search, if c.search_active { [1.0, 1.0, 1.0, 0.16] } else { pill_off }, rad);
     if c.search.is_empty() && !c.search_active {
-        label("\u{1f50d} Search".into(), b.search[0] + 10.0, b.search[1] + 8.0, 14.0, [170, 170, 180, 220]);
+        label!("Search\u{2026}".into(), b.search[0] + 14.0, b.search[1] + 8.0, 14.0, [160, 160, 170, 220]);
     } else {
-        label(caret_str(&c.search, c.caret, c.search_active), b.search[0] + 10.0, b.search[1] + 8.0, 14.0, white);
+        label!(caret_str(&c.search, c.caret, c.search_active), b.search[0] + 14.0, b.search[1] + 8.0, 14.0, white);
         if !c.search.is_empty() {
-            label("\u{2715}".into(), b.search[0] + b.search[2] - 20.0, b.search[1] + 8.0, 14.0, [200, 200, 210, 230]);
+            label!("\u{2715}".into(), b.search[0] + b.search[2] - 22.0, b.search[1] + 8.0, 14.0, [200, 200, 210, 230]);
         }
     }
-    rect(b.settings, if c.menu == Some(MenuKind::Settings) { chip_on } else { chip });
-    label("\u{2699} Settings \u{25be}".into(), b.settings[0] + 8.0, b.settings[1] + 8.0, 14.0, white);
-    rect(b.info, if c.show_info { chip_on } else { chip });
-    label("Info".into(), b.info[0] + 14.0, b.info[1] + 8.0, 14.0, white);
-    rect(b.full, chip);
-    label("\u{26f6} Fullscreen".into(), b.full[0] + 10.0, b.full[1] + 8.0, 14.0, white);
-    // Counts (left of Info) — always shows loaded + loading. With the memory toggle on, the RSS
-    // readout sits just to its left.
-    let counts = format!("{} loaded · {} loading · {} total", c.ready, c.inflight, c.total);
-    label(counts, b.info[0] - 250.0, b.info[1] + 9.0, 13.0, [205, 205, 215, 230]);
+    // Count (loaded/total), far right, with a small "still loading" dot; memory readout to its left.
+    if c.total > 0 {
+        let t = format!("{}/{}", c.ready.min(c.total), c.total);
+        let cw = t.chars().count() as f32 * 7.6;
+        if c.inflight > 0 {
+            pill!([w - 16.0 - cw - 16.0, BTN_Y + 12.0, 9.0, 9.0], [0.45, 0.75, 1.0, 0.95], 4.5);
+        }
+        label!(t, w - 16.0 - cw, BTN_Y + 9.0, 13.0, [165, 165, 175, 230]);
+    }
     if let Some(mb) = c.mem_mb {
-        label(format!("{mb} MB ·"), b.info[0] - 320.0, b.info[1] + 9.0, 13.0, [150, 200, 160, 230]);
+        label!(format!("{mb} MB"), w - 16.0 - 130.0, BTN_Y + 9.0, 12.0, [150, 200, 160, 220]);
     }
 
     // Dropdowns (Open / Sort / Filter) and the Settings modal.
     if c.menu == Some(MenuKind::Settings) {
         let on = [c.show_titles, c.gif_anim, c.reflections, c.show_mem];
         let su = settings_layout(w, h, SETTINGS_ROWS.len());
-        rect([0.0, 0.0, w, h], [0.0, 0.0, 0.0, 0.5]); // scrim
-        rect(su.panel, [0.08, 0.08, 0.11, 0.99]);
-        label("Settings".into(), su.panel[0] + 22.0, su.panel[1] + 18.0, 18.0, white);
-        label("\u{2715}".into(), su.close[0] + 5.0, su.close[1] + 3.0, 17.0, [200, 200, 210, 230]);
+        rect!([0.0, 0.0, w, h], [0.0, 0.0, 0.0, 0.5]); // scrim
+        pill!(su.panel, [0.09, 0.09, 0.10, 0.99], 16.0);
+        label!("Settings".into(), su.panel[0] + 22.0, su.panel[1] + 18.0, 18.0, white);
+        label!("\u{2715}".into(), su.close[0] + 5.0, su.close[1] + 3.0, 17.0, [200, 200, 210, 230]);
         for (i, (lbl, desc)) in SETTINGS_ROWS.iter().enumerate() {
             let sw = su.switches[i];
             if hit(su.rows[i], c.pointer[0], c.pointer[1]) {
-                rect(su.rows[i], [1.0, 1.0, 1.0, 0.05]);
+                rect!(su.rows[i], [1.0, 1.0, 1.0, 0.05]);
             }
-            rect(sw, if on[i] { [0.30, 0.62, 0.45, 1.0] } else { [1.0, 1.0, 1.0, 0.16] }); // track
+            rect!(sw, if on[i] { [0.30, 0.62, 0.45, 1.0] } else { [1.0, 1.0, 1.0, 0.16] }); // track
             let kx = if on[i] { sw[0] + sw[2] - 22.0 } else { sw[0] + 2.0 };
-            rect([kx, sw[1] + 2.0, 20.0, sw[3] - 4.0], white_rect); // knob
+            rect!([kx, sw[1] + 2.0, 20.0, sw[3] - 4.0], white_rect); // knob
             let tx = sw[0] + sw[2] + 16.0;
-            label((*lbl).into(), tx, sw[1] - 4.0, 15.0, white);
-            label((*desc).into(), tx, sw[1] + 16.0, 12.0, [160, 160, 170, 210]);
+            label!((*lbl).into(), tx, sw[1] - 4.0, 15.0, white);
+            label!((*desc).into(), tx, sw[1] + 16.0, 12.0, [160, 160, 170, 210]);
         }
     } else if c.menu == Some(MenuKind::Dates) {
         let du = dates_layout(b.dates);
         let dim = [170, 170, 180, 220];
         let field_bg = [1.0, 1.0, 1.0, 0.08];
-        rect(du.panel, [0.08, 0.08, 0.11, 0.99]);
-        label("Filter by".into(), du.panel[0] + 12.0, du.panel[1] + 8.0, 13.0, dim);
+        pill!(du.panel, [0.09, 0.09, 0.10, 0.99], 14.0);
+        label!("Filter by".into(), du.panel[0] + 12.0, du.panel[1] + 8.0, 13.0, dim);
         // Modified / Created tabs.
-        rect(du.modified, if !c.date_created { chip_on } else { chip });
-        label("Modified".into(), du.modified[0] + 16.0, du.modified[1] + 7.0, 13.0, white);
-        rect(du.created, if c.date_created { chip_on } else { chip });
-        label("Created".into(), du.created[0] + 20.0, du.created[1] + 7.0, 13.0, white);
+        rect!(du.modified, if !c.date_created { chip_on } else { chip });
+        label!("Modified".into(), du.modified[0] + 16.0, du.modified[1] + 7.0, 13.0, white);
+        rect!(du.created, if c.date_created { chip_on } else { chip });
+        label!("Created".into(), du.created[0] + 20.0, du.created[1] + 7.0, 13.0, white);
         // From field.
-        label("From".into(), du.from[0], du.from[1] - 16.0, 12.0, dim);
-        rect(du.from, if c.date_active == 1 { chip_on } else { field_bg });
+        label!("From".into(), du.from[0], du.from[1] - 16.0, 12.0, dim);
+        rect!(du.from, if c.date_active == 1 { chip_on } else { field_bg });
         if c.date_from.is_empty() && c.date_active != 1 {
-            label("YYYY-MM-DD".into(), du.from[0] + 8.0, du.from[1] + 9.0, 13.0, dim);
+            label!("YYYY-MM-DD".into(), du.from[0] + 8.0, du.from[1] + 9.0, 13.0, dim);
         } else {
-            label(caret_str(&c.date_from, c.caret, c.date_active == 1), du.from[0] + 8.0, du.from[1] + 9.0, 13.0, white);
+            label!(caret_str(&c.date_from, c.caret, c.date_active == 1), du.from[0] + 8.0, du.from[1] + 9.0, 13.0, white);
         }
         // To field.
-        label("To".into(), du.to[0], du.to[1] - 16.0, 12.0, dim);
-        rect(du.to, if c.date_active == 2 { chip_on } else { field_bg });
+        label!("To".into(), du.to[0], du.to[1] - 16.0, 12.0, dim);
+        rect!(du.to, if c.date_active == 2 { chip_on } else { field_bg });
         if c.date_to.is_empty() && c.date_active != 2 {
-            label("YYYY-MM-DD".into(), du.to[0] + 8.0, du.to[1] + 9.0, 13.0, dim);
+            label!("YYYY-MM-DD".into(), du.to[0] + 8.0, du.to[1] + 9.0, 13.0, dim);
         } else {
-            label(caret_str(&c.date_to, c.caret, c.date_active == 2), du.to[0] + 8.0, du.to[1] + 9.0, 13.0, white);
+            label!(caret_str(&c.date_to, c.caret, c.date_active == 2), du.to[0] + 8.0, du.to[1] + 9.0, 13.0, white);
         }
         // Clear / Done.
-        rect(du.clear, chip);
-        label("Clear dates".into(), du.clear[0] + 12.0, du.clear[1] + 8.0, 13.0, white);
-        rect(du.done, chip_on);
-        label("Done".into(), du.done[0] + 26.0, du.done[1] + 8.0, 13.0, white);
+        rect!(du.clear, chip);
+        label!("Clear dates".into(), du.clear[0] + 12.0, du.clear[1] + 8.0, 13.0, white);
+        rect!(du.done, chip_on);
+        label!("Done".into(), du.done[0] + 26.0, du.done[1] + 8.0, 13.0, white);
     } else if let Some(kind) = c.menu {
         let (anchor, items): ([f32; 4], Vec<(String, bool)>) = match kind {
             MenuKind::Open => (
@@ -538,16 +577,17 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
             MenuKind::Dates => unreachable!("dates is drawn as a panel above"),
             MenuKind::Settings => unreachable!("settings is drawn as a modal above"),
         };
-        let (panel, rows) = menu(anchor, items.len());
-        rect(panel, [0.08, 0.08, 0.11, 0.97]);
+        let (panel, rows) = menu(anchor, items.len(), w);
+        // rounded-xl neutral-900 panel
+        pill!(panel, [0.09, 0.09, 0.10, 0.99], 12.0);
         for (r, (text, current)) in rows.iter().zip(items) {
             let hov = hit(*r, c.pointer[0], c.pointer[1]);
             if current {
-                rect(*r, [1.0, 1.0, 1.0, 0.22]);
+                pill!(*r, [1.0, 1.0, 1.0, 0.15], 7.0);
             } else if hov {
-                rect(*r, [1.0, 1.0, 1.0, 0.12]);
+                pill!(*r, [1.0, 1.0, 1.0, 0.10], 7.0);
             }
-            label(text, r[0] + 8.0, r[1] + 7.0, 14.0, white);
+            label!(text, r[0] + 10.0, r[1] + 7.0, 14.0, if current { white } else { [200, 200, 210, 235] });
         }
     }
     } // end top bar (hidden while an item is focused)
@@ -559,12 +599,12 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
             let cx0 = (w - cw) * 0.5;
             // Near the top when focused (top bar is hidden); below the bar otherwise.
             let cy0 = if c.focused { 26.0 } else { BAR_H + 10.0 };
-            rect([cx0, cy0, cw, 78.0], [0.04, 0.04, 0.06, 0.84]);
+            rect!([cx0, cy0, cw, 78.0], [0.04, 0.04, 0.06, 0.84]);
             // Approximate centring (variable-width font): width ≈ chars × per-glyph estimate.
             let centre = |text: &str, per: f32| (w - text.chars().count() as f32 * per) * 0.5;
-            label(title.clone(), centre(title, 7.7), cy0 + 13.0, 15.0, white);
-            label(file.clone(), centre(file, 6.2), cy0 + 38.0, 12.0, [180, 180, 190, 220]);
-            label(meta.clone(), centre(meta, 6.2), cy0 + 56.0, 12.0, [150, 150, 160, 210]);
+            label!(title.clone(), centre(title, 7.7), cy0 + 13.0, 15.0, white);
+            label!(file.clone(), centre(file, 6.2), cy0 + 38.0, 12.0, [180, 180, 190, 220]);
+            label!(meta.clone(), centre(meta, 6.2), cy0 + 56.0, 12.0, [150, 150, 160, 210]);
         }
     }
 
@@ -573,11 +613,11 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
     if let Some(v) = &c.video {
         if v.visible {
             let vl = video_layout(w, h);
-            rect(vl.bar, [0.0, 0.0, 0.0, 0.55]);
+            rect!(vl.bar, [0.0, 0.0, 0.0, 0.55]);
             let dim = [200, 200, 210, 235];
             let off = [150, 150, 160, 200];
             // play / pause
-            label(
+            label!(
                 if v.paused { "\u{25b6}".into() } else { "\u{23f8}".into() },
                 vl.play[0],
                 vl.play[1] + 4.0,
@@ -586,11 +626,11 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
             );
             // volume slider (track · fill · knob)
             let vf = (v.vol / 100.0).clamp(0.0, 1.0) as f32;
-            rect(vl.vol, [1.0, 1.0, 1.0, 0.20]);
-            rect([vl.vol[0], vl.vol[1], vl.vol[2] * vf, vl.vol[3]], [0.9, 0.9, 0.95, 0.9]);
-            rect([vl.vol[0] + vl.vol[2] * vf - 4.0, vl.vol[1] - 4.0, 8.0, vl.vol[3] + 8.0], white_rect);
+            rect!(vl.vol, [1.0, 1.0, 1.0, 0.20]);
+            rect!([vl.vol[0], vl.vol[1], vl.vol[2] * vf, vl.vol[3]], [0.9, 0.9, 0.95, 0.9]);
+            rect!([vl.vol[0] + vl.vol[2] * vf - 4.0, vl.vol[1] - 4.0, 8.0, vl.vol[3] + 8.0], white_rect);
             // time "pos / dur"
-            label(
+            label!(
                 format!("{} / {}", fmt_time(v.pos), fmt_time(v.dur)),
                 vl.vol[0] + vl.vol[2] + 14.0,
                 vl.bar[1] + 14.0,
@@ -603,9 +643,9 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
                 None if v.dur > 0.0 => (v.pos / v.dur).clamp(0.0, 1.0) as f32,
                 None => 0.0,
             };
-            rect(vl.seek, [1.0, 1.0, 1.0, 0.20]);
-            rect([vl.seek[0], vl.seek[1], vl.seek[2] * frac, vl.seek[3]], [0.9, 0.9, 0.95, 0.95]);
-            rect([vl.seek[0] + vl.seek[2] * frac - 4.0, vl.seek[1] - 5.0, 8.0, vl.seek[3] + 10.0], white_rect);
+            rect!(vl.seek, [1.0, 1.0, 1.0, 0.20]);
+            rect!([vl.seek[0], vl.seek[1], vl.seek[2] * frac, vl.seek[3]], [0.9, 0.9, 0.95, 0.95]);
+            rect!([vl.seek[0] + vl.seek[2] * frac - 4.0, vl.seek[1] - 5.0, 8.0, vl.seek[3] + 10.0], white_rect);
             // Hover readout: a black box with white time text at the cursor over the seek track.
             let pt = c.pointer;
             if v.dur > 0.0 && pt[1] >= vl.bar[1] && pt[0] >= vl.seek[0] && pt[0] <= vl.seek[0] + vl.seek[2] {
@@ -614,17 +654,17 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
                 let bw = ht.chars().count() as f32 * 8.0 + 14.0;
                 let bx = (pt[0] - bw * 0.5).clamp(4.0, w - bw - 4.0);
                 let tip_y = vl.bar[1] - 30.0;
-                rect([bx, tip_y, bw, 22.0], [0.0, 0.0, 0.0, 0.88]);
-                label(ht, bx + 7.0, tip_y + 5.0, 13.0, white);
+                rect!([bx, tip_y, bw, 22.0], [0.0, 0.0, 0.0, 0.88]);
+                label!(ht, bx + 7.0, tip_y + 5.0, 13.0, white);
             }
             // right cluster: skip-back · skip-fwd · subtitles · audio · fullscreen
-            label("\u{23ea}".into(), vl.back[0], vl.back[1] + 5.0, 15.0, white);
-            label("\u{23e9}".into(), vl.fwd[0], vl.fwd[1] + 5.0, 15.0, white);
+            label!("\u{23ea}".into(), vl.back[0], vl.back[1] + 5.0, 15.0, white);
+            label!("\u{23e9}".into(), vl.fwd[0], vl.fwd[1] + 5.0, 15.0, white);
             let subs_on = v.sid > 0 || v.track_menu == Some(TrackMenu::Sub);
             let aud_on = v.aid > 0 || v.track_menu == Some(TrackMenu::Audio);
-            label("CC".into(), vl.subs[0] + 2.0, vl.subs[1] + 6.0, 13.0, if subs_on { white } else { off });
-            label("\u{266a}".into(), vl.audio[0] + 7.0, vl.audio[1] + 4.0, 16.0, if aud_on { white } else { off });
-            label("\u{26f6}".into(), vl.full[0] + 3.0, vl.full[1] + 5.0, 16.0, white);
+            label!("CC".into(), vl.subs[0] + 2.0, vl.subs[1] + 6.0, 13.0, if subs_on { white } else { off });
+            label!("\u{266a}".into(), vl.audio[0] + 7.0, vl.audio[1] + 4.0, 16.0, if aud_on { white } else { off });
+            label!("\u{26f6}".into(), vl.full[0] + 3.0, vl.full[1] + 5.0, 16.0, white);
 
             // Audio / subtitle track menu (opens above its button).
             if let Some(tm) = v.track_menu {
@@ -633,24 +673,24 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
                     TrackMenu::Sub => (vl.subs, &v.sub_tracks, v.sid <= 0),
                 };
                 let (panel, rows) = track_menu_layout(anchor, tracks.len() + 1);
-                rect(panel, [0.08, 0.08, 0.11, 0.99]);
+                pill!(panel, [0.09, 0.09, 0.10, 0.99], 12.0);
                 if off_sel {
-                    rect(rows[0], [1.0, 1.0, 1.0, 0.22]);
+                    rect!(rows[0], [1.0, 1.0, 1.0, 0.22]);
                 } else if hit(rows[0], c.pointer[0], c.pointer[1]) {
-                    rect(rows[0], [1.0, 1.0, 1.0, 0.12]);
+                    rect!(rows[0], [1.0, 1.0, 1.0, 0.12]);
                 }
-                label("Off".into(), rows[0][0] + 8.0, rows[0][1] + 7.0, 13.0, white);
+                label!("Off".into(), rows[0][0] + 8.0, rows[0][1] + 7.0, 13.0, white);
                 for (r, (_id, lbl, sel)) in rows[1..].iter().zip(tracks.iter()) {
                     if *sel {
-                        rect(*r, [1.0, 1.0, 1.0, 0.22]);
+                        rect!(*r, [1.0, 1.0, 1.0, 0.22]);
                     } else if hit(*r, c.pointer[0], c.pointer[1]) {
-                        rect(*r, [1.0, 1.0, 1.0, 0.12]);
+                        rect!(*r, [1.0, 1.0, 1.0, 0.12]);
                     }
                     let mut t = lbl.clone();
                     if t.chars().count() > 30 {
                         t = t.chars().take(29).collect::<String>() + "\u{2026}";
                     }
-                    label(t, r[0] + 8.0, r[1] + 7.0, 13.0, white);
+                    label!(t, r[0] + 8.0, r[1] + 7.0, 13.0, white);
                 }
             }
         }
@@ -662,12 +702,12 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>) {
     let controls_hidden = c.video.as_ref().map_or(false, |v| !v.visible);
     if c.focused && !controls_hidden {
         let ib = lightbox_info(w);
-        rect(ib, if c.show_info { chip_on } else { [0.0, 0.0, 0.0, 0.55] });
-        label("Info".into(), ib[0] + 14.0, ib[1] + 10.0, 14.0, white);
+        rect!(ib, if c.show_info { chip_on } else { [0.0, 0.0, 0.0, 0.55] });
+        label!("Info".into(), ib[0] + 14.0, ib[1] + 10.0, 14.0, white);
         let cb = lightbox_close(w);
         let hov = hit(cb, c.pointer[0], c.pointer[1]);
-        rect(cb, if hov { [0.0, 0.0, 0.0, 0.8] } else { [0.0, 0.0, 0.0, 0.55] });
-        label("\u{2715}".into(), cb[0] + 10.0, cb[1] + 9.0, 18.0, white);
+        rect!(cb, if hov { [0.0, 0.0, 0.0, 0.8] } else { [0.0, 0.0, 0.0, 0.55] });
+        label!("\u{2715}".into(), cb[0] + 10.0, cb[1] + 9.0, 18.0, white);
     }
 
     (rects, lines)
@@ -749,7 +789,7 @@ pub fn hit_test(c: &UiCtx, x: f32, y: f32) -> Option<UiAction> {
             MenuKind::Dates => (bar(c.w).dates, 0),
             MenuKind::Settings => unreachable!(),
         };
-        let (_, rows) = menu(anchor, n);
+        let (_, rows) = menu(anchor, n, c.w);
         for (i, r) in rows.iter().enumerate() {
             if hit(*r, x, y) {
                 return Some(match kind {
@@ -875,8 +915,8 @@ pub fn hit_test(c: &UiCtx, x: f32, y: f32) -> Option<UiAction> {
         if hit(b.settings, x, y) {
             return Some(UiAction::ToggleMenu(MenuKind::Settings));
         }
-        if hit(b.info, x, y) {
-            return Some(UiAction::ToggleInfo);
+        if hit(b.slideshow, x, y) {
+            return Some(UiAction::ToggleSlideshow);
         }
         if hit(b.full, x, y) {
             return Some(UiAction::Fullscreen);

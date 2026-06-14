@@ -103,24 +103,41 @@ const VERTEX_ATTRS: [wgpu::VertexAttribute; 2] =
 const INSTANCE_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
     2 => Float32x2, 3 => Float32x2, 4 => Uint32, 5 => Float32x2, 6 => Uint32, 7 => Float32x2];
 
-const OVERLAY_ATTRS: [wgpu::VertexAttribute; 2] =
-    wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4];
+const OVERLAY_ATTRS: [wgpu::VertexAttribute; 3] =
+    wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
 const OVERLAY_CAP: u64 = 320; // wall overlay (dim/scrubber/arrows/ticks/title boxes) + custom UI rects
 const OVERLAY_SHADER: &str = r#"
-struct In { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32> };
-struct V { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> };
+struct In { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32>, @location(2) round: vec4<f32> };
+struct V {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) @interpolate(flat) round: vec4<f32>,
+};
 @vertex
 fn vs(@builtin(vertex_index) vi: u32, in: In) -> V {
     var c = array<vec2<f32>, 6>(
         vec2(0.,0.), vec2(1.,0.), vec2(0.,1.), vec2(0.,1.), vec2(1.,0.), vec2(1.,1.));
-    let p = in.rect.xy + c[vi] * in.rect.zw;
+    let q = c[vi];
+    let p = in.rect.xy + q * in.rect.zw;
     var out: V;
     out.clip = vec4(p, 0.0, 1.0);
     out.color = in.color;
+    out.uv = q;
+    out.round = in.round;
     return out;
 }
 @fragment
-fn fs(in: V) -> @location(0) vec4<f32> { return in.color; }
+fn fs(in: V) -> @location(0) vec4<f32> {
+    let r = in.round.x;            // corner radius (px)
+    if (r <= 0.0) { return in.color; }
+    let size = in.round.yz;        // rect size (px)
+    let p = in.uv * size - size * 0.5;            // position from the rect centre
+    let q = abs(p) - (size * 0.5 - vec2<f32>(r)); // rounded-box SDF
+    let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+    let alpha = in.color.a * (1.0 - smoothstep(-0.75, 0.75, d)); // 1.5px edge AA
+    return vec4<f32>(in.color.rgb, alpha);
+}
 "#;
 
 /// Lightbox: the focused image drawn as a fitted, centered screen-space quad over a dimmed wall.
@@ -346,6 +363,8 @@ pub struct State {
     date_active: u8,              // which date field takes keyboard: 0 none, 1 From, 2 To
     caret: usize,                 // caret char-index within the focused text field (search/date)
     view_dirty: bool,             // search/filter changed → rebuild the displayed view next frame
+    slideshow: bool,              // auto-advance the focused item
+    slideshow_t: Instant,         // last slideshow advance
     gif_anim: bool,               // Settings: animate GIFs on focus
     reflections: bool,            // Settings: draw the glass reflections
     show_titles: bool,            // Settings: filename label on every wall tile
@@ -867,6 +886,8 @@ impl State {
             date_active: 0,
             caret: 0,
             view_dirty: false,
+            slideshow: false,
+            slideshow_t: Instant::now(),
             gif_anim: true,
             reflections: true,
             show_titles: false,
@@ -1378,6 +1399,7 @@ impl State {
             menu: self.open_menu,
             search: self.search.clone(),
             search_active: self.search_active,
+            slideshow: self.slideshow,
             gif_anim: self.gif_anim,
             reflections: self.reflections,
             date_created: self.date_created,
@@ -1415,6 +1437,15 @@ impl State {
             }
             UiAction::Back => self.back(),
             UiAction::Fullscreen => self.fullscreen_requested = true,
+            UiAction::ToggleSlideshow => {
+                self.slideshow = !self.slideshow;
+                self.slideshow_t = Instant::now();
+                self.open_menu = None;
+                if self.slideshow && self.focus.is_none() && self.total > 0 {
+                    self.focus = Some(0); // start the show on the first item
+                    self.reset_lb_view();
+                }
+            }
             UiAction::ToggleInfo => self.show_info = !self.show_info,
             UiAction::ToggleMenu(m) => {
                 self.open_menu = if self.open_menu == Some(m) { None } else { Some(m) };
@@ -1629,6 +1660,17 @@ impl State {
         if self.view_dirty {
             self.view_dirty = false;
             self.rebuild_view();
+        }
+
+        // Slideshow: auto-advance the focused item every few seconds (wraps; stops if closed).
+        if self.slideshow {
+            if self.focus.is_none() || self.total == 0 {
+                self.slideshow = false;
+            } else if self.slideshow_t.elapsed().as_secs_f32() >= 4.0 {
+                self.slideshow_t = Instant::now();
+                self.focus = Some(self.focus.map_or(0, |f| (f + 1) % self.total));
+                self.reset_lb_view();
+            }
         }
 
         // --- scroll physics (frozen while a tile is focused) ---
@@ -2810,8 +2852,7 @@ impl State {
         let s = smoothstep(self.focus_t);
         rects.push(OverlayRect {
             rect: [-1.0, -1.0, 2.0, 2.0],
-            color: [0.0, 0.0, 0.0, 0.93 * s],
-        });
+            color: [0.0, 0.0, 0.0, 0.93 * s], round: [0.0; 4] });
 
         // (Top bar, dropdowns, search and video controls are built by `components` and merged in
         // render — this layer only draws the wall overlay below.)
@@ -2825,25 +2866,21 @@ impl State {
                 if f > 0 {
                     rects.push(OverlayRect {
                         rect: to_ndc(prev),
-                        color: [1.0, 1.0, 1.0, 0.14 * s],
-                    });
+                        color: [1.0, 1.0, 1.0, 0.14 * s], round: [0.0; 4] });
                 }
                 if f + 1 < self.total {
                     rects.push(OverlayRect {
                         rect: to_ndc(next),
-                        color: [1.0, 1.0, 1.0, 0.14 * s],
-                    });
+                        color: [1.0, 1.0, 1.0, 0.14 * s], round: [0.0; 4] });
                 }
             }
         } else if self.scroll_max > 0.0 {
             rects.push(OverlayRect {
                 rect: to_ndc(prev),
-                color: [1.0, 1.0, 1.0, 0.10],
-            });
+                color: [1.0, 1.0, 1.0, 0.10], round: [0.0; 4] });
             rects.push(OverlayRect {
                 rect: to_ndc(next),
-                color: [1.0, 1.0, 1.0, 0.10],
-            });
+                color: [1.0, 1.0, 1.0, 0.10], round: [0.0; 4] });
         }
 
         // Bottom scrubber (only when scrollable and not focused): a taller track with evenly spaced
@@ -2854,8 +2891,7 @@ impl State {
             let by = -1.0 + nhh(14.0);
             rects.push(OverlayRect {
                 rect: [nx(pad), by, nw(track_w), bh],
-                color: [1.0, 1.0, 1.0, 0.14],
-            });
+                color: [1.0, 1.0, 1.0, 0.14], round: [0.0; 4] });
             // Tick lines across the track (one per column step, capped so we never overflow).
             let ticks = (self.total_cols.max(1) as usize).min(40);
             if ticks > 1 {
@@ -2867,16 +2903,14 @@ impl State {
                     let x = pad + (track_w - 1.5) * fx;
                     rects.push(OverlayRect {
                         rect: [nx(x), ty, tw, th],
-                        color: [1.0, 1.0, 1.0, 0.18],
-                    });
+                        color: [1.0, 1.0, 1.0, 0.18], round: [0.0; 4] });
                 }
             }
             let frac = (self.scroll_x / self.scroll_max).clamp(0.0, 1.0);
             let thumb_x = pad + (track_w - thumb_w) * frac;
             rects.push(OverlayRect {
                 rect: [nx(thumb_x), by, nw(thumb_w), bh],
-                color: [0.95, 0.96, 1.0, 0.9],
-            });
+                color: [0.95, 0.96, 1.0, 0.9], round: [0.0; 4] });
         }
 
         // Hover tooltip: a solid black pill centred on the hovered tile (text drawn in ui_lines),
@@ -2884,16 +2918,14 @@ impl State {
         if let Some((_name, bx, by, bw)) = self.hover_label() {
             rects.push(OverlayRect {
                 rect: [nx(bx), ny_top(by + 22.0), nw(bw), nhh(22.0)],
-                color: [0.0, 0.0, 0.0, 1.0],
-            });
+                color: [0.0, 0.0, 0.0, 1.0], round: [0.0; 4] });
         }
 
         // Show-titles: a solid black pill at each tile's bottom (text drawn in ui_lines).
         for (_name, bx, by, bw) in self.wall_titles() {
             rects.push(OverlayRect {
                 rect: [nx(bx), ny_top(by + 22.0), nw(bw), nhh(22.0)],
-                color: [0.0, 0.0, 0.0, 1.0],
-            });
+                color: [0.0, 0.0, 0.0, 1.0], round: [0.0; 4] });
         }
         rects
     }
