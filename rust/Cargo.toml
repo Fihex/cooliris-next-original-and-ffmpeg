@@ -43,8 +43,12 @@ log = "0.4"
 env_logger = "0.11"
 # GPU text (the Open button label + the loaded/total readout). Matches wgpu 22.
 glyphon = "0.6"
-# Recursive directory walk (folders usually nest images in subfolders).
-walkdir = "2"
+# Recursive directory walk (folders usually nest images in subfolders). jwalk reads directories in
+# parallel (rayon) so scanning a big, deeply-nested library is much faster than a single-threaded walk.
+jwalk = "0.8"
+# SVG rasteriser (pure Rust) — the UI icons (video controls, lightbox arrows/info) are the website's
+# own SVG paths, baked into a small atlas at startup. Re-exports usvg + tiny_skia.
+resvg = "0.44"
 # Allocator that returns freed memory to the OS (glibc holds the decode high-water mark, so RSS
 # stayed multi-hundred-MB after big image decodes; mimalloc purges it back down).
 mimalloc = { version = "0.1", default-features = false }

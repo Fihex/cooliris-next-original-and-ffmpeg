@@ -255,7 +255,8 @@ fn fs(in: V) -> @location(0) vec4<f32> {
                 let h = mpv_create();
                 mpv_set_option_string(h, c"vo".as_ptr(), c"libmpv".as_ptr());
                 mpv_set_option_string(h, c"terminal".as_ptr(), c"no".as_ptr());
-                mpv_set_option_string(h, c"loop".as_ptr(), c"inf".as_ptr());
+                // Play once and hold the final frame (paused) at the end — no looping.
+                mpv_set_option_string(h, c"keep-open".as_ptr(), c"yes".as_ptr());
                 // Auto-load every external subtitle in the video's folder (not just exact/likely
                 // name matches), so a same-folder .srt/.ass always shows up and is selectable.
                 mpv_set_option_string(h, c"sub-auto".as_ptr(), c"all".as_ptr());

@@ -9,6 +9,7 @@
 // Controls: mouse wheel or ←/→ to scroll the wall.
 
 mod components;
+mod icons;
 mod post;
 mod state;
 mod ui;

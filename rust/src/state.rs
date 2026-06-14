@@ -136,7 +136,11 @@ fn fs(in: V) -> @location(0) vec4<f32> {
     let q = abs(p) - (size * 0.5 - vec2<f32>(r)); // rounded-box SDF
     let d = length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
     let alpha = in.color.a * (1.0 - smoothstep(-0.75, 0.75, d)); // 1.5px edge AA
-    return vec4<f32>(in.color.rgb, alpha);
+    // Vertical gradient (round.w = strength, 0 = flat): lighter at the top, darker at the bottom —
+    // the DAW button look. uv.y is 0 at the bottom, 1 at the top.
+    let g = in.round.w;
+    let col = in.color.rgb * mix(1.0 - g, 1.0 + g, in.uv.y);
+    return vec4<f32>(col, alpha);
 }
 "#;
 
@@ -146,11 +150,12 @@ fn fs(in: V) -> @location(0) vec4<f32> {
 struct LbUniform {
     rect: [f32; 4],     // NDC x, y (bottom-left), w, h
     uv_layer: [f32; 4], // uv.x, uv.y (extent), layer, alpha
+    uv_off: [f32; 4],   // atlas sub-rect origin (uv.x, uv.y) for animated-GIF cells; .zw unused
 }
 const LIGHTBOX_SHADER: &str = r#"
 @group(0) @binding(0) var atlas: texture_2d_array<f32>;
 @group(0) @binding(1) var samp: sampler;
-struct LB { rect: vec4<f32>, uv_layer: vec4<f32> };
+struct LB { rect: vec4<f32>, uv_layer: vec4<f32>, uv_off: vec4<f32> };
 @group(1) @binding(0) var<uniform> lb: LB;
 struct V { @builtin(position) clip: vec4<f32>, @location(0) uv: vec2<f32> };
 @vertex
@@ -161,7 +166,7 @@ fn vs(@builtin(vertex_index) i: u32) -> V {
     let p = lb.rect.xy + q * lb.rect.zw;
     var out: V;
     out.clip = vec4(p, 0.0, 1.0);
-    out.uv = vec2(q.x, 1.0 - q.y) * (lb.uv_layer.xy - vec2(0.5 / 512.0, 0.5 / 512.0));
+    out.uv = lb.uv_off.xy + vec2(q.x, 1.0 - q.y) * (lb.uv_layer.xy - vec2(0.5 / 512.0, 0.5 / 512.0));
     return out;
 }
 @fragment
@@ -311,6 +316,7 @@ pub struct State {
     full_extent: [f32; 2],       // fraction of full_tex the image fills
     post: crate::post::Post,     // offscreen scene + blur for the lightbox backdrop
     ui: crate::ui::Ui,
+    icons: crate::icons::Icons,  // SVG UI icons (video controls, lightbox arrows/info)
 
     camera_buf: wgpu::Buffer,
     camera_bg: wgpu::BindGroup,
@@ -716,6 +722,7 @@ impl State {
             mapped_at_creation: false,
         });
         let ui = crate::ui::Ui::new(&device, &queue, config.format);
+        let icons = crate::icons::Icons::new(&device, &queue, config.format);
         let post = crate::post::Post::new(&device, &queue, config.format, size.width, size.height);
 
         // --- lightbox (focused image fitted over the dimmed wall; reuses the tile texture array) ---
@@ -841,6 +848,7 @@ impl State {
             full_extent: [1.0, 1.0],
             post,
             ui,
+            icons,
             camera_buf,
             camera_bg,
             tex_bg,
@@ -1034,18 +1042,14 @@ impl State {
         }
         let w = self.config.width as f32;
         let h = self.config.height as f32;
-        // Project the tile's bottom-centre, then centre the pill on it (like wall_titles).
-        let vp = self.view_proj_matrix();
-        let (cx, _) = self.tile_center(i);
-        let by = row_baseline(i % ROWS);
-        let p = vp * Vec4::new(cx, by, 0.0, 1.0);
-        if p.w <= 0.05 {
-            return None;
-        }
-        let sx = (p.x / p.w * 0.5 + 0.5) * w;
-        let sy = (1.0 - (p.y / p.w * 0.5 + 0.5)) * h;
+        // Follow the cursor: centre the pill horizontally on the mouse, floating just above it
+        // (not pinned to the tile), so the name tracks where you're actually pointing.
+        let mx = (self.pointer_ndc[0] + 1.0) * 0.5 * w;
+        let my = (1.0 - self.pointer_ndc[1]) * 0.5 * h;
         let bw = name.chars().count() as f32 * 7.0 + 16.0;
-        Some((name, sx - bw * 0.5, sy - 28.0, bw))
+        let bx = (mx - bw * 0.5).clamp(4.0, (w - bw - 4.0).max(4.0));
+        let by = (my - 34.0).max(4.0);
+        Some((name, bx, by, bw))
     }
 
     /// True if a screen-space pixel falls on the focused image (vs the empty/dim area).
@@ -1309,22 +1313,29 @@ impl State {
             .values()
             .filter(|t| matches!(t, Tile::Ready { .. }))
             .count();
-        // Bottom-of-lightbox info pill (only while an item is open). Always: title + "N / total".
-        // With Info on, also the filename and the chosen date — (title, line2, line3).
-        let info = self.focus.and_then(|i| {
-            let p = match self.sources.get(i)? {
-                Source::File(p) | Source::Video(p) | Source::Audio(p) => p,
-                Source::Placeholder(_) => return None,
-            };
-            let filename =
-                p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-            let title = p
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| filename.clone());
-            let pos = format!("{} / {}", i + 1, self.total);
-            if self.show_info {
-                // Date matching the active selection (Dates "Created" tab or a Created sort).
+        // Bottom-of-lightbox info pill — only when Info is toggled on: title · full path ·
+        // "N / total · When date" (title, line2, line3).
+        let info = if self.show_info {
+            self.focus.and_then(|i| {
+                let p = match self.sources.get(i)? {
+                    Source::File(p) | Source::Video(p) | Source::Audio(p) => p,
+                    Source::Placeholder(_) => return None,
+                };
+                let filename =
+                    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                let title = p
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| filename.clone());
+                // Full path, left-ellipsised so the end (filename) always stays visible.
+                let full = p.to_string_lossy();
+                let n = full.chars().count();
+                let path = if n > 72 {
+                    format!("\u{2026}{}", full.chars().skip(n - 71).collect::<String>())
+                } else {
+                    full.into_owned()
+                };
+                let pos = format!("{} / {}", i + 1, self.total);
                 let use_created = self.date_created
                     || matches!(self.sort_mode, SortMode::CreatedNew | SortMode::CreatedOld);
                 let md = std::fs::metadata(p).ok();
@@ -1335,13 +1346,13 @@ impl State {
                 };
                 let line3 = match time {
                     Some(t) => format!("{pos}  ·  {when} {}", fmt_date(t)),
-                    None => pos.clone(),
+                    None => pos,
                 };
-                Some((title, filename, line3))
-            } else {
-                Some((title, pos, String::new()))
-            }
-        });
+                Some((title, path, line3))
+            })
+        } else {
+            None
+        };
         let video = if self.video.is_some() {
             let (pos, dur, paused) = self.video_state().unwrap_or((0.0, 0.0, false));
             let (vol, aid, sid) = self
@@ -1412,6 +1423,7 @@ impl State {
                 (self.pointer_ndc[0] + 1.0) * 0.5 * self.config.width as f32,
                 (1.0 - self.pointer_ndc[1]) * 0.5 * self.config.height as f32,
             ],
+            fullscreen: self.window.fullscreen().is_some(),
         }
     }
 
@@ -1632,6 +1644,36 @@ impl State {
         let prev = [ARROW_MARGIN, y, ARROW_W, ARROW_H];
         let next = [w - ARROW_MARGIN - ARROW_W, y, ARROW_W, ARROW_H];
         (prev, next)
+    }
+
+    /// SVG icons drawn over the wall/lightbox (the prev/next chevrons, centred in the arrow buttons).
+    /// The video-control and Back/Info icons are emitted by `components::build`.
+    fn icon_reqs(&self) -> Vec<crate::icons::IconReq> {
+        let mut v = Vec::new();
+        let (prev, next) = self.arrow_rects();
+        let tint = [235, 235, 240, 235];
+        let centre = |r: [f32; 4], name: &'static str| {
+            let s = 28.0_f32;
+            crate::icons::IconReq {
+                rect: [r[0] + (r[2] - s) * 0.5, r[1] + (r[3] - s) * 0.5, s, s],
+                name,
+                tint,
+            }
+        };
+        if let Some(f) = self.focus {
+            if self.lightbox_controls_visible() {
+                if f > 0 {
+                    v.push(centre(prev, "prev"));
+                }
+                if f + 1 < self.total {
+                    v.push(centre(next, "next"));
+                }
+            }
+        } else if self.scroll_max > 0.0 {
+            v.push(centre(prev, "prev"));
+            v.push(centre(next, "next"));
+        }
+        v
     }
 
     /// Arrow keys: -1 left, +1 right, 0 released.
@@ -1919,7 +1961,6 @@ impl State {
             }
         }
 
-        self.rebuild_instances();
         self.upload_camera();
 
         // --- focused-video playback: start mpv when a video tile is focused, stop on change ---
@@ -2082,6 +2123,10 @@ impl State {
                 }
             }
         }
+
+        // Rebuild wall instances last — after the GIF atlases upload and the frame cursor advances —
+        // so each animated tile samples a single (current) cell this frame, never the packed grid.
+        self.rebuild_instances();
 
         // A decode burst just finished — hand the freed decode buffers back to the OS.
         if self.prev_inflight > 0 && self.inflight == 0 {
@@ -2678,29 +2723,7 @@ impl State {
                 color: [235, 235, 240, 255],
             });
         } else if let Some(idx) = self.focus {
-            // Lightbox: clickable prev/next chevrons (drawn only when a neighbour exists; hidden
-            // with the rest of the controls when a video goes idle), and "Loading…" until decoded.
-            let (prev, next) = self.arrow_rects();
-            if self.lightbox_controls_visible() {
-                if idx > 0 {
-                    v.push(crate::ui::Line {
-                        text: "‹".into(),
-                        x: prev[0] + ARROW_W * 0.5 - 9.0,
-                        y: prev[1] + ARROW_H * 0.5 - 30.0,
-                        size: 46.0,
-                        color: [240, 240, 245, 240],
-                    });
-                }
-                if idx + 1 < self.total {
-                    v.push(crate::ui::Line {
-                        text: "›".into(),
-                        x: next[0] + ARROW_W * 0.5 - 9.0,
-                        y: next[1] + ARROW_H * 0.5 - 30.0,
-                        size: 46.0,
-                        color: [240, 240, 245, 240],
-                    });
-                }
-            }
+            // Lightbox: prev/next chevrons are SVG icons now (see icon_reqs); "Loading…" until decoded.
             // (Position / total now lives in the Info card; no bottom hint here.)
             if matches!(self.sources.get(idx), Some(Source::Video(_))) && !cfg!(feature = "video") {
                 // This build has no libmpv linked — explain why the clip isn't playing.
@@ -2724,24 +2747,7 @@ impl State {
             }
             // (Video controls — play/pause, seek, time, tracks — are drawn by `components`.)
         } else {
-            // On-screen left/right scroll arrows (hold to scroll), when the wall is scrollable.
-            if self.scroll_max > 0.0 {
-                let (prev, next) = self.arrow_rects();
-                v.push(crate::ui::Line {
-                    text: "‹".into(),
-                    x: prev[0] + ARROW_W * 0.5 - 9.0,
-                    y: prev[1] + ARROW_H * 0.5 - 30.0,
-                    size: 46.0,
-                    color: [235, 235, 240, 210],
-                });
-                v.push(crate::ui::Line {
-                    text: "›".into(),
-                    x: next[0] + ARROW_W * 0.5 - 9.0,
-                    y: next[1] + ARROW_H * 0.5 - 30.0,
-                    size: 46.0,
-                    color: [235, 235, 240, 210],
-                });
-            }
+            // On-screen left/right scroll arrows (SVG icons now; see icon_reqs).
             // Big centered "Loading…" right after opening a folder, while the first tiles decode.
             let ready = self
                 .resident
@@ -2793,17 +2799,25 @@ impl State {
         if matches!(self.sources.get(idx), Some(Source::Video(_))) {
             return LbDraw::None; // videos play via the video layer, not the lightbox
         }
-        // An animated GIF's tile layer holds a packed atlas (a grid of frames) — sampling it as a
-        // full thumbnail would show the whole grid. Wait for the full-res GIF (full_tex) instead.
-        if self.full_for != Some(idx) && self.wall_gifs.contains_key(&idx) {
-            return LbDraw::None;
-        }
-        // (aspect, uv extent, layer, which bind group) — full-res if ready, else the thumb.
-        let (aspect, uv, layer, draw) = if self.full_for == Some(idx) {
+        // (aspect, uv extent, uv offset, layer, which bind group) — full-res if ready, else the
+        // thumb. An animated GIF's tile layer holds a packed atlas (a grid of frames): until the
+        // full-res GIF (full_tex) is decoded, sample its *current cell* (uv_off) so the open shows
+        // the animating frame, not a black screen or the whole grid.
+        let (aspect, uv, uv_off, layer, draw) = if self.full_for == Some(idx) {
             let e = self.full_extent;
-            (e[0] / e[1], e, 0.0, LbDraw::Full)
+            (e[0] / e[1], e, [0.0, 0.0], 0.0, LbDraw::Full)
+        } else if let Some(a) = self.wall_gifs.get(&idx) {
+            let Some(&Tile::Ready { layer, .. }) = self.resident.get(&idx) else {
+                return LbDraw::None;
+            };
+            let g = a.grid.max(1) as usize;
+            let cur = a.cur.min(a.delays.len().saturating_sub(1));
+            let cell_uv = a.cell as f32 / 512.0;
+            let uv_off = [(cur % g) as f32 * cell_uv, (cur / g) as f32 * cell_uv];
+            let uv_ext = [a.fw as f32 / 512.0, a.fh as f32 / 512.0];
+            (a.fw as f32 / a.fh.max(1) as f32, uv_ext, uv_off, layer as f32, LbDraw::Thumb)
         } else if let Some(Tile::Ready { layer, aspect, uv }) = self.resident.get(&idx) {
-            (*aspect, *uv, *layer as f32, LbDraw::Thumb)
+            (*aspect, *uv, [0.0, 0.0], *layer as f32, LbDraw::Thumb)
         } else {
             return LbDraw::None; // still decoding
         };
@@ -2826,6 +2840,7 @@ impl State {
                 qh,
             ],
             uv_layer: [uv[0], uv[1], layer, smoothstep(self.focus_t)],
+            uv_off: [uv_off[0], uv_off[1], 0.0, 0.0],
         };
         self.queue
             .write_buffer(&self.lb_buf, 0, bytemuck::cast_slice(&[u]));
@@ -2857,26 +2872,35 @@ impl State {
         // wall: left/right scroll buttons (when scrollable).
         let to_ndc = |r: [f32; 4]| [nx(r[0]), ny_top(r[1] + r[3]), nw(r[2]), nhh(r[3])];
         let (prev, next) = self.arrow_rects();
+        // A rounded arrow button centred in the arrow's (taller) hit region — the same dark-blue
+        // fill + border + hover as the top-bar buttons (lighter when the cursor is over it).
+        let bd = components::BTN_BORDER;
+        let (mx, my) = ((self.pointer_ndc[0] + 1.0) * 0.5 * w, (1.0 - self.pointer_ndc[1]) * 0.5 * h);
+        let mut arrow_btn = |r: [f32; 4], a: f32| {
+            let (bw, bh) = (46.0_f32, 64.0_f32);
+            let bx = r[0] + (r[2] - bw) * 0.5;
+            let by = r[1] + (r[3] - bh) * 0.5;
+            let hov = mx >= r[0] && mx <= r[0] + r[2] && my >= r[1] && my <= r[1] + r[3];
+            let fl = if hov { components::BTN_HOVER } else { components::BTN_FILL };
+            rects.push(OverlayRect {
+                rect: to_ndc([bx - 1.0, by - 1.0, bw + 2.0, bh + 2.0]),
+                color: [bd[0], bd[1], bd[2], bd[3] * a], round: [15.0, bw + 2.0, bh + 2.0, 0.0] });
+            rects.push(OverlayRect {
+                rect: to_ndc([bx, by, bw, bh]),
+                color: [fl[0], fl[1], fl[2], fl[3] * a], round: [14.0, bw, bh, components::BTN_GRAD] });
+        };
         if let Some(f) = self.focus {
             if self.lightbox_controls_visible() {
                 if f > 0 {
-                    rects.push(OverlayRect {
-                        rect: to_ndc(prev),
-                        color: [1.0, 1.0, 1.0, 0.14 * s], round: [0.0; 4] });
+                    arrow_btn(prev, s);
                 }
                 if f + 1 < self.total {
-                    rects.push(OverlayRect {
-                        rect: to_ndc(next),
-                        color: [1.0, 1.0, 1.0, 0.14 * s], round: [0.0; 4] });
+                    arrow_btn(next, s);
                 }
             }
         } else if self.scroll_max > 0.0 {
-            rects.push(OverlayRect {
-                rect: to_ndc(prev),
-                color: [1.0, 1.0, 1.0, 0.10], round: [0.0; 4] });
-            rects.push(OverlayRect {
-                rect: to_ndc(next),
-                color: [1.0, 1.0, 1.0, 0.10], round: [0.0; 4] });
+            arrow_btn(prev, 1.0);
+            arrow_btn(next, 1.0);
         }
 
         // Bottom scrubber (only when scrollable and not focused): a taller track with evenly spaced
@@ -2934,9 +2958,11 @@ impl State {
         // search, video controls) built by `components`.
         let mut overlay = self.overlay_rects();
         let mut lines = self.ui_lines();
-        let (ui_rects, ui_lines) = components::build(&self.ui_ctx());
+        let mut icons = self.icon_reqs();
+        let (ui_rects, ui_lines, ui_icons) = components::build(&self.ui_ctx());
         overlay.extend(ui_rects);
         lines.extend(ui_lines);
+        icons.extend(ui_icons);
         overlay.truncate(OVERLAY_CAP as usize);
         if !overlay.is_empty() {
             self.queue
@@ -3050,6 +3076,14 @@ impl State {
                 rp.draw(0..6, 1..overlay.len() as u32);
             }
             self.ui.render(&mut rp);
+            // SVG icons (video controls, arrows, info) on top of the overlay + text.
+            self.icons.draw(
+                &mut rp,
+                &self.queue,
+                self.config.width as f32,
+                self.config.height as f32,
+                &icons,
+            );
         }
         self.queue.submit(std::iter::once(enc.finish()));
         frame.present();
@@ -3278,41 +3312,43 @@ pub fn gather_sources(folder: Option<PathBuf>, progress: impl Fn(usize)) -> Vec<
         return (0..24).map(Source::Placeholder).collect();
     };
     // Recurse into subfolders to any depth — media is usually nested (a folder per product/album,
-    // and those may nest further). follow_links(false) means no symlink loops; the cap bounds it.
-    // `progress` reports the running media count so the UI can show "Scanning… N found".
-    let mut paths: Vec<PathBuf> = Vec::new();
-    for entry in walkdir::WalkDir::new(&dir)
+    // and those may nest further). jwalk reads directories in parallel, so a big tree scans fast.
+    // follow_links(false) means no symlink loops; the cap bounds it. `progress` reports the running
+    // media count so the UI can show "Scanning… N found". Classify once (kept with each path).
+    let mut items: Vec<(PathBuf, Kind)> = Vec::new();
+    for entry in jwalk::WalkDir::new(&dir)
         .follow_links(false)
+        .skip_hidden(false)
         .into_iter()
         .filter_map(Result::ok)
     {
         if !entry.file_type().is_file() {
             continue;
         }
-        let p = entry.into_path();
-        if classify(&p).is_some() {
-            paths.push(p);
-            if paths.len() % 200 == 0 {
-                progress(paths.len());
+        let p = entry.path();
+        if let Some(kind) = classify(&p) {
+            items.push((p, kind));
+            if items.len() % 500 == 0 {
+                progress(items.len());
             }
-            if paths.len() >= 200_000 {
+            if items.len() >= 200_000 {
                 break;
             }
         }
     }
-    progress(paths.len());
-    paths.sort();
-    log::info!("folder {dir:?}: {} media files (incl. subfolders)", paths.len());
-    if paths.is_empty() {
+    progress(items.len());
+    items.sort_by(|a, b| a.0.cmp(&b.0)); // jwalk's parallel order isn't stable — sort by path
+    log::info!("folder {dir:?}: {} media files (incl. subfolders)", items.len());
+    if items.is_empty() {
         log::info!("no images/videos under {dir:?} — showing placeholders");
         return (0..24).map(Source::Placeholder).collect();
     }
-    paths
+    items
         .into_iter()
-        .map(|p| match classify(&p) {
-            Some(Kind::Video) => Source::Video(p),
-            Some(Kind::Audio) => Source::Audio(p),
-            _ => Source::File(p),
+        .map(|(p, kind)| match kind {
+            Kind::Video => Source::Video(p),
+            Kind::Audio => Source::Audio(p),
+            Kind::Image => Source::File(p),
         })
         .collect()
 }
