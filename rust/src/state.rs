@@ -55,8 +55,8 @@ const ANIM_SPEED: f32 = 4.0; // focus in/out transition speed (1 / seconds)
 const POOL: u32 = 128; // resident texture-array layers (fixed VRAM ceiling: POOL * 1MB)
 const INSTANCE_CAP: u64 = POOL as u64 * 2; // photos + their reflections (bottom row adds ~POOL/3)
 const KEEP_COLS: i64 = 16; // columns kept resident on each side of the camera
-const MAX_INFLIGHT: usize = 16; // concurrent decodes in flight (fills the wall faster on scroll)
-const MAX_UPLOADS_PER_FRAME: usize = 6; // GPU texture uploads/frame (spread bursts → smooth scroll)
+const MAX_INFLIGHT: usize = 32; // concurrent decodes in flight (deep queue keeps every worker fed)
+const MAX_UPLOADS_PER_FRAME: usize = 10; // GPU texture uploads/frame (drains decode bursts faster)
 const WALL_GIF_PROV: u32 = 128; // provisional per-frame decode size before packing into the atlas
 const WALL_GIF_FRAMES: usize = 256; // cap frames (a 16×16 atlas grid in the 512 layer)
 const MAX_GIF_DECODES: usize = 3; // concurrent GIF decodes (decoding many at once stutters)
@@ -64,7 +64,8 @@ const GIF_FAST_VEL: f32 = 4.0; // don't start new GIF decodes while scrolling fa
 // Wall GIFs are sampled at one global low rate (web wall: base 24fps − 20 skip = 4fps) — each
 // shows its time-correct frame, so the tempo is right while uploads stay cheap.
 const GIF_WALL_TICK_S: f32 = 1.0 / 4.0;
-const WORKERS: usize = 4; // decode threads — also caps the peak (WORKERS × full-image decode size)
+// Decode threads are chosen at runtime from the CPU (see State::new). DecodeBudget caps peak RAM,
+// so the thread count is purely about throughput — a fixed 4 was far too few on modern machines.
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -105,7 +106,7 @@ const INSTANCE_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
 
 const OVERLAY_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
-const OVERLAY_CAP: u64 = 320; // wall overlay (dim/scrubber/arrows/ticks/title boxes) + custom UI rects
+const OVERLAY_CAP: u64 = 512; // wall overlay (dim/scrubber/arrows/ticks/title boxes) + custom UI rects (incl. the Open dialog's dashed drop-zone border)
 const OVERLAY_SHADER: &str = r#"
 struct In { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32>, @location(2) round: vec4<f32> };
 struct V {
@@ -137,7 +138,12 @@ fn s2l(c: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs(in: V) -> @location(0) vec4<f32> {
     let r = in.round.x;            // corner radius (px)
-    if (r <= 0.0) { return vec4<f32>(s2l(in.color.rgb), in.color.a); }
+    if (r <= 0.0) {
+        // round.w > 0 on a sharp rect = vertical ALPHA gradient (opaque at top → transparent at the
+        // bottom): the top-bar's black→transparent fade, smooth (no banding).
+        let a = select(in.color.a, in.color.a * in.uv.y, in.round.w > 0.0);
+        return vec4<f32>(s2l(in.color.rgb), a);
+    }
     let size = in.round.yz;        // rect size (px)
     let p = in.uv * size - size * 0.5;            // position from the rect centre
     let q = abs(p) - (size * 0.5 - vec2<f32>(r)); // rounded-box SDF
@@ -281,6 +287,7 @@ enum Tile {
 pub enum OpenKind {
     Files,
     Folder,
+    Json, // "From JSON…" — pick a .json manifest of media paths
 }
 
 /// What a held pointer is doing — matches the web wall: left-drag scrolls, right/middle-drag
@@ -342,6 +349,7 @@ pub struct State {
 
     // decode worker pool
     job_tx: Sender<Job>,
+    pjob_tx: Sender<Job>, // priority lane (focused full-res decode jumps the queue)
     result_rx: Receiver<Loaded>,
 
     // camera / scroll
@@ -490,18 +498,34 @@ impl State {
 
         // --- decode worker pool ---
         let (job_tx, job_rx) = crossbeam_channel::unbounded::<Job>();
+        // Priority lane: the focused full-res decode jumps ahead of wall-thumb streaming so an
+        // opened photo reaches best quality fast (not after the streaming queue drains).
+        let (pjob_tx, pjob_rx) = crossbeam_channel::unbounded::<Job>();
         let (result_tx, result_rx) = crossbeam_channel::unbounded::<Loaded>();
         let (gif_tx, gif_rx) = crossbeam_channel::unbounded::<GifMsg>();
         let (wall_gif_tx, wall_gif_rx) = crossbeam_channel::unbounded::<WallGifMsg>();
         // Cap total in-flight decode memory so opening a folder of very large images doesn't spike
         // RSS to several GB (each full-res decode is w·h·4 bytes; 4 workers × a huge photo added up).
         let budget = Arc::new(DecodeBudget::new(1_100_000_000)); // ~1.1 GB
-        for _ in 0..WORKERS {
+        // One decode thread per logical CPU (clamped). Decoding + thumbnailing is CPU-bound, so this
+        // scales loading speed with the machine instead of a fixed 4; RAM stays capped by `budget`.
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(4, 12);
+        log::info!("decode workers: {workers}");
+        for _ in 0..workers {
             let job_rx = job_rx.clone();
+            let pjob_rx = pjob_rx.clone();
             let result_tx = result_tx.clone();
             let budget = budget.clone();
             std::thread::spawn(move || {
-                while let Ok(job) = job_rx.recv() {
+                loop {
+                    // Always take a priority (focused full-res) job first; otherwise block on either.
+                    let job = match pjob_rx.try_recv() {
+                        Ok(j) => j,
+                        Err(_) => crossbeam_channel::select! {
+                            recv(pjob_rx) -> j => match j { Ok(j) => j, Err(_) => break },
+                            recv(job_rx) -> j => match j { Ok(j) => j, Err(_) => break },
+                        },
+                    };
                     let est = estimate_decode_bytes(&job.source);
                     budget.acquire(est);
                     let (rgba, w, h) = decode(&job.source, job.full);
@@ -738,6 +762,17 @@ impl State {
         for l in ["Modified", "Created", "Done", "Clear dates"] {
             label_w.insert(l.to_string(), ui.text_width(l, 13.0));
         }
+        // Digits + colon at size 13 — so the seek-hover time tooltip centres exactly.
+        for ch in "0123456789:".chars() {
+            label_w.insert(ch.to_string(), ui.text_width(&ch.to_string(), 13.0));
+        }
+        // Open-media modal: buttons + the line-1 prompt at size 14.
+        for l in ["Choose files\u{2026}", "Choose folder\u{2026}", "From JSON\u{2026}", "Drag & drop files or a folder here"] {
+            label_w.insert(l.to_string(), ui.text_width(l, 14.0));
+        }
+        // The modal's line-2 hint renders at size 12.
+        let l2 = "or click to choose a folder \u{00b7} images, videos, audio";
+        label_w.insert(l2.to_string(), ui.text_width(l2, 12.0));
         components::set_label_widths(label_w);
         let icons = crate::icons::Icons::new(&device, &queue, config.format);
         let post = crate::post::Post::new(&device, &queue, config.format, size.width, size.height);
@@ -880,6 +915,7 @@ impl State {
             free_layers,
             inflight: 0,
             job_tx,
+            pjob_tx,
             result_rx,
             scroll_x: 0.0,
             prev_scroll_x: 0.0,
@@ -1440,6 +1476,7 @@ impl State {
             inflight: self.inflight,
             focused: self.focus.is_some(),
             info,
+            info_w: [0.0; 3], // measured in render() where &mut ui is available
             video,
             pointer: [
                 (self.pointer_ndc[0] + 1.0) * 0.5 * self.config.width as f32,
@@ -1461,6 +1498,10 @@ impl State {
             UiAction::OpenFolder => {
                 self.open_menu = None;
                 self.open_request = Some(OpenKind::Folder);
+            }
+            UiAction::OpenJson => {
+                self.open_menu = None;
+                self.open_request = Some(OpenKind::Json);
             }
             UiAction::Back => self.back(),
             UiAction::Fullscreen => self.fullscreen_requested = true,
@@ -1950,11 +1991,13 @@ impl State {
                 let want = match self.sources.get(f) {
                     Some(Source::File(p)) => !(self.gif_anim && is_gif(p)),
                     Some(Source::Audio(_)) => true, // crisp cover art (videos draw via their own quad)
+                    Some(Source::Placeholder(_)) => true, // sample (SVG) tiles open in the lightbox too
                     _ => false,
                 };
                 if want && self.full_pending != Some(f) && self.full_for != Some(f) {
                     self.full_pending = Some(f);
-                    let _ = self.job_tx.send(Job {
+                    // Priority lane → decodes ahead of wall-thumb streaming, so the open is crisp fast.
+                    let _ = self.pjob_tx.send(Job {
                         index: f,
                         source: self.sources[f].clone(),
                         gen: self.generation,
@@ -2693,6 +2736,12 @@ impl State {
         self.open_request.take()
     }
 
+    /// Close any open top-bar menu/modal (e.g. after a file is dropped on the Open dialog).
+    pub fn close_menu(&mut self) {
+        self.open_menu = None;
+        self.date_active = 0;
+    }
+
     /// Mark that a folder is being picked/scanned (shows a "Scanning folder…" indicator).
     pub fn set_scanning(&mut self, b: bool) {
         self.scanning = b;
@@ -2870,10 +2919,10 @@ impl State {
             let uv_off = [(cur % g) as f32 * cell_uv, (cur / g) as f32 * cell_uv];
             let uv_ext = [a.fw as f32 / 512.0, a.fh as f32 / 512.0];
             (a.fw as f32 / a.fh.max(1) as f32, uv_ext, uv_off, layer as f32, LbDraw::Thumb)
-        } else if let Some(Tile::Ready { layer, aspect, uv }) = self.resident.get(&idx) {
-            (*aspect, *uv, [0.0, 0.0], *layer as f32, LbDraw::Thumb)
         } else {
-            return LbDraw::None; // still decoding
+            // Never show the low-res wall thumbnail in the lightbox — wait for the full-res decode
+            // (priority lane makes it quick) so an opened photo is always at best quality.
+            return LbDraw::None;
         };
         let w = self.config.width.max(1) as f32;
         let h = self.config.height.max(1) as f32;
@@ -2981,7 +3030,7 @@ impl State {
             let thumb_x = pad + (track_w - thumb_w) * frac;
             rects.push(OverlayRect {
                 rect: [nx(thumb_x), by, nw(thumb_w), bh],
-                color: [0.95, 0.96, 1.0, 0.9], round: [4.0, thumb_w, 18.0, 0.0] });
+                color: [0.95, 0.96, 1.0, 0.9], round: [9.0, thumb_w, 18.0, 0.0] }); // full-round (pill) ends
         }
 
         // Hover tooltip: a rounded black pill centred on the hovered tile (text drawn in ui_lines),
@@ -3011,7 +3060,16 @@ impl State {
         let mut overlay = self.overlay_rects();
         let mut lines = self.ui_lines();
         let mut icons = self.icon_reqs();
-        let (ui_rects, ui_lines, ui_icons) = components::build(&self.ui_ctx());
+        let mut uic = self.ui_ctx();
+        // Measure the info-card lines now (needs &mut ui) so they centre exactly.
+        if let Some((a, b, c)) = uic.info.clone() {
+            uic.info_w = [
+                self.ui.text_width(&a, 14.0),
+                self.ui.text_width(&b, 12.0),
+                self.ui.text_width(&c, 12.0),
+            ];
+        }
+        let (ui_rects, ui_lines, ui_icons) = components::build(&uic);
         overlay.extend(ui_rects);
         lines.extend(ui_lines);
         icons.extend(ui_icons);
@@ -3275,6 +3333,13 @@ fn decode(source: &Source, full: bool) -> (Vec<u8>, u32, u32) {
     let target = if full { FULL_PX } else { TILE_PX };
     match source {
         Source::File(p) => {
+            // SVG isn't a raster format — rasterise it with resvg (the image crate can't decode it).
+            if is_svg(p) {
+                return std::fs::read_to_string(p)
+                    .ok()
+                    .map(|s| rasterize_svg(&s, target))
+                    .unwrap_or((Vec::new(), 0, 0));
+            }
             // Decode by CONTENT, not extension — many files are mislabeled (a ".jpg" whose bytes
             // are actually PNG, etc.). with_guessed_format() sniffs the magic bytes.
             let decoded = image::ImageReader::open(p)
@@ -3333,6 +3398,21 @@ fn video_thumb(p: &std::path::Path, target: u32, badge: bool) -> Option<(Vec<u8>
     ffmpeg_frame(p, target, None, true, badge)
 }
 
+/// `ffmpeg` command that never flashes a console window on Windows (CREATE_NO_WINDOW). We spawn it
+/// many times for thumbnails/cover art, so without this the screen blinks with consoles on launch.
+fn ffmpeg_cmd() -> std::process::Command {
+    let cmd = std::process::Command::new("ffmpeg");
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = cmd;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        return cmd;
+    }
+    #[cfg(not(windows))]
+    cmd
+}
+
 /// One ffmpeg poster-frame attempt. `ss` = input seek seconds (None = no seek); `pick` = use the
 /// `thumbnail` filter to choose a representative (non-black) frame.
 fn ffmpeg_frame(
@@ -3342,7 +3422,7 @@ fn ffmpeg_frame(
     pick: bool,
     badge: bool,
 ) -> Option<(Vec<u8>, u32, u32)> {
-    let mut cmd = std::process::Command::new("ffmpeg");
+    let mut cmd = ffmpeg_cmd();
     cmd.args(["-nostdin", "-loglevel", "error"]);
     if let Some(s) = ss {
         cmd.args(["-ss", s]);
@@ -3369,7 +3449,7 @@ fn ffmpeg_frame(
 /// Extract embedded cover art from an audio file via ffmpeg (the attached picture is a video
 /// stream). None → no art (fall back to the music placeholder).
 fn cover_thumb(p: &std::path::Path, target: u32) -> Option<(Vec<u8>, u32, u32)> {
-    let out = std::process::Command::new("ffmpeg")
+    let out = ffmpeg_cmd()
         .args(["-nostdin", "-loglevel", "error", "-i"])
         .arg(p)
         .args(["-frames:v", "1", "-vf"])
@@ -3459,38 +3539,51 @@ fn video_placeholder() -> Vec<u8> {
 }
 
 /// Build the tile library from a folder, scanning subfolders too. Placeholders if none.
-pub fn gather_sources(folder: Option<PathBuf>, progress: impl Fn(usize)) -> Vec<Source> {
+pub fn gather_sources(folder: Option<PathBuf>, progress: impl Fn(usize) + Sync) -> Vec<Source> {
     let Some(dir) = folder else {
         log::info!("no folder chosen — showing placeholders");
         return (0..18).map(Source::Placeholder).collect();
     };
-    // Recurse into subfolders to any depth — media is usually nested (a folder per product/album,
-    // and those may nest further). jwalk reads directories in parallel, so a big tree scans fast.
-    // follow_links(false) means no symlink loops; the cap bounds it. `progress` reports the running
-    // media count so the UI can show "Scanning… N found". Classify once (kept with each path).
-    let mut items: Vec<(PathBuf, Kind)> = Vec::new();
-    for entry in jwalk::WalkDir::new(&dir)
+    // Recurse into subfolders to any depth — media is usually nested (a folder per product/album).
+    // ignore's parallel walker reads directories AND classifies across threads, so a big tree scans
+    // fast. `progress` reports the running media count for the "Scanning… N found" readout.
+    use ignore::{WalkBuilder, WalkState};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let found = AtomicUsize::new(0);
+    let items: std::sync::Mutex<Vec<(PathBuf, Kind)>> = std::sync::Mutex::new(Vec::new());
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(4, 16);
+    WalkBuilder::new(&dir)
+        .hidden(false)
+        .ignore(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .parents(false)
         .follow_links(false)
-        .skip_hidden(false)
-        .into_iter()
-        .filter_map(Result::ok)
-    {
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let p = entry.path();
-        if let Some(kind) = classify(&p) {
-            items.push((p, kind));
-            if items.len() % 500 == 0 {
-                progress(items.len());
-            }
-            if items.len() >= 200_000 {
-                break;
-            }
-        }
-    }
+        .threads(threads)
+        .build_parallel()
+        .run(|| {
+            Box::new(|res| {
+                let Ok(e) = res else { return WalkState::Continue };
+                if e.file_type().map_or(false, |t| t.is_file()) {
+                    let p = e.into_path();
+                    if let Some(kind) = classify(&p) {
+                        let n = found.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n % 500 == 0 {
+                            progress(n);
+                        }
+                        items.lock().unwrap().push((p, kind));
+                        if n >= 200_000 {
+                            return WalkState::Quit;
+                        }
+                    }
+                }
+                WalkState::Continue
+            })
+        });
+    let mut items = items.into_inner().unwrap();
     progress(items.len());
-    items.sort_by(|a, b| a.0.cmp(&b.0)); // jwalk's parallel order isn't stable — sort by path
+    items.sort_by(|a, b| a.0.cmp(&b.0)); // parallel order isn't stable — sort by path
     log::info!("folder {dir:?}: {} media files (incl. subfolders)", items.len());
     if items.is_empty() {
         log::info!("no images/videos under {dir:?} — showing placeholders");
@@ -3520,13 +3613,56 @@ pub fn gather_from_files(files: Vec<PathBuf>) -> Vec<Source> {
         .collect()
 }
 
+/// Build a library from a JSON manifest (the Open dialog's "From JSON…"). The format is lenient:
+/// any string anywhere in the JSON that resolves to an existing media file is loaded — so a bare
+/// array of paths, an array of `{ "path"/"src"/"file": … }` objects, or `{ "items": [ … ] }` all
+/// work. Relative paths resolve against the JSON file's own folder; http(s) URLs are skipped (this
+/// is a local-file wall). Duplicates are removed, original order preserved.
+pub fn gather_from_json(json_path: PathBuf) -> Vec<Source> {
+    let Ok(text) = std::fs::read_to_string(&json_path) else {
+        log::warn!("could not read JSON {json_path:?}");
+        return Vec::new();
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) else {
+        log::warn!("invalid JSON {json_path:?}");
+        return Vec::new();
+    };
+    let base = json_path.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    let mut strings = Vec::new();
+    collect_json_strings(&val, &mut strings);
+    let mut files = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for s in strings {
+        if s.starts_with("http://") || s.starts_with("https://") {
+            continue; // remote URLs aren't local files
+        }
+        let raw = PathBuf::from(&s);
+        let p = if raw.is_absolute() { raw } else { base.join(raw) };
+        if classify(&p).is_some() && p.is_file() && seen.insert(p.clone()) {
+            files.push(p);
+        }
+    }
+    log::info!("JSON {json_path:?}: {} media file(s)", files.len());
+    gather_from_files(files)
+}
+
+/// Recursively collect every string value in a JSON tree (used by `gather_from_json`).
+fn collect_json_strings(v: &serde_json::Value, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(a) => a.iter().for_each(|x| collect_json_strings(x, out)),
+        serde_json::Value::Object(o) => o.values().for_each(|x| collect_json_strings(x, out)),
+        _ => {}
+    }
+}
+
 // Extension groups for the Open file picker's type filters (kept in sync with `classify`).
-pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp"];
+pub const IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "webp", "gif", "bmp", "svg"];
 pub const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "webm", "mov", "avi", "m4v"];
 pub const AUDIO_EXTS: &[&str] = &["mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "wma"];
 pub const MEDIA_EXTS: &[&str] = &[
-    "jpg", "jpeg", "png", "webp", "gif", "bmp", "mp4", "mkv", "webm", "mov", "avi", "m4v", "mp3",
-    "flac", "m4a", "aac", "ogg", "opus", "wav", "wma",
+    "jpg", "jpeg", "png", "webp", "gif", "bmp", "svg", "mp4", "mkv", "webm", "mov", "avi", "m4v",
+    "mp3", "flac", "m4a", "aac", "ogg", "opus", "wav", "wma",
 ];
 
 enum Kind {
@@ -3540,6 +3676,12 @@ fn is_gif(p: &std::path::Path) -> bool {
     p.extension()
         .and_then(|s| s.to_str())
         .map(|s| s.eq_ignore_ascii_case("gif"))
+        .unwrap_or(false)
+}
+fn is_svg(p: &std::path::Path) -> bool {
+    p.extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("svg"))
         .unwrap_or(false)
 }
 
@@ -3660,7 +3802,7 @@ fn classify(p: &std::path::Path) -> Option<Kind> {
     {
         Some("mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v") => Some(Kind::Video),
         Some("mp3" | "flac" | "m4a" | "aac" | "ogg" | "opus" | "wav" | "wma") => Some(Kind::Audio),
-        Some("jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp") => Some(Kind::Image),
+        Some("jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp" | "svg") => Some(Kind::Image),
         _ => None,
     }
 }

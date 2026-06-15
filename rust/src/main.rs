@@ -1,3 +1,7 @@
+// On Windows release builds, use the GUI subsystem so double-clicking the .exe doesn't pop a
+// console window. Debug builds keep the console for logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 // Cooliris (Rust/wgpu) — native rebuild of the 3D media wall.
 //
 // Why this exists: the Electron build's memory pain came entirely from embedding a browser.
@@ -114,6 +118,39 @@ fn spawn_file_picker(tx: &Sender<LoadMsg>) {
     });
 }
 
+/// Open a JSON-manifest file picker on a worker thread (the Open dialog's "From JSON…"), then load
+/// the media paths it lists. The resulting set becomes the library.
+fn spawn_json_picker(tx: &Sender<LoadMsg>) {
+    let tx = tx.clone();
+    log::info!("opening JSON picker…");
+    std::thread::spawn(move || {
+        match rfd::FileDialog::new()
+            .add_filter("JSON manifest", &["json"])
+            .add_filter("All files", &["*"])
+            .set_title("Open a JSON media manifest")
+            .pick_file()
+        {
+            Some(path) => {
+                let sources = state::gather_from_json(path.clone());
+                if sources.is_empty() {
+                    log::info!("JSON had no loadable media");
+                    let _ = tx.send(LoadMsg::Cancelled);
+                } else {
+                    let folder = path
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| path.clone());
+                    let _ = tx.send(LoadMsg::Library(folder, sources));
+                }
+            }
+            None => {
+                log::info!("JSON picker cancelled / unavailable");
+                let _ = tx.send(LoadMsg::Cancelled);
+            }
+        }
+    });
+}
+
 /// Scan a folder (e.g. a drag-and-dropped one) on a worker thread.
 fn spawn_scan(tx: &Sender<LoadMsg>, dir: PathBuf) {
     let tx = tx.clone();
@@ -152,6 +189,7 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(size) => state.resize(size),
             // Drag a folder (or a file) onto the window to load it.
             WindowEvent::DroppedFile(path) => {
+                state.close_menu(); // dismiss the Open dialog if it's up
                 let folder = if path.is_dir() {
                     Some(path)
                 } else {
@@ -199,6 +237,10 @@ impl ApplicationHandler for App {
                         Some(state::OpenKind::Folder) => {
                             state.set_scanning(true);
                             spawn_picker(&self.folder_tx);
+                        }
+                        Some(state::OpenKind::Json) => {
+                            state.set_scanning(true);
+                            spawn_json_picker(&self.folder_tx);
                         }
                         None => {}
                     }

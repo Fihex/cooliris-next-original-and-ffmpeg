@@ -111,6 +111,7 @@ pub enum TrackMenu {
 pub enum UiAction {
     OpenFiles,
     OpenFolder,
+    OpenJson, // Open dialog → "From JSON…" (load a manifest of media paths)
     Back, // close the lightbox (✕)
     Fullscreen,
     ToggleSlideshow,
@@ -179,6 +180,7 @@ pub struct UiCtx {
     pub inflight: usize,
     pub focused: bool,                          // an item is open (lightbox) — hide the top bar
     pub info: Option<(String, String, String)>, // (title, filename, meta) for the info card
+    pub info_w: [f32; 3], // measured pixel widths of the 3 info lines (0 = fall back to estimate)
     pub video: Option<VideoCtx>,
     pub pointer: [f32; 2], // pixel cursor (for hover highlight)
     pub fullscreen: bool,  // window is currently fullscreen (swaps the fullscreen icon)
@@ -190,20 +192,18 @@ const BTN_Y: f32 = 8.0;
 const BTN_H: f32 = 32.0;
 const ROW_H: f32 = 30.0;
 
-// Shared UI theme (one palette so every button/panel matches).
-// Change these to restyle every button / control / panel / border at once.
-pub const BTN_FILL: [f32; 4] = [0.20, 0.20, 0.20, 0.96]; // #333 gray — on-panel buttons / fields
-pub const BTN_HOVER: [f32; 4] = [0.27, 0.27, 0.27, 1.0]; // #454545 on hover
-pub const PANEL_BORDER: [f32; 4] = [1.0, 1.0, 1.0, 0.03]; // white @ 3% — panels only (buttons have no border)
+// Shared UI theme — matches the reference web Toolbar (white/10 glass buttons on a black→transparent
+// gradient bar; active = solid white + black text; neutral-900 dropdowns ringed white/10).
+pub const PANEL_BORDER: [f32; 4] = [1.0, 1.0, 1.0, 0.05]; // faint white ring
 pub const BTN_GRAD: f32 = 0.0; // flat fill
 pub const BTN_TEXT: [u8; 4] = [235, 235, 240, 255]; // button label colour
-pub const BTN_ON: [f32; 4] = [1.0, 1.0, 1.0, 1.0]; // selected = light (white)
-pub const BTN_ON_TEXT: [u8; 4] = [14, 14, 16, 255]; // black text when selected
-pub const PANEL_BG: [f32; 4] = [0.118, 0.118, 0.118, 1.0]; // #1e1e1e, solid (dropdowns / panels / info)
+pub const BTN_ON: [f32; 4] = [1.0, 1.0, 1.0, 1.0]; // active = bg-white
+pub const BTN_ON_TEXT: [u8; 4] = [14, 14, 16, 255]; // active = text-black
+pub const PANEL_BG: [f32; 4] = [0.09, 0.09, 0.09, 0.99]; // neutral-900 dropdowns / panels / info
 pub const HOVER_OVERLAY: [f32; 4] = [1.0, 1.0, 1.0, 0.10]; // subtle highlight over icon buttons / rows
-// Top-bar buttons — translucent black, so the wall shows through (the bar itself is transparent).
-pub const TOPBTN_FILL: [f32; 4] = [0.0, 0.0, 0.0, 0.40];
-pub const TOPBTN_HOVER: [f32; 4] = [0.0, 0.0, 0.0, 0.58];
+// Top-bar buttons — very light glass (white @ 5%), so they read as transparent, not gray.
+pub const TOPBTN_FILL: [f32; 4] = [1.0, 1.0, 1.0, 0.02];
+pub const TOPBTN_HOVER: [f32; 4] = [1.0, 1.0, 1.0, 0.05];
 // The wall/lightbox prev-next arrows are transparent black glass (see-through), no border.
 pub const ARROW_FILL: [f32; 4] = [0.0, 0.0, 0.0, 0.45];
 pub const ARROW_HOVER: [f32; 4] = [0.0, 0.0, 0.0, 0.62];
@@ -320,20 +320,20 @@ struct DatesUi {
     done: [f32; 4],
 }
 fn dates_layout(anchor: [f32; 4]) -> DatesUi {
-    let pw = 244.0_f32;
+    let pw = 280.0_f32; // wider, so the labels/fields breathe
     let px = (anchor[0] + anchor[2] - pw).max(8.0); // right-aligned to the Dates button
     let py = anchor[1] + anchor[3] + 6.0;
-    let pad = 12.0;
+    let pad = 14.0;
     let iw = pw - pad * 2.0;
-    let tabw = (iw - 8.0) * 0.5;
-    let modified = [px + pad, py + 28.0, tabw, 28.0];
-    let created = [px + pad + tabw + 8.0, py + 28.0, tabw, 28.0];
-    let from = [px + pad, py + 86.0, iw, 30.0];
-    let to = [px + pad, py + 146.0, iw, 30.0];
-    let clear = [px + pad, py + 188.0, 110.0, 30.0];
-    let done = [px + pw - pad - 80.0, py + 188.0, 80.0, 30.0];
+    let tabw = iw * 0.5; // joined segmented control (no gap)
+    let modified = [px + pad, py + 34.0, tabw, 30.0];
+    let created = [px + pad + tabw, py + 34.0, tabw, 30.0];
+    let from = [px + pad, py + 94.0, iw, 32.0];
+    let to = [px + pad, py + 158.0, iw, 32.0];
+    let clear = [px + pad, py + 206.0, 116.0, 32.0];
+    let done = [px + pw - pad - 84.0, py + 206.0, 84.0, 32.0];
     DatesUi {
-        panel: [px, py, pw, 232.0],
+        panel: [px, py, pw, 270.0],
         modified,
         created,
         from,
@@ -341,6 +341,32 @@ fn dates_layout(anchor: [f32; 4]) -> DatesUi {
         clear,
         done,
     }
+}
+
+/// "Open media" modal geometry (centred dialog: a drag-drop zone + Choose files / Choose folder /
+/// From JSON). Mirrors the reference OpenDialog (max-w-lg, p-5).
+struct OpenUi {
+    panel: [f32; 4],
+    close: [f32; 4],
+    drop: [f32; 4],
+    files: [f32; 4],
+    folder: [f32; 4],
+    json: [f32; 4],
+}
+fn open_dialog_layout(w: f32, h: f32) -> OpenUi {
+    let pw = 520.0_f32.min(w - 32.0);
+    let ph = 300.0_f32;
+    let px = (w - pw) * 0.5;
+    let py = (h - ph) * 0.5;
+    let close = [px + pw - 44.0, py + 18.0, 28.0, 28.0];
+    let drop = [px + 20.0, py + 62.0, pw - 40.0, 148.0];
+    let bh = 38.0;
+    let by = py + ph - 20.0 - bh;
+    let files = [px + 20.0, by, label_w("Choose files\u{2026}") + 30.0, bh];
+    let folder = [files[0] + files[2] + 10.0, by, label_w("Choose folder\u{2026}") + 30.0, bh];
+    let jw = label_w("From JSON\u{2026}") + 30.0;
+    let json = [px + pw - 20.0 - jw, by, jw, bh]; // right-aligned (a flex spacer pushes it over)
+    OpenUi { panel: [px, py, pw, ph], close, drop, files, folder, json }
 }
 
 /// The Settings rows (label, description). `on` is read from the UiCtx in build()/hit_test().
@@ -508,10 +534,9 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
     // Top bar — hidden while an item is open (the lightbox is uncluttered).
     let b = bar(w);
     if !c.focused {
-    // Top bar — transparent: the wall shows through, only the translucent buttons sit on top.
-    // DAW-style buttons: a dark-blue fill with a top-lighter vertical gradient, under a hairline
-    // lighter border (shared dark-blue theme).
-    let pill_off = BTN_FILL;
+    // Top bar — fully transparent (no strip): the white/10 buttons are real glass over the wall,
+    // not gray pills on a dark bar.
+    // White/10 glass buttons (reference style); active = solid white + black text.
     let pill_on = BTN_ON; // active = white pill, black text
     let txt_on = BTN_ON_TEXT;
     let rad = BTN_H * 0.5; // 100%-round — full pill
@@ -602,44 +627,108 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
         }
     } else if c.menu == Some(MenuKind::Dates) {
         let du = dates_layout(b.dates);
-        let dim = [170, 170, 180, 220];
-        let field_bg = BTN_FILL; // same fill as the buttons, so fields read on the panel
+        let lbl = [255, 255, 255, 120]; // dim section labels (~white/47)
+        let ph = [255, 255, 255, 70]; // dim placeholders (~white/27)
+        let tab_off = [255, 255, 255, 170]; // inactive tab text (~white/67)
         panel!(du.panel, 14.0);
-        label!("Filter by".into(), du.panel[0] + 12.0, du.panel[1] + 8.0, 13.0, dim);
-        // Modified / Created tabs (active = white pill + black text; inactive = gradient gray).
-        let on = !c.date_created;
-        if on { pill!(du.modified, BTN_ON, 6.0); } else { gpill!(du.modified, pill_off, 6.0, grad); }
-        label!("Modified".into(), du.modified[0] + (du.modified[2] - label_w("Modified")) * 0.5, du.modified[1] + 6.0, 13.0, if on { txt_on } else { white });
-        let on = c.date_created;
-        if on { pill!(du.created, BTN_ON, 6.0); } else { gpill!(du.created, pill_off, 6.0, grad); }
-        label!("Created".into(), du.created[0] + (du.created[2] - label_w("Created")) * 0.5, du.created[1] + 6.0, 13.0, if on { txt_on } else { white });
+        label!("Filter by".into(), du.from[0], du.panel[1] + 14.0, 12.0, lbl);
+        // A dark inset field: a subtle edge (brighter when focused) + a near-black fill.
+        macro_rules! field {
+            ($r:expr, $active:expr) => {{
+                let fr = $r;
+                pill!([fr[0] - 1.0, fr[1] - 1.0, fr[2] + 2.0, fr[3] + 2.0], [1.0, 1.0, 1.0, if $active { 0.22 } else { 0.07 }], 9.0);
+                pill!(fr, [0.0, 0.0, 0.0, 0.45], 8.0);
+            }};
+        }
+        // Modified / Created — a joined, ringed segmented control with a white pill on the active tab.
+        let seg = [du.modified[0], du.modified[1], du.modified[2] + du.created[2], du.modified[3]];
+        pill!([seg[0] - 1.0, seg[1] - 1.0, seg[2] + 2.0, seg[3] + 2.0], [1.0, 1.0, 1.0, 0.15], 9.0); // ring
+        pill!(seg, [0.0, 0.0, 0.0, 0.25], 8.0); // dark track
+        let active = if c.date_created { du.created } else { du.modified };
+        pill!([active[0] + 2.0, active[1] + 2.0, active[2] - 4.0, active[3] - 4.0], BTN_ON, 6.0); // sliding pill
+        let mon = !c.date_created;
+        label!("Modified".into(), du.modified[0] + (du.modified[2] - label_w("Modified")) * 0.5, du.modified[1] + 7.0, 13.0, if mon { txt_on } else { tab_off });
+        label!("Created".into(), du.created[0] + (du.created[2] - label_w("Created")) * 0.5, du.created[1] + 7.0, 13.0, if c.date_created { txt_on } else { tab_off });
         // From field.
-        label!("From".into(), du.from[0], du.from[1] - 16.0, 12.0, dim);
-        pill!(du.from, if c.date_active == 1 { BTN_HOVER } else { field_bg }, 8.0);
-        if c.date_from.is_empty() && c.date_active != 1 {
-            label!("YYYY-MM-DD".into(), du.from[0] + 8.0, du.from[1] + 7.0, 13.0, dim);
+        let fa = c.date_active == 1;
+        label!("From".into(), du.from[0], du.from[1] - 20.0, 12.0, lbl);
+        field!(du.from, fa);
+        if c.date_from.is_empty() && !fa {
+            label!("YYYY-MM-DD".into(), du.from[0] + 8.0, du.from[1] + 8.0, 13.0, ph);
         } else {
-            label!(caret_str(&c.date_from, c.caret, c.date_active == 1 && c.caret_on), du.from[0] + 8.0, du.from[1] + 7.0, 13.0, white);
+            label!(caret_str(&c.date_from, c.caret, fa && c.caret_on), du.from[0] + 8.0, du.from[1] + 8.0, 13.0, white);
         }
         // To field.
-        label!("To".into(), du.to[0], du.to[1] - 16.0, 12.0, dim);
-        pill!(du.to, if c.date_active == 2 { BTN_HOVER } else { field_bg }, 8.0);
-        if c.date_to.is_empty() && c.date_active != 2 {
-            label!("YYYY-MM-DD".into(), du.to[0] + 8.0, du.to[1] + 7.0, 13.0, dim);
+        let ta = c.date_active == 2;
+        label!("To".into(), du.to[0], du.to[1] - 20.0, 12.0, lbl);
+        field!(du.to, ta);
+        if c.date_to.is_empty() && !ta {
+            label!("YYYY-MM-DD".into(), du.to[0] + 8.0, du.to[1] + 8.0, 13.0, ph);
         } else {
-            label!(caret_str(&c.date_to, c.caret, c.date_active == 2 && c.caret_on), du.to[0] + 8.0, du.to[1] + 7.0, 13.0, white);
+            label!(caret_str(&c.date_to, c.caret, ta && c.caret_on), du.to[0] + 8.0, du.to[1] + 8.0, 13.0, white);
         }
-        // Clear / Done — both black like the rest (Done a touch more opaque).
-        gpill!(du.clear, pill_off, 6.0, grad);
-        label!("Clear dates".into(), du.clear[0] + (du.clear[2] - label_w("Clear dates")) * 0.5, du.clear[1] + 7.0, 13.0, white);
-        pill!(du.done, BTN_ON, 6.0);
-        label!("Done".into(), du.done[0] + (du.done[2] - label_w("Done")) * 0.5, du.done[1] + 7.0, 13.0, txt_on);
+        // Clear = dark (like the inputs); Done = solid white.
+        field!(du.clear, false);
+        label!("Clear dates".into(), du.clear[0] + (du.clear[2] - label_w("Clear dates")) * 0.5, du.clear[1] + 8.0, 13.0, white);
+        pill!(du.done, BTN_ON, 8.0);
+        label!("Done".into(), du.done[0] + (du.done[2] - label_w("Done")) * 0.5, du.done[1] + 8.0, 13.0, txt_on);
+        // Footer hint (reference: text-white/35).
+        let by = if c.date_created { "created" } else { "modified" };
+        label!(format!("Filtering by file {by} date."), du.from[0], du.panel[1] + du.panel[3] - 22.0, 11.0, [255, 255, 255, 89]);
+    } else if c.menu == Some(MenuKind::Open) {
+        // "Open media" modal — matches the reference OpenDialog: a dashed drop zone (click → choose
+        // a folder) plus Choose files / Choose folder / From JSON. Drag-drop works anywhere on the
+        // window, so the zone here is the click target + visual cue.
+        let ou = open_dialog_layout(w, h);
+        rect!([0.0, 0.0, w, h], [0.0, 0.0, 0.0, 0.7]); // scrim (bg-black/70)
+        panel!(ou.panel, 16.0); // rounded-2xl neutral-900, ring-white/10
+        label!("Open media".into(), ou.panel[0] + 22.0, ou.panel[1] + 20.0, 18.0, white);
+        // Close ✕ (top-right).
+        if hit(ou.close, c.pointer[0], c.pointer[1]) {
+            pill!(ou.close, HOVER_OVERLAY, ou.close[3] * 0.5);
+        }
+        label!("\u{2715}".into(), ou.close[0] + 8.0, ou.close[1] + 5.0, 17.0, [200, 200, 210, 230]);
+        // Drop zone — subtle fill (brighter on hover) under a dashed white border.
+        let dr = ou.drop;
+        let dhov = hit(dr, c.pointer[0], c.pointer[1]);
+        pill!(dr, if dhov { [1.0, 1.0, 1.0, 0.10] } else { [1.0, 1.0, 1.0, 0.05] }, 12.0);
+        let dcol = if dhov { [1.0, 1.0, 1.0, 0.70] } else { [1.0, 1.0, 1.0, 0.22] };
+        let (dl, gap, th, ins) = (10.0_f32, 7.0_f32, 1.5_f32, 12.0_f32); // dash len, gap, thickness, corner inset
+        let (mut x, x1) = (dr[0] + ins, dr[0] + dr[2] - ins);
+        while x < x1 {
+            let dw = dl.min(x1 - x);
+            rect!([x, dr[1], dw, th], dcol); // top edge
+            rect!([x, dr[1] + dr[3] - th, dw, th], dcol); // bottom edge
+            x += dl + gap;
+        }
+        let (mut y, y1) = (dr[1] + ins, dr[1] + dr[3] - ins);
+        while y < y1 {
+            let dh = dl.min(y1 - y);
+            rect!([dr[0], y, th, dh], dcol); // left edge
+            rect!([dr[0] + dr[2] - th, y, th, dh], dcol); // right edge
+            y += dl + gap;
+        }
+        // Two centred lines of guidance text.
+        let t1 = "Drag & drop files or a folder here";
+        let t2 = "or click to choose a folder \u{00b7} images, videos, audio";
+        let cy = dr[1] + dr[3] * 0.5;
+        label!(t1.into(), dr[0] + (dr[2] - label_w(t1)) * 0.5, cy - 16.0, 14.0, white);
+        label!(t2.into(), dr[0] + (dr[2] - label_w(t2)) * 0.5, cy + 4.0, 12.0, [255, 255, 255, 110]);
+        // Buttons — white/15 glass (reference Btn).
+        macro_rules! obtn {
+            ($r:expr, $t:expr) => {{
+                let r = $r;
+                let hov = hit(r, c.pointer[0], c.pointer[1]);
+                pill!(r, if hov { [1.0, 1.0, 1.0, 0.22] } else { [1.0, 1.0, 1.0, 0.13] }, 9.0);
+                label!($t.into(), r[0] + (r[2] - label_w($t)) * 0.5, r[1] + r[3] * 0.5 - 9.0, 14.0, white);
+            }};
+        }
+        obtn!(ou.files, "Choose files\u{2026}");
+        obtn!(ou.folder, "Choose folder\u{2026}");
+        obtn!(ou.json, "From JSON\u{2026}");
     } else if let Some(kind) = c.menu {
         let (anchor, items): ([f32; 4], Vec<(String, bool)>) = match kind {
-            MenuKind::Open => (
-                b.open,
-                vec![("\u{1f4c4} Files…".into(), false), ("\u{1f4c1} Folder…".into(), false)],
-            ),
+            MenuKind::Open => unreachable!("open is drawn as a modal above"),
             MenuKind::Sort => (
                 b.sort,
                 SortMode::ALL
@@ -681,28 +770,22 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
             let ph = if three { 66.0 } else { 46.0 };
             let bottom = if c.video.is_some() { h - 44.0 - 14.0 } else { h - 18.0 };
             let py = bottom - ph;
-            // Size the panel to the widest line (capped to the window), so text never spills out.
+            // Measured line widths (exact horizontal centring); fall back to an estimate if unset.
             let wpx = |t: &str, per: f32| t.chars().count() as f32 * per;
+            let iw = [
+                if c.info_w[0] > 0.0 { c.info_w[0] } else { wpx(title, 7.8) },
+                if c.info_w[1] > 0.0 { c.info_w[1] } else { wpx(line2, 6.6) },
+                if c.info_w[2] > 0.0 { c.info_w[2] } else { wpx(line3, 6.6) },
+            ];
             let maxw = (w - 40.0).max(220.0);
-            let need = wpx(title, 7.8).max(wpx(line2, 6.6)).max(wpx(line3, 6.6)) + 40.0;
-            let pw = need.clamp(360.0, maxw);
+            let pw = (iw[0].max(iw[1]).max(iw[2]) + 40.0).clamp(360.0, maxw);
             let px = (w - pw) * 0.5;
             panel!([px, py, pw, ph], 10.0);
-            // Clip a line (end ellipsis) if it's still wider than the (capped) panel.
-            let fit = |t: &str, per: f32| -> String {
-                let max_chars = ((pw - 28.0) / per).floor() as usize;
-                if t.chars().count() > max_chars && max_chars > 1 {
-                    t.chars().take(max_chars - 1).collect::<String>() + "\u{2026}"
-                } else {
-                    t.to_string()
-                }
-            };
-            let centre = |t: &str, per: f32| (w - wpx(t, per)) * 0.5;
-            let (t1, t2, t3) = (fit(title, 7.8), fit(line2, 6.6), fit(line3, 6.6));
-            label!(t1.clone(), centre(&t1, 7.8), py + 9.0, 14.0, white);
-            label!(t2.clone(), centre(&t2, 6.6), py + 28.0, 12.0, [175, 175, 185, 225]);
+            // Each line centred on screen (= on the panel) using its measured width.
+            label!(title.clone(), (w - iw[0]) * 0.5, py + 9.0, 14.0, white);
+            label!(line2.clone(), (w - iw[1]) * 0.5, py + 28.0, 12.0, [175, 175, 185, 225]);
             if three {
-                label!(t3.clone(), centre(&t3, 6.6), py + 46.0, 12.0, [150, 150, 160, 210]);
+                label!(line3.clone(), (w - iw[2]) * 0.5, py + 46.0, 12.0, [150, 150, 160, 210]);
             }
         }
     }
@@ -744,11 +827,13 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
             if v.dur > 0.0 && pt[1] >= vl.bar[1] && pt[0] >= vl.seek[0] && pt[0] <= vl.seek[0] + vl.seek[2] {
                 let hf = ((pt[0] - vl.seek[0]) / vl.seek[2]).clamp(0.0, 1.0) as f64;
                 let ht = fmt_time(hf * v.dur);
-                let bw = ht.chars().count() as f32 * 8.0 + 14.0;
+                // Exact width from per-character (digit/colon) measurements → precise centring.
+                let tw: f32 = ht.chars().map(|c| label_w(&c.to_string())).sum();
+                let bw = tw + 18.0;
                 let bx = (pt[0] - bw * 0.5).clamp(4.0, w - bw - 4.0);
                 let tip_y = vl.bar[1] - 30.0;
-                rect!([bx, tip_y, bw, 22.0], [0.0, 0.0, 0.0, 0.88]);
-                label!(ht, bx + 7.0, tip_y + 5.0, 13.0, white);
+                pill!([bx, tip_y, bw, 22.0], [0.0, 0.0, 0.0, 0.88], 6.0);
+                label!(ht, bx + (bw - tw) * 0.5, tip_y + 22.0 * 0.5 - 13.0 * 0.64, 13.0, white);
             }
             // right cluster: skip-back · skip-fwd · subtitles · audio · fullscreen (SVG icons)
             icon_btn!(vl.back, 22.0, "back10", white);
@@ -794,19 +879,19 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
     // it goes idle, so nothing is left floating over the picture.
     let controls_hidden = c.video.as_ref().map_or(false, |v| !v.visible);
     if c.focused && !controls_hidden {
-        // "← Back" button, top-left — flat gray fill, no border (borders are panel-only now).
+        // "← Back" button, top-left — transparent glass like the arrows.
         let bk = lightbox_back(w);
         let hov = hit(bk, c.pointer[0], c.pointer[1]);
-        gpill!(bk, if hov { BTN_HOVER } else { BTN_FILL }, 8.0, BTN_GRAD);
+        gpill!(bk, if hov { ARROW_HOVER } else { ARROW_FILL }, 8.0, BTN_GRAD);
         label!("\u{2190} Back".into(), bk[0] + 16.0, bk[1] + 10.0, 14.0, white);
-        // Circular Info (ⓘ) toggle, top-right (white when on).
+        // Circular Info (ⓘ) toggle, top-right — transparent glass (white when on).
         let ib = lightbox_info(w);
         let on = c.show_info;
         let hov = hit(ib, c.pointer[0], c.pointer[1]);
         if on {
             pill!(ib, BTN_ON, ib[3] * 0.5);
         } else {
-            gpill!(ib, if hov { BTN_HOVER } else { BTN_FILL }, ib[3] * 0.5, BTN_GRAD);
+            gpill!(ib, if hov { ARROW_HOVER } else { ARROW_FILL }, ib[3] * 0.5, BTN_GRAD);
         }
         icon!(ib, 19.0, "info", if on { BTN_ON_TEXT } else { BTN_TEXT });
     }
@@ -854,6 +939,30 @@ pub fn hit_test(c: &UiCtx, x: f32, y: f32) -> Option<UiAction> {
                 UiAction::CloseMenu
             });
         }
+        // Open is a modal: ✕/outside closes, the 3 buttons act, the drop zone chooses a folder.
+        if kind == MenuKind::Open {
+            let ou = open_dialog_layout(c.w, c.h);
+            if hit(ou.close, x, y) {
+                return Some(UiAction::CloseMenu);
+            }
+            if hit(ou.files, x, y) {
+                return Some(UiAction::OpenFiles);
+            }
+            if hit(ou.folder, x, y) {
+                return Some(UiAction::OpenFolder);
+            }
+            if hit(ou.json, x, y) {
+                return Some(UiAction::OpenJson);
+            }
+            if hit(ou.drop, x, y) {
+                return Some(UiAction::OpenFolder); // clicking the drop zone chooses a folder
+            }
+            return Some(if hit(ou.panel, x, y) {
+                UiAction::Noop
+            } else {
+                UiAction::CloseMenu
+            });
+        }
         // Dates is a custom panel (tabs, From/To fields, Clear/Done).
         if kind == MenuKind::Dates {
             let du = dates_layout(bar(c.w).dates);
@@ -884,7 +993,7 @@ pub fn hit_test(c: &UiCtx, x: f32, y: f32) -> Option<UiAction> {
             // on the Dates button → fall through to toggle it closed
         }
         let (anchor, n) = match kind {
-            MenuKind::Open => (bar(c.w).open, 2),
+            MenuKind::Open => unreachable!("open is a modal, handled above"),
             MenuKind::Sort => (bar(c.w).sort, SortMode::ALL.len()),
             MenuKind::Filter => (bar(c.w).filter, Filter::ALL.len()),
             MenuKind::Dates => (bar(c.w).dates, 0),
@@ -894,13 +1003,7 @@ pub fn hit_test(c: &UiCtx, x: f32, y: f32) -> Option<UiAction> {
         for (i, r) in rows.iter().enumerate() {
             if hit(*r, x, y) {
                 return Some(match kind {
-                    MenuKind::Open => {
-                        if i == 0 {
-                            UiAction::OpenFiles
-                        } else {
-                            UiAction::OpenFolder
-                        }
-                    }
+                    MenuKind::Open => unreachable!(),
                     MenuKind::Sort => UiAction::SetSort(SortMode::ALL[i]),
                     MenuKind::Filter => UiAction::SetFilter(Filter::ALL[i]),
                     MenuKind::Dates => unreachable!(),
