@@ -187,19 +187,44 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => state.resize(size),
-            // Drag a folder (or a file) onto the window to load it.
+            // Drag a folder (or a file) onto the window to load it. Hovering a file auto-opens the
+            // Open dialog so its drop zone is the visible target (and glows). (DnD delivery is up to
+            // the platform/compositor; if the dialog doesn't pop up on hover, drop events aren't
+            // reaching the app — see the README's Wayland note / WINIT_UNIX_BACKEND=x11 fallback.)
+            WindowEvent::HoveredFile(path) => {
+                log::info!("drag hover: {path:?}");
+                state.set_drag_over(true);
+                state.window.request_redraw(); // paint the drop-zone glow during the drag
+            }
+            WindowEvent::HoveredFileCancelled => {
+                log::info!("drag hover cancelled");
+                state.set_drag_over(false);
+                state.window.request_redraw();
+            }
             WindowEvent::DroppedFile(path) => {
-                state.close_menu(); // dismiss the Open dialog if it's up
+                log::info!("dropped: {path:?} (is_dir={})", path.is_dir());
+                // Drops are only accepted while the Open dialog is showing — its drop zone is the
+                // target. (The hover above auto-opens it, so a drag-and-drop just works.)
+                let accept = state.open_dialog_active();
+                state.set_drag_over(false); // clears the glow; closes an auto-opened dialog
+                if !accept {
+                    log::info!("drop ignored — Open dialog isn't open");
+                    return;
+                }
+                state.close_menu(); // dismiss the dialog now that we're loading
+                // A dropped folder loads directly; a dropped file loads its containing folder.
                 let folder = if path.is_dir() {
                     Some(path)
                 } else {
                     path.parent().map(|p| p.to_path_buf())
                 };
-                if let Some(f) = folder {
-                    if state.current_folder() != Some(f.as_path()) {
+                match folder {
+                    Some(f) if state.current_folder() != Some(f.as_path()) => {
                         state.set_scanning(true);
                         spawn_scan(&self.folder_tx, f);
                     }
+                    Some(_) => log::info!("dropped folder is already loaded — ignoring"),
+                    None => log::warn!("dropped path has no folder to load"),
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {

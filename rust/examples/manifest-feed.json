@@ -1,0 +1,14 @@
+{
+  "title": "My album",
+  "generated": "2026-06-15",
+  "items": [
+    { "src": "../../libmpv/public/samples/06.svg", "caption": "nested objects are fine" },
+    { "src": "../../libmpv/public/samples/07.svg" },
+    { "src": "../../libmpv/public/samples/08.svg" },
+    { "src": "../../libmpv/public/samples/09.svg" }
+  ],
+  "extras": [
+    "../../libmpv/public/samples/10.svg",
+    "https://example.com/skipped-remote.jpg"
+  ]
+}

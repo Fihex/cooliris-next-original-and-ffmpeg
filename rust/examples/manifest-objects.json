@@ -1,0 +1,7 @@
+[
+  { "path": "../../libmpv/public/samples/01.svg", "title": "first (path key)" },
+  { "src":  "../../libmpv/public/samples/02.svg", "note": "src key also works" },
+  { "file": "../../libmpv/public/samples/03.svg" },
+  { "url":  "../../libmpv/public/samples/04.svg" },
+  { "anything": "../../libmpv/public/samples/05.svg", "loader is lenient": true }
+]

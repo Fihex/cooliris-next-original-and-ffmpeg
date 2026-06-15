@@ -179,6 +179,7 @@ pub struct UiCtx {
     pub ready: usize,
     pub inflight: usize,
     pub focused: bool,                          // an item is open (lightbox) — hide the top bar
+    pub drag_over: bool,                        // a file is being dragged over the window (drop-zone glow)
     pub info: Option<(String, String, String)>, // (title, filename, meta) for the info card
     pub info_w: [f32; 3], // measured pixel widths of the 3 info lines (0 = fall back to estimate)
     pub video: Option<VideoCtx>,
@@ -683,30 +684,55 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
         rect!([0.0, 0.0, w, h], [0.0, 0.0, 0.0, 0.7]); // scrim (bg-black/70)
         panel!(ou.panel, 16.0); // rounded-2xl neutral-900, ring-white/10
         label!("Open media".into(), ou.panel[0] + 22.0, ou.panel[1] + 20.0, 18.0, white);
-        // Close ✕ (top-right).
-        if hit(ou.close, c.pointer[0], c.pointer[1]) {
-            pill!(ou.close, HOVER_OVERLAY, ou.close[3] * 0.5);
-        }
-        label!("\u{2715}".into(), ou.close[0] + 8.0, ou.close[1] + 5.0, 17.0, [200, 200, 210, 230]);
-        // Drop zone — subtle fill (brighter on hover) under a dashed white border.
+        // Close ✕ (top-right) — no hover background; just the glyph, centred, brighter on hover.
+        let xhov = hit(ou.close, c.pointer[0], c.pointer[1]);
+        let xw = label_w("\u{2715}"); // measured at 17 → exact centring
+        label!(
+            "\u{2715}".into(),
+            ou.close[0] + (ou.close[2] - xw) * 0.5,
+            ou.close[1] + ou.close[3] * 0.5 - 9.0,
+            17.0,
+            if xhov { [255, 255, 255, 255] } else { [165, 165, 175, 230] },
+        );
+        // Drop zone — subtle fill under a ROUNDED dashed white border: straight dashes along the four
+        // edges, plus small dots tracing each rounded corner so the box reads as rounded, not boxy.
         let dr = ou.drop;
-        let dhov = hit(dr, c.pointer[0], c.pointer[1]);
-        pill!(dr, if dhov { [1.0, 1.0, 1.0, 0.10] } else { [1.0, 1.0, 1.0, 0.05] }, 12.0);
-        let dcol = if dhov { [1.0, 1.0, 1.0, 0.70] } else { [1.0, 1.0, 1.0, 0.22] };
-        let (dl, gap, th, ins) = (10.0_f32, 7.0_f32, 1.5_f32, 12.0_f32); // dash len, gap, thickness, corner inset
-        let (mut x, x1) = (dr[0] + ins, dr[0] + dr[2] - ins);
-        while x < x1 {
-            let dw = dl.min(x1 - x);
-            rect!([x, dr[1], dw, th], dcol); // top edge
-            rect!([x, dr[1] + dr[3] - th, dw, th], dcol); // bottom edge
+        // Active = mouse hovering the zone OR a file being dragged over the window (drop-zone glow).
+        let dhov = hit(dr, c.pointer[0], c.pointer[1]) || c.drag_over;
+        let r = 14.0_f32; // corner radius (fill + dashed corners share it)
+        pill!(dr, if dhov { [1.0, 1.0, 1.0, 0.12] } else { [1.0, 1.0, 1.0, 0.06] }, r);
+        let dcol = if dhov { [1.0, 1.0, 1.0, 0.90] } else { [1.0, 1.0, 1.0, 0.40] };
+        let (dl, gap, th) = (12.0_f32, 8.0_f32, 2.0_f32); // dash length, gap, thickness (border-2)
+        let (x0, y0, x1, y1) = (dr[0], dr[1], dr[0] + dr[2], dr[1] + dr[3]);
+        // Straight dashes between the rounded corners (top/bottom run in x, left/right in y).
+        let mut x = x0 + r;
+        while x < x1 - r - 0.5 {
+            let dw = dl.min(x1 - r - x);
+            rect!([x, y0, dw, th], dcol); // top
+            rect!([x, y1 - th, dw, th], dcol); // bottom
             x += dl + gap;
         }
-        let (mut y, y1) = (dr[1] + ins, dr[1] + dr[3] - ins);
-        while y < y1 {
-            let dh = dl.min(y1 - y);
-            rect!([dr[0], y, th, dh], dcol); // left edge
-            rect!([dr[0] + dr[2] - th, y, th, dh], dcol); // right edge
+        let mut y = y0 + r;
+        while y < y1 - r - 0.5 {
+            let dh = dl.min(y1 - r - y);
+            rect!([x0, y, th, dh], dcol); // left
+            rect!([x1 - th, y, th, dh], dcol); // right
             y += dl + gap;
+        }
+        // Rounded corners — dots along each quarter arc (radius r) bridging the straight edges.
+        use std::f32::consts::PI;
+        let dot = 2.6_f32;
+        for (cx, cy, a0) in [
+            (x0 + r, y0 + r, PI),       // top-left     180°→270°
+            (x1 - r, y0 + r, 1.5 * PI), // top-right    270°→360°
+            (x1 - r, y1 - r, 0.0),      // bottom-right   0°→90°
+            (x0 + r, y1 - r, 0.5 * PI), // bottom-left   90°→180°
+        ] {
+            for k in 0..=4 {
+                let a = a0 + (PI * 0.5) * (k as f32 / 4.0);
+                let (px, py) = (cx + r * a.cos() - dot * 0.5, cy + r * a.sin() - dot * 0.5);
+                pill!([px, py, dot, dot], dcol, dot * 0.5);
+            }
         }
         // Two centred lines of guidance text.
         let t1 = "Drag & drop files or a folder here";
@@ -714,12 +740,13 @@ pub fn build(c: &UiCtx) -> (Vec<OverlayRect>, Vec<Line>, Vec<IconReq>) {
         let cy = dr[1] + dr[3] * 0.5;
         label!(t1.into(), dr[0] + (dr[2] - label_w(t1)) * 0.5, cy - 16.0, 14.0, white);
         label!(t2.into(), dr[0] + (dr[2] - label_w(t2)) * 0.5, cy + 4.0, 12.0, [255, 255, 255, 110]);
-        // Buttons — white/15 glass (reference Btn).
+        // Buttons — dark (near-black) fill with a faint ring that brightens on hover.
         macro_rules! obtn {
             ($r:expr, $t:expr) => {{
                 let r = $r;
                 let hov = hit(r, c.pointer[0], c.pointer[1]);
-                pill!(r, if hov { [1.0, 1.0, 1.0, 0.22] } else { [1.0, 1.0, 1.0, 0.13] }, 9.0);
+                pill!([r[0] - 1.0, r[1] - 1.0, r[2] + 2.0, r[3] + 2.0], [1.0, 1.0, 1.0, if hov { 0.20 } else { 0.10 }], 10.0); // ring
+                pill!(r, [0.0, 0.0, 0.0, if hov { 0.66 } else { 0.5 }], 9.0); // dark fill
                 label!($t.into(), r[0] + (r[2] - label_w($t)) * 0.5, r[1] + r[3] * 0.5 - 9.0, 14.0, white);
             }};
         }

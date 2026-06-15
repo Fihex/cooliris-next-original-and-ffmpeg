@@ -100,3 +100,53 @@ step.)
 
 Logging: `RUST_LOG=cooliris_rs=info cargo run` (the wgpu backends are chatty at `info`; the
 default filter keeps just our logs).
+
+## Opening media
+
+The toolbar **Open** button opens a dialog with four ways in:
+
+- **Choose files…** — pick one or more images / videos / audio files.
+- **Choose folder…** — pick a folder; it's scanned recursively (subfolders included).
+- **Drag & drop** — with the dialog open, drop a folder or files onto its drop zone.
+- **From JSON…** — load a JSON manifest that lists media paths (see below).
+
+You can also pass a folder on the CLI (`cargo run --release -- /path/to/media`) or press **O**.
+
+> Drag-and-drop delivery is handled by the OS/compositor. It works on Windows and X11. On some
+> Wayland compositors winit doesn't deliver drop events — if a drop does nothing, run with
+> `RUST_LOG=cooliris_rs=info` (you'll see `drag hover:` / `dropped:` lines if events arrive), and
+> as a fallback launch under X11 with `WINIT_UNIX_BACKEND=x11 ./cooliris-rs`.
+
+### From JSON… (manifest format)
+
+"From JSON…" reads a `.json` file and loads **every string anywhere in it that resolves to an
+existing local media file**. The parser is deliberately lenient, so all of these work:
+
+```jsonc
+// 1) a bare array of paths
+["a/cat.gif", "b/clip.mp4", "/abs/photo.jpg"]
+
+// 2) an array of objects — the key name doesn't matter (path, src, file, url, …)
+[ { "path": "a/cat.gif" }, { "src": "b/clip.mp4", "caption": "ignored" } ]
+
+// 3) a nested feed — strings are collected from anywhere in the tree
+{ "title": "My album", "items": [ { "src": "a/cat.gif" } ], "extras": ["b/clip.mp4"] }
+```
+
+Rules:
+
+- **Relative paths** resolve against the JSON file's own folder; absolute paths are used as-is.
+- Only **existing files with a known media extension** are kept (non-media strings like titles,
+  dates or captions are ignored), de-duplicated, in first-seen order.
+- **`http(s)://` URLs are skipped** — this is a local-file wall, not a web fetcher.
+
+Ready-to-run examples live in [`examples/`](examples/) and load the bundled sample tiles
+(`libmpv/public/samples/*.svg`) via relative paths, so you can try the feature immediately:
+
+```sh
+cargo run --release        # then: Open → From JSON… → pick rust/examples/manifest-paths.json
+```
+
+- [`examples/manifest-paths.json`](examples/manifest-paths.json) — bare array of paths (all 18 tiles).
+- [`examples/manifest-objects.json`](examples/manifest-objects.json) — array of objects (mixed keys).
+- [`examples/manifest-feed.json`](examples/manifest-feed.json) — nested feed (note the remote URL is skipped).

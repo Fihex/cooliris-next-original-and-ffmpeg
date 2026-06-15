@@ -57,8 +57,12 @@ const INSTANCE_CAP: u64 = POOL as u64 * 2; // photos + their reflections (bottom
 const KEEP_COLS: i64 = 16; // columns kept resident on each side of the camera
 const MAX_INFLIGHT: usize = 32; // concurrent decodes in flight (deep queue keeps every worker fed)
 const MAX_UPLOADS_PER_FRAME: usize = 10; // GPU texture uploads/frame (drains decode bursts faster)
-const WALL_GIF_PROV: u32 = 128; // provisional per-frame decode size before packing into the atlas
-const WALL_GIF_FRAMES: usize = 256; // cap frames (a 16×16 atlas grid in the 512 layer)
+const WALL_GIF_PROV: u32 = 160; // provisional per-frame decode size before packing into the atlas
+// Frames packed into the one 512px atlas layer. FEWER frames = BIGGER cells = sharper wall GIFs:
+// 16 → a 4×4 grid → 128px cells (vs the old 256-cap's 16×16 grid = blurry 32px cells). The wall
+// only animates at ~4fps anyway, so 16 evenly-sampled frames represent the whole loop fine.
+const WALL_GIF_FRAMES: usize = 16;
+const GIF_DECODE_CAP: usize = 240; // decode at most this many frames before even-sampling down
 const MAX_GIF_DECODES: usize = 3; // concurrent GIF decodes (decoding many at once stutters)
 const GIF_FAST_VEL: f32 = 4.0; // don't start new GIF decodes while scrolling faster than this
 // Wall GIFs are sampled at one global low rate (web wall: base 24fps − 20 skip = 4fps) — each
@@ -106,7 +110,7 @@ const INSTANCE_ATTRS: [wgpu::VertexAttribute; 6] = wgpu::vertex_attr_array![
 
 const OVERLAY_ATTRS: [wgpu::VertexAttribute; 3] =
     wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4];
-const OVERLAY_CAP: u64 = 512; // wall overlay (dim/scrubber/arrows/ticks/title boxes) + custom UI rects (incl. the Open dialog's dashed drop-zone border)
+const OVERLAY_CAP: u64 = 768; // wall overlay (dim/scrubber/arrows/ticks/title boxes) + custom UI rects (incl. the Open dialog's dashed drop-zone border)
 const OVERLAY_SHADER: &str = r#"
 struct In { @location(0) rect: vec4<f32>, @location(1) color: vec4<f32>, @location(2) round: vec4<f32> };
 struct V {
@@ -414,6 +418,8 @@ pub struct State {
     wall_gif_rx: Receiver<WallGifMsg>,
     gif_tick: Instant,                   // global low-rate sample tick for wall GIFs
     last_activity: Instant,              // last pointer activity — video controls auto-hide on idle
+    drag_over: bool,                     // a file is being dragged over the window (drop-zone glow)
+    drag_opened_dialog: bool,            // the Open dialog was auto-opened by a drag (close on leave)
     fullscreen_requested: bool,          // a control asked to toggle fullscreen (main polls it)
     last_frame: Instant,
     frame: u64,
@@ -773,6 +779,8 @@ impl State {
         // The modal's line-2 hint renders at size 12.
         let l2 = "or click to choose a folder \u{00b7} images, videos, audio";
         label_w.insert(l2.to_string(), ui.text_width(l2, 12.0));
+        // Modal close ✕ renders at size 17 (centred via its measured width).
+        label_w.insert("\u{2715}".to_string(), ui.text_width("\u{2715}", 17.0));
         components::set_label_widths(label_w);
         let icons = crate::icons::Icons::new(&device, &queue, config.format);
         let post = crate::post::Post::new(&device, &queue, config.format, size.width, size.height);
@@ -978,6 +986,8 @@ impl State {
             wall_gif_rx,
             gif_tick: Instant::now(),
             last_activity: Instant::now(),
+            drag_over: false,
+            drag_opened_dialog: false,
             fullscreen_requested: false,
             last_frame: Instant::now(),
             frame: 0,
@@ -1334,10 +1344,14 @@ impl State {
     }
 
     /// Video controls show when a video is focused and there's been recent pointer activity (or
-    /// it's paused) — they auto-hide after a few idle seconds, like the web player.
+    /// it's paused) — they auto-hide after a few idle seconds, like the web player. Music is the
+    /// exception: there's nothing to watch, so its controls stay up (never auto-hide on idle).
     fn video_controls_visible(&self) -> bool {
         if self.focus.is_none() || self.video.is_none() {
             return false;
+        }
+        if matches!(self.focus.and_then(|i| self.sources.get(i)), Some(Source::Audio(_))) {
+            return true; // music: keep the controls visible regardless of idle time
         }
         let paused = self.video_state().map(|(_, _, p)| p).unwrap_or(false);
         self.track_menu.is_some() || paused || self.last_activity.elapsed().as_secs_f32() < 2.5
@@ -1475,6 +1489,7 @@ impl State {
             ready,
             inflight: self.inflight,
             focused: self.focus.is_some(),
+            drag_over: self.drag_over,
             info,
             info_w: [0.0; 3], // measured in render() where &mut ui is available
             video,
@@ -2742,6 +2757,27 @@ impl State {
         self.date_active = 0;
     }
 
+    /// Whether the "Open media" dialog is currently showing (drops are only accepted then).
+    pub fn open_dialog_active(&self) -> bool {
+        self.open_menu == Some(MenuKind::Open)
+    }
+
+    /// A file is being dragged over the window. We auto-open the Open dialog (so its drop zone is
+    /// the visible target, and the drop is accepted), and glow the zone. Leaving without dropping
+    /// closes the dialog again if the drag is what opened it.
+    pub fn set_drag_over(&mut self, over: bool) {
+        self.drag_over = over;
+        if over {
+            if self.open_menu != Some(MenuKind::Open) {
+                self.open_menu = Some(MenuKind::Open);
+                self.drag_opened_dialog = true;
+            }
+        } else if self.drag_opened_dialog {
+            self.open_menu = None;
+            self.drag_opened_dialog = false;
+        }
+    }
+
     /// Mark that a folder is being picked/scanned (shows a "Scanning folder…" indicator).
     pub fn set_scanning(&mut self, b: bool) {
         self.scanning = b;
@@ -3432,7 +3468,7 @@ fn ffmpeg_frame(
     let vf = if pick { format!("thumbnail,{scale}") } else { scale };
     let out = cmd
         .args(["-frames:v", "1", "-an", "-sn", "-vf", &vf])
-        .args(["-f", "image2pipe", "-vcodec", "png", "pipe:1"])
+        .args(["-f", "image2pipe", "-vcodec", "bmp", "pipe:1"]) // BMP = near-instant encode (vs PNG's zlib pass)
         .output()
         .ok()?;
     if !out.status.success() || out.stdout.is_empty() {
@@ -3456,7 +3492,7 @@ fn cover_thumb(p: &std::path::Path, target: u32) -> Option<(Vec<u8>, u32, u32)> 
         .arg(format!(
             "scale={target}:{target}:force_original_aspect_ratio=decrease"
         ))
-        .args(["-f", "image2pipe", "-vcodec", "png", "pipe:1"])
+        .args(["-f", "image2pipe", "-vcodec", "bmp", "pipe:1"]) // BMP = near-instant encode (vs PNG's zlib pass)
         .output()
         .ok()?;
     if !out.status.success() || out.stdout.is_empty() {
@@ -3550,8 +3586,24 @@ pub fn gather_sources(folder: Option<PathBuf>, progress: impl Fn(usize) + Sync) 
     use ignore::{WalkBuilder, WalkState};
     use std::sync::atomic::{AtomicUsize, Ordering};
     let found = AtomicUsize::new(0);
-    let items: std::sync::Mutex<Vec<(PathBuf, Kind)>> = std::sync::Mutex::new(Vec::new());
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(4, 16);
+    // Each walker thread accumulates into its OWN Vec and merges once when it finishes (on Drop),
+    // rather than locking a shared Vec on every file. The per-file lock serialised a media-dense
+    // scan across all threads; now the shared lock is touched ~once per thread.
+    let merged: std::sync::Mutex<Vec<(PathBuf, Kind)>> = std::sync::Mutex::new(Vec::new());
+    struct Batch<'a> {
+        local: Vec<(PathBuf, Kind)>,
+        sink: &'a std::sync::Mutex<Vec<(PathBuf, Kind)>>,
+    }
+    impl Drop for Batch<'_> {
+        fn drop(&mut self) {
+            if !self.local.is_empty() {
+                self.sink.lock().unwrap().append(&mut self.local);
+            }
+        }
+    }
+    // Walking is dominated by readdir/stat latency, so oversubscribe the cores a little to overlap it.
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let threads = (cores * 2).clamp(8, 24);
     WalkBuilder::new(&dir)
         .hidden(false)
         .ignore(false)
@@ -3563,16 +3615,19 @@ pub fn gather_sources(folder: Option<PathBuf>, progress: impl Fn(usize) + Sync) 
         .threads(threads)
         .build_parallel()
         .run(|| {
-            Box::new(|res| {
+            let mut batch = Batch { local: Vec::new(), sink: &merged };
+            let found = &found;
+            let progress = &progress; // borrow (don't move) so every thread's visitor shares it
+            Box::new(move |res| {
                 let Ok(e) = res else { return WalkState::Continue };
                 if e.file_type().map_or(false, |t| t.is_file()) {
                     let p = e.into_path();
                     if let Some(kind) = classify(&p) {
+                        batch.local.push((p, kind));
                         let n = found.fetch_add(1, Ordering::Relaxed) + 1;
-                        if n % 500 == 0 {
-                            progress(n);
+                        if n % 200 == 0 {
+                            progress(n); // frequent enough that the "Scanning… N found" count ticks
                         }
-                        items.lock().unwrap().push((p, kind));
                         if n >= 200_000 {
                             return WalkState::Quit;
                         }
@@ -3581,7 +3636,7 @@ pub fn gather_sources(folder: Option<PathBuf>, progress: impl Fn(usize) + Sync) 
                 WalkState::Continue
             })
         });
-    let mut items = items.into_inner().unwrap();
+    let mut items = merged.into_inner().unwrap();
     progress(items.len());
     items.sort_by(|a, b| a.0.cmp(&b.0)); // parallel order isn't stable — sort by path
     log::info!("folder {dir:?}: {} media files (incl. subfolders)", items.len());
@@ -3749,15 +3804,26 @@ fn decode_gif_atlas(path: &std::path::Path) -> Option<GifAtlas> {
             buf
         };
         frames.push(img);
-        if frames.len() >= WALL_GIF_FRAMES {
+        if frames.len() >= GIF_DECODE_CAP {
             break;
         }
     }
-    let count = frames.len();
-    if count == 0 {
+    if frames.is_empty() {
         return None;
     }
-    let grid = (count as f64).sqrt().ceil() as u32; // ≤16 (count ≤ 256)
+    // Even-sample down to WALL_GIF_FRAMES so the WHOLE loop is represented at a high per-frame
+    // resolution (a few big atlas cells), not just the first frames at a tiny size. Delays become
+    // uniform across the kept frames, preserving the original total duration.
+    if frames.len() > WALL_GIF_FRAMES {
+        let src_n = frames.len();
+        let total: f32 = delays.iter().sum::<f32>().max(0.01);
+        frames = (0..WALL_GIF_FRAMES)
+            .map(|j| frames[j * src_n / WALL_GIF_FRAMES].clone())
+            .collect();
+        delays = vec![total / WALL_GIF_FRAMES as f32; WALL_GIF_FRAMES];
+    }
+    let count = frames.len();
+    let grid = (count as f64).sqrt().ceil() as u32; // ≤4 (count ≤ 16)
     let cell = (TILE_PX / grid).max(1);
     let total: f32 = delays.iter().sum::<f32>().max(0.01);
     let mut rgba = vec![0u8; (TILE_PX * TILE_PX * 4) as usize];
